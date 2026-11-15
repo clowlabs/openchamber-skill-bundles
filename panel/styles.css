@@ -126,3 +126,9 @@ body.sb-compact #app { display: none; }
 .sb-c-switch { flex: none; }
 .sb-c-empty, .sb-c-hint { color: var(--oc-muted); font-size: 11px; }
 .sb-c-hint { border-top: 1px solid var(--oc-border); padding-top: 6px; }
+
+/* SDK secondary/ghost buttons ship with a transparent border and blend into the panel. */
+body .oc-sdk-btn[data-variant="secondary"],
+body .oc-sdk-btn[data-variant="ghost"]:not(.oc-sdk-menu > .oc-sdk-btn) { border-color: var(--oc-sdk-edge, var(--oc-border)); }
+body .oc-sdk-btn[data-variant="secondary"]:hover:not(:disabled),
+body .oc-sdk-btn[data-variant="ghost"]:not(.oc-sdk-menu > .oc-sdk-btn):hover:not(:disabled) { border-color: var(--oc-muted); }
