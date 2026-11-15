@@ -13,8 +13,6 @@ export type SkillCounts = {
   chars: number;
   /** Ids of bundles that are on; null when skill-bundles.json is missing. */
   bundlesOn: string[] | null;
-  /** Extra project folders listed by bundles (on or off). */
-  projects: number;
   /** True when counted from opencode.json because skill-bundles.json is missing. */
   fromOpencode: boolean;
 };
@@ -63,17 +61,15 @@ export function liveFromOpencode(opencodeText: string | null, allIds: string[]):
 export function countsFromState(state: State | null, allIds: string[], opencodeText: string | null): SkillCounts {
   if (!state) {
     const live = liveFromOpencode(opencodeText, allIds);
-    return { live, installed: allIds.length, chars: live * core.CHARS_PER_SKILL, bundlesOn: null, projects: 0, fromOpencode: true };
+    return { live, installed: allIds.length, chars: live * core.CHARS_PER_SKILL, bundlesOn: null, fromOpencode: true };
   }
   const sum = core.summary(state, allIds);
-  const projects = new Set(state.bundles.flatMap((b) => b.projects ?? [])).size;
   return {
     live: sum.on,
     installed: allIds.length,
     chars: sum.chars,
     // ids ("dev, plan"): short enough for one line; names can be long.
     bundlesOn: state.bundles.filter((b) => b.enabled).map((b) => b.id),
-    projects,
     fromOpencode: false,
   };
 }
@@ -92,9 +88,55 @@ export async function readCounts(host: FileHost): Promise<SkillCounts> {
 /** "35 live / 212 installed" */
 export const liveLine = (c: SkillCounts) => `${c.live} live / ${c.installed} installed`;
 
-/** "dev, plan on · +N projects" (or a fallback note). */
-export function bundlesLine(c: SkillCounts) {
-  if (c.bundlesOn == null) return 'from opencode.json · no bundles yet';
-  const on = c.bundlesOn.length ? `${c.bundlesOn.join(', ')} on` : 'no bundles on';
-  return c.projects ? `${on} · +${c.projects} project${c.projects > 1 ? 's' : ''}` : on;
+/** Live share of installed, 0–100 (0 when nothing is installed). */
+export const livePct = (c: Pick<SkillCounts, 'live' | 'installed'>) => (c.installed > 0 ? Math.round((c.live / c.installed) * 100) : 0);
+
+/** Estimated prompt tokens (~4 chars per token). */
+export const tokensOf = (chars: number) => Math.round(chars / 4);
+
+/** 950 → "950", 1,600 → "1.6k", 12,345 → "12k", 1,250,000 → "1.3M". */
+export function formatTokens(n: number) {
+  if (n < 1000) return String(n);
+  if (n < 10_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+  return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+}
+
+export const TOKENS_TITLE = 'Estimated tokens the live skills add to every prompt (skill list only)';
+
+/**
+ * Header + meter, shared by the Work Status section and the rail panel:
+ *   <35 live / 211 installed · 17%>            <~1.6k tokens>
+ *   [■■■■□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□]
+ * Returns `left` so a caller can append to the summary (e.g. a Saving… badge).
+ */
+export function renderMeterHeader(c: SkillCounts) {
+  const pct = livePct(c);
+  const wrap = document.createElement('div');
+  wrap.className = 'skm';
+  const top = document.createElement('div');
+  top.className = 'skm-top';
+  const left = document.createElement('span');
+  left.className = 'skm-left';
+  const n = Object.assign(document.createElement('span'), { className: 'skm-live-n', textContent: String(c.live) });
+  const w = Object.assign(document.createElement('span'), { className: 'skm-live-w', textContent: 'live' });
+  const rest = Object.assign(document.createElement('span'), { className: 'skm-rest', textContent: ` / ${c.installed} installed · ${pct}%` });
+  left.append(n, w, rest);
+  const right = Object.assign(document.createElement('span'), {
+    className: 'skm-tokens', title: TOKENS_TITLE, textContent: `~${formatTokens(tokensOf(c.chars))} tokens`,
+  });
+  top.append(left, right);
+  const meter = document.createElement('div');
+  meter.className = 'skm-meter';
+  meter.setAttribute('role', 'meter');
+  meter.setAttribute('aria-valuemin', '0');
+  meter.setAttribute('aria-valuemax', String(c.installed));
+  meter.setAttribute('aria-valuenow', String(c.live));
+  meter.setAttribute('aria-label', `${c.live} of ${c.installed} skills live`);
+  const fill = document.createElement('div');
+  fill.className = 'skm-fill';
+  fill.style.width = `${pct}%`;
+  meter.appendChild(fill);
+  wrap.append(top, meter);
+  return { wrap, left, fill };
 }

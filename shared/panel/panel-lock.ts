@@ -9,8 +9,13 @@ export type PanelLockProtocol<Info> = {
   path: string;
   /** Lock file text → parsed info. */
   parse: (text: string) => Info;
-  /** null info = no lock file. Only "free" is taken; the panel can't probe pids to reclaim. */
+  /** null info = no lock file. "free" is taken; "stale" only when reclaimStale allows it. */
   classify: (info: Info | null, opts: { now: number; mtimeMs: number }) => LockVerdict;
+  /**
+   * A "stale" lock this panel may take over, e.g. an orphaned lock of another panel frame past
+   * its TTL. Must be false for process (CLI) locks: the panel can't probe pids. Default: never.
+   */
+  reclaimStale?: (info: Info) => boolean;
   /** True if `info` is the panel's own record with this token. */
   isOwn: (info: Info, token: string) => boolean;
   /** Whether reading the mtime is worth it (e.g. false for a released marker). */
@@ -69,7 +74,9 @@ export function createPanelLock<Info>(o: PanelLockOptions<Info>): PanelLock {
       const i = info(await readOptional(o.host, o.path));
       const now = Date.now();
       const m = i == null || (o.needsMtime && !o.needsMtime(i)) ? 0 : await mtimeMs();
-      if (o.classify(i, { now, mtimeMs: m }) === 'free') {
+      const verdict = o.classify(i, { now, mtimeMs: m });
+      if (verdict === 'free' || (verdict === 'stale' && i != null && o.reclaimStale?.(i) === true)) {
+        // Taking over is the same write + token read-back as taking a free lock.
         const token = (o.token ?? randomToken)();
         await o.host.writeFile(o.path, o.record(token, Date.now()));
         if (ours(await readOptional(o.host, o.path), token)) return token;

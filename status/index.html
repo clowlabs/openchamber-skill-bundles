@@ -4,22 +4,20 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Skills</title>
+  <link rel="stylesheet" href="meter.css" />
   <style>
     html, body { margin: 0; background: transparent; color: var(--oc-fg); font-family: var(--oc-font, system-ui, sans-serif); }
-    #line { display: block; width: 100%; box-sizing: border-box; text-align: left; border: 0; background: none; color: inherit; font: inherit; padding: 6px 10px; cursor: pointer; border-radius: 6px; }
-    #line:hover { background: var(--oc-hover); }
-    #line:focus-visible { outline: 2px solid var(--oc-focus, var(--oc-primary)); outline-offset: -2px; }
-    .main { font-size: 13px; font-weight: 600; }
-    .main .n { font-variant-numeric: tabular-nums; }
-    .sub { font-size: 11px; color: var(--oc-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .err { color: var(--oc-error-text, var(--oc-error)); }
+    /* The Work Status section already frames this: no outer card, just padding. */
+    #section { padding: 12px; cursor: pointer; border-radius: 6px; }
+    #section:hover .skm-rest, #section:hover .skm-tokens { color: var(--oc-fg); }
+    #section:focus-visible { outline: 2px solid var(--oc-focus, var(--oc-primary)); outline-offset: -2px; }
+    .err { color: var(--oc-error-text, var(--oc-error)); font-size: 12px; }
   </style>
 </head>
 <body>
-  <button id="line" type="button" title="Open Skill Bundles">
-    <div class="main" id="main">Counting skills…</div>
-    <div class="sub" id="sub"></div>
-  </button>
+  <div id="section" role="button" tabindex="0" title="Open Skill Bundles" aria-label="Skills. Open Skill Bundles">
+    <div id="head"><span class="skm-sub">Counting skills…</span></div>
+  </div>
   <script src="main.js"></script>
 </body>
 </html>

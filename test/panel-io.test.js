@@ -378,8 +378,7 @@ test("status counts: 35 live / 212 installed from skill-bundles.json", async () 
   const c = await counts.readCounts(fx.host);
   expect([c.live, c.installed]).toEqual([35, 212]);
   expect(c.fromOpencode).toBe(false);
-  expect(counts.liveLine(c)).toBe("35 live / 212 installed");
-  expect(counts.bundlesLine(c)).toBe("dev, plan on · +2 projects");
+  expect(c.bundlesOn).toEqual(["dev", "plan"]);
   expect(c.chars).toBe(35 * core.CHARS_PER_SKILL);
   expect(fx.writes).toEqual([]); // read-only
 });
@@ -397,8 +396,86 @@ test("status counts: falls back to opencode.json skill rules when skill-bundles.
   const c = await counts.readCounts(fx.host);
   expect([c.live, c.installed]).toEqual([35, 212]);
   expect(c.fromOpencode).toBe(true);
-  expect(counts.bundlesLine(c)).toBe("from opencode.json · no bundles yet");
+  expect(c.bundlesOn).toBe(null);
   // no skill rules at all: everything is live
   put(core.OPENCODE_PATH, JSON.stringify({ permissions: [] }) + "\n");
   expect((await counts.readCounts(fx.host)).live).toBe(212);
+});
+
+// ---------- hot-swap toggles (rail panel compact view) ----------
+
+test("toggleBundle (compact row) flips enabled through the locked save path", async () => {
+  expect(io.S.state.bundles[0].enabled).toBe(false);
+  io.toggleBundle("b");
+  await settle();
+  expect(core.parseBundles(read(core.BUNDLES_PATH)).bundles[0].enabled).toBe(true);
+  expect(io.S.state.bundles[0].enabled).toBe(true);
+  // lock taken first, released last, opencode.json rewritten with the bundle's allows
+  expect(writes[0]).toBe(core.LOCK_PATH);
+  expect(read(core.LOCK_PATH)).toBe(core.RELEASED_MARKER);
+  expect(read(core.OPENCODE_PATH)).toContain('"resource": "alpha"');
+  io.toggleBundle("b");
+  await settle();
+  expect(core.parseBundles(read(core.BUNDLES_PATH)).bundles[0].enabled).toBe(false);
+});
+
+test("toggleBundle with a held CLI lock writes nothing and shows the lock toast", async () => {
+  put(core.LOCK_PATH, JSON.stringify({ pid: 4242, host: "box", token: "t", time: Date.now() }));
+  io.toggleBundle("b");
+  await settle();
+  expect(writes).toEqual([]);
+  expect(core.parseBundles(read(core.BUNDLES_PATH)).bundles[0].enabled).toBe(false);
+  expect(toasts.map((t) => t.message)).toContain("CLI is writing — try again");
+});
+
+test("panel lock: an orphaned panel lock past its TTL is reclaimed; a CLI lock is not", async () => {
+  put(core.LOCK_PATH, core.panelLockRecord("orphan", Date.now() - core.PANEL_LOCK_TTL_MS - 5_000));
+  // the file's mtime must be old too (classifyLock uses the later of time and mtime)
+  const old = new Date(Date.now() - core.PANEL_LOCK_TTL_MS - 5_000);
+  fs.utimesSync(real(core.LOCK_PATH), old, old);
+  io.toggleBundle("b");
+  await settle();
+  expect(core.parseBundles(read(core.BUNDLES_PATH)).bundles[0].enabled).toBe(true);
+  expect(read(core.LOCK_PATH)).toBe(core.RELEASED_MARKER);
+
+  const cli = JSON.stringify({ pid: 4242, host: "box", token: "t", time: Date.now() - 3_600_000 });
+  put(core.LOCK_PATH, cli);
+  const older = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(real(core.LOCK_PATH), older, older);
+  writes.length = 0;
+  io.toggleBundle("b");
+  await settle();
+  expect(writes).toEqual([]);
+  expect(read(core.LOCK_PATH)).toBe(cli);
+});
+
+// ---------- meter: pct and tokens ----------
+
+test("meter: 35 live / 211 installed → 17%, ~1.6k tokens", async () => {
+  const ids = installMany(); // 210 folders + 2 built-ins = 212
+  fs.rmSync(real(`~/.config/opencode/skills/${ids[209]}`), { recursive: true }); // 211 installed
+  put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [
+      { id: "dev", name: "Dev", enabled: true, skills: [...ids.slice(0, 34), "ghost"] }, // ghost: not installed
+      { id: "plan", name: "Plan", enabled: true, skills: ["opencode"] },
+    ],
+    overrides: {},
+  }))));
+  const c = await counts.readCounts(fx.host);
+  expect([c.live, c.installed]).toEqual([35, 211]);
+  expect(counts.livePct(c)).toBe(17);
+  expect(c.chars).toBe(6300);
+  expect(counts.formatTokens(counts.tokensOf(c.chars))).toBe("1.6k");
+});
+
+test("counts: 0 live → 0%, ~0 tokens; nothing installed → 0%", async () => {
+  const c = counts.countsFromState(core.parseBundles(JSON.stringify({
+    version: 1, bundles: [{ id: "x", name: "X", enabled: false, skills: ["alpha"] }], overrides: {},
+  })), ["alpha", "beta", "opencode", "report"], null);
+  expect(c.live).toBe(0);
+  expect(counts.livePct(c)).toBe(0);
+  expect(counts.formatTokens(counts.tokensOf(c.chars))).toBe("0");
+  expect(counts.livePct({ live: 0, installed: 0 })).toBe(0);
+  expect([950, 1000, 1600, 9999, 12345, 1250000].map(counts.formatTokens)).toEqual(["950", "1k", "1.6k", "10k", "12k", "1.3M"]);
 });

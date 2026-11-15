@@ -1,42 +1,63 @@
-// Work Status section: "35 live / 212 installed". Read-only; the frame only runs while shown.
+// Work Status section: the skills meter (live / installed, est. tokens). Read-only: no writes, no
+// lock. The whole section is one button that opens the rail panel, where bundles are toggled.
+// The frame only runs while the section is shown.
 import { connectHost } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
 import { errText } from '../shared/panel/host';
-import { bundlesLine, liveLine, readCounts } from './counts';
+import { readCounts, renderMeterHeader, type SkillCounts } from './counts';
 
 const host = connectHost();
 const REFRESH_MS = 30_000;
 const $ = (id: string) => document.getElementById(id)!;
+const fit = () => void host.setHeight(Math.ceil(document.body.scrollHeight));
 
-let busy = false;
+function paint(c: SkillCounts) {
+  const head = $('head');
+  const prev = head.querySelector<HTMLElement>('.skm-fill')?.style.width;
+  const { wrap, fill } = renderMeterHeader(c);
+  // Animate from the previous width (the meter is rebuilt on every refresh).
+  if (prev != null && prev !== fill.style.width) {
+    const to = fill.style.width;
+    fill.style.width = prev;
+    requestAnimationFrame(() => { fill.style.width = to; });
+  }
+  head.replaceChildren(wrap);
+  $('section').setAttribute('aria-label', `Skills: ${c.live} live of ${c.installed} installed. Open Skill Bundles`);
+  fit();
+}
+
+let reading = false;
 async function refresh() {
-  if (busy) return;
-  busy = true;
+  if (reading) return;
+  reading = true;
   try {
-    const c = await readCounts(host);
-    $('main').textContent = liveLine(c);
-    $('main').classList.remove('err');
-    $('sub').textContent = bundlesLine(c);
-    $('line').title = `Open Skill Bundles · ~${c.chars.toLocaleString('en-US')} prompt chars`;
+    paint(await readCounts(host));
   } catch (e) {
-    $('main').textContent = "Couldn't count skills";
-    $('main').classList.add('err');
-    $('sub').textContent = errText(e);
+    $('head').replaceChildren(
+      Object.assign(document.createElement('div'), { className: 'err', textContent: "Couldn't count skills" }),
+      Object.assign(document.createElement('div'), { className: 'skm-sub', textContent: errText(e) }),
+    );
+    fit();
   } finally {
-    busy = false;
-    void host.setHeight(Math.ceil(document.body.scrollHeight));
+    reading = false;
   }
 }
+
+const openPanel = () => {
+  host.openSurface('plugin:skill-bundles').catch((e) => {
+    void host.toast({ kind: 'error', message: `Couldn't open Skill Bundles: ${errText(e)}`, dismiss: true });
+  });
+};
 
 let mounted = false;
 host.onReady((ctx) => {
   applyHostReady(ctx, document.documentElement);
   if (mounted) return;
   mounted = true;
-  $('line').addEventListener('click', () => {
-    host.openSurface('plugin:skill-bundles').catch((e) => {
-      void host.toast({ kind: 'error', message: `Couldn't open Skill Bundles: ${errText(e)}`, dismiss: true });
-    });
+  const section = $('section');
+  section.addEventListener('click', openPanel);
+  section.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPanel(); }
   });
   void refresh();
   // The frame is unloaded when the section is collapsed, so this only runs while visible.

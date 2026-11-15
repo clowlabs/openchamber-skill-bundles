@@ -20,6 +20,8 @@ export function setHost(h: HostClient) {
     parse: core.parseLock,
     classify: (info, opts) => core.classifyLock(info, opts),
     isOwn: (info, token) => info.kind === 'panel' && info.token === token,
+    // An orphaned panel lock (frame unloaded mid-save) past PANEL_LOCK_TTL_MS. Never a CLI lock.
+    reclaimStale: (info) => info.kind === 'panel',
     needsMtime: (info) => info.kind !== 'released',
     record: core.panelLockRecord,
     releasedMarker: core.RELEASED_MARKER,
@@ -296,6 +298,17 @@ export function commit(fn: (s: State) => State, onAccepted?: () => void) {
     if (await applyChange(fn)) onAccepted?.();
   });
 }
+
+/** Turn a bundle on or off (flip when `on` is omitted) through the normal save path. */
+export function toggleBundle(bundleId: string, on?: boolean, onAccepted?: () => void) {
+  commit((s) => flip(bundleId, on)(s), onAccepted);
+}
+
+const flip = (bundleId: string, on?: boolean) => (s: State) => {
+  const b = s.bundles.find((x) => x.id === bundleId);
+  if (!b) throw new Error(`Unknown bundle "${bundleId}"`);
+  return core.setBundleEnabled(s, bundleId, on ?? !b.enabled);
+};
 
 /** Body of a commit; call only from inside the queue. True once on disk. */
 export async function applyChange(fn: (s: State) => State): Promise<boolean> {

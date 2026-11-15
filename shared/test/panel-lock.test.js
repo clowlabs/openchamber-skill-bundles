@@ -87,3 +87,58 @@ test("timing is read live (tests can shorten it after creation)", async () => {
   await expect(lock.acquire()).rejects.toBeInstanceOf(LockedError);
   expect(Date.now() - t0).toBeLessThan(500);
 });
+
+// ---------- reclaiming stale locks ----------
+// Protocol with ages: a panel lock is stale after 100 ms, a CLI lock after 1 s.
+const aged = {
+  ...protocol,
+  classify: (info, { now, mtimeMs }) => {
+    if (!info || (info.owner === "panel" && info.released)) return "free";
+    const age = now - (info.time ?? mtimeMs);
+    if (info.owner === "panel") return age > 100 ? "stale" : "held";
+    return age > 1000 ? "stale" : "held";
+  },
+  reclaimStale: (info) => info.owner === "panel",
+};
+const makeAged = (extra = {}) => createPanelLock({ ...aged, host: fx.host, timing: { pollMs: 5, waitMs: 40 }, ...extra });
+
+test("a stale PANEL lock is reclaimed (write + token read-back)", async () => {
+  fx.put(PATH, JSON.stringify({ owner: "panel", token: "orphan", time: Date.now() - 10_000 }));
+  const lock = makeAged({ token: () => "new" });
+  const token = await lock.acquire();
+  expect(token).toBe("new");
+  expect(JSON.parse(fx.read(PATH))).toMatchObject({ owner: "panel", token: "new" });
+});
+
+test("a stale CLI lock is never reclaimed", async () => {
+  const cli = JSON.stringify({ owner: "cli", pid: 9, time: Date.now() - 60_000 });
+  fx.put(PATH, cli);
+  await expect(makeAged().acquire()).rejects.toBeInstanceOf(LockedError);
+  expect(fx.read(PATH)).toBe(cli);
+  expect(fx.writes).toEqual([]);
+});
+
+test("a fresh PANEL lock still blocks", async () => {
+  const live = JSON.stringify({ owner: "panel", token: "busy", time: Date.now() + 5_000 });
+  fx.put(PATH, live);
+  await expect(makeAged().acquire()).rejects.toBeInstanceOf(LockedError);
+  expect(fx.read(PATH)).toBe(live);
+});
+
+test("without reclaimStale, stale locks are not taken", async () => {
+  fx.put(PATH, JSON.stringify({ owner: "panel", token: "orphan", time: Date.now() - 10_000 }));
+  const { reclaimStale, ...noReclaim } = aged;
+  await expect(createPanelLock({ ...noReclaim, host: fx.host, timing: { pollMs: 5, waitMs: 30 } }).acquire()).rejects.toBeInstanceOf(LockedError);
+});
+
+test("reclaim race: someone else takes the stale lock first → we wait, not overwrite", async () => {
+  fx.put(PATH, JSON.stringify({ owner: "panel", token: "orphan", time: Date.now() - 10_000 }));
+  const lock = makeAged({ token: () => "mine" });
+  const orig = fx.host.writeFile;
+  fx.host.writeFile = async (p, c) => {
+    await orig(p, c);
+    fx.put(PATH, JSON.stringify({ owner: "panel", token: "winner", time: Date.now() + 5_000 }));
+  };
+  await expect(lock.acquire()).rejects.toBeInstanceOf(LockedError);
+  expect(JSON.parse(fx.read(PATH)).token).toBe("winner");
+});

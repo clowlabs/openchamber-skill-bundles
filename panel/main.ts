@@ -18,6 +18,7 @@ import { initPopup, setHomeSource } from './popup';
 import { openProjectsMenu, refreshProjectsMenu } from './projects';
 import { deferRender, endDrag, initDrag, isDragging, onPillDown } from './drag';
 import { renderDetail } from './detail';
+import { renderCompact, renderCompactBusy } from './compact';
 import { countsFromState, liveLine } from '../status/counts';
 import { $, el, HAND_EDIT, MODE_LABEL, UNBUNDLED, type Disposable } from './dom';
 import {
@@ -336,12 +337,17 @@ function renderGroups() {
 
 /** Stats and button state only: safe while a click is in flight. */
 function renderLight() {
+  if (compact) { renderCompactBusy(); return; }
   renderStats();
   newField?.update({ disabled: !S.loaded });
   newButton?.update({ disabled: !S.loaded, loading: pending() > 0 });
 }
 
+/** Rail panel = compact hot-swap list; page and everything else = full editor. */
+let compact = false;
+
 function render() {
+  if (compact) { renderCompact($('compact')); return; }
   if (isDragging()) { deferRender(); renderLight(); return; }
   renderBanner();
   renderGroups();
@@ -395,13 +401,16 @@ function mountChrome() {
 
 async function boot() {
   const spin = el('div');
-  $('groups').appendChild(spin);
+  (compact ? $('compact') : $('groups')).appendChild(spin);
   const s = mountSpinner(spin, { label: 'Loading skills…' });
   try {
     await load();
   } catch (e) {
     s.dispose();
-    mountBanner($('banner'), { tone: 'error', title: 'Could not load skills', body: errText(e) });
+    // On the rail the editor (#app, which holds #banner) is hidden: mount where it shows.
+    const at = compact ? $('compact') : $('banner');
+    if (compact) at.textContent = '';
+    mountBanner(at, { tone: 'error', title: 'Could not load skills', body: errText(e) });
     return;
   }
   s.dispose();
@@ -421,6 +430,8 @@ host.onReady((ctx) => {
   applyHostReady(ctx, document.documentElement);
   if (mounted) return;
   mounted = true;
-  mountChrome();
+  compact = ctx.surface === 'panel';
+  document.body.classList.toggle('sb-compact', compact);
+  if (!compact) mountChrome();
   void boot();
 });
