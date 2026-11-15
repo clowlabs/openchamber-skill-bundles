@@ -7,6 +7,17 @@ Every skill you have is listed in every OpenCode prompt, and that list can grow 
 30,000 characters on each request. Skill Bundles lets you keep only the skills you use turned on and
 switch the rest on in groups when you need them.
 
+## Development checks
+
+From a clone of this repository, run `bun install`, then `bun run check` to run
+typechecking, extension and shared tests, lint, and the SDK package check.
+`bun run lint:fix` applies safe lint fixes; `bun run build` rebuilds the shipped
+panel and status bundles. The included OpenCode `/close` command runs the build,
+checks, and review workflow before a commit.
+
+The standalone lint configuration is `lint.jsonc`; the lint scripts pass it
+explicitly so they also work inside the parent Extensions workspace.
+
 ## What it does
 
 - **Bundles:** group skills ("Dev & coding", "Media", "NVIDIA", …) and turn a whole group on or

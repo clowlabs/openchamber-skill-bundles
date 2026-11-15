@@ -1,0 +1,29 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.6.4/schema.json",
+  "files": {
+    "includes": ["**", "!!**/node_modules", "!**/panel/main.js", "!**/status/main.js", "!**/panel/meter.css"]
+  },
+  "formatter": { "enabled": false },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "style": { "useTemplate": "off" },
+      "suspicious": {
+        // Existing teardown callbacks return dispose(); frontmatter exports valueOf.
+        "useIterableCallbackReturn": "off",
+        "noShadowRestrictedNames": "off"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["**/test/**"],
+      "linter": { "rules": { "suspicious": { "noAssignInExpressions": "off" } } }
+    },
+    {
+      "includes": ["**/status/index.html"],
+      "linter": { "rules": { "a11y": { "useSemanticElements": "off" } } }
+    }
+  ]
+}

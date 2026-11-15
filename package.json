@@ -1,6 +1,6 @@
 {
   "name": "skill-bundles",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "type": "module",
   "description": "Turn OpenCode skills on and off in named bundles.",
@@ -11,10 +11,15 @@
     "build": "cp status/meter.css panel/meter.css && openchamber-guest-bundle panel/main.ts panel/main.js && openchamber-guest-bundle status/main.ts status/main.js",
     "test": "node --test test/ && bun test test/panel-io.test.js",
     "test:panel": "bun test test/panel-io.test.js",
-    "typecheck": "tsc --noEmit --strict --target es2022 --moduleResolution bundler --module esnext --resolveJsonModule --lib es2022,dom panel/main.ts status/main.ts shared/panel/*.ts"
+    "check": "bash scripts/check.sh",
+    "lint": "biome lint --config-path=lint.jsonc .",
+    "lint:fix": "biome lint --write --config-path=lint.jsonc .",
+    "typecheck": "tsc --noEmit --strict --target es2022 --moduleResolution bundler --module esnext --resolveJsonModule --lib es2022,dom,dom.iterable panel/main.ts status/main.ts shared/panel/*.ts"
   },
   "devDependencies": {
-    "@openchamber/sdk": "2.7.1"
+    "@openchamber/sdk": "2.7.1",
+    "@biomejs/biome": "2.6.4",
+    "typescript": "5.9.3"
   },
   "openchamber": {
     "apiVersion": 1,
