@@ -3,7 +3,8 @@ import { mountBanner, mountButton, mountEmpty, mountSelect, mountTabs, mountText
 import * as core from '../src/core.js';
 import type { Mode } from '../src/core.js';
 import { $, el, HAND_EDIT, UNBUNDLED, type Disposable } from './dom';
-import { S, bundlesOf, commit, fmError, meta, mode, saveDescription, skillPath } from './io';
+import { shortDir } from './popup';
+import { S, bundlesOf, commit, fmError, homeOpt, meta, mode, saveDescription, skillPath } from './io';
 
 let mounts: Disposable[] = [];
 let disposing = false;
@@ -76,6 +77,15 @@ export function renderDetail(selected: string | null) {
       options: others.map((b) => ({ id: b.id, label: b.name, hint: b.enabled ? 'on' : 'off' })),
       onChange: (to) => commit((s) => core.moveSkill(s, id, mine.length ? mine[0].id : UNBUNDLED, to, { copy: mine.length > 0 })),
     }));
+  }
+
+  const dirs = core.projectsFor(state, id, homeOpt());
+  if (dirs.length) {
+    root.appendChild(el('div', 'sb-d-label', 'Projects'));
+    const line = el('div', 'sb-d-projects');
+    line.title = `On through a bundle in:\n${dirs.join('\n')}`;
+    line.textContent = dirs.map((d) => shortDir(d)).join(', ');
+    root.appendChild(line);
   }
 
   if (!builtin && md != null) {

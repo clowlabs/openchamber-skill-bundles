@@ -307,3 +307,76 @@ test("io: lock reclaim fault (rename aside fails) surfaces and writes nothing", 
   assert.match(r.err, /injected reclaim failure/);
   assert.deepEqual(snapshot(h), snap);
 });
+
+// ---------- per-project bundles (v0.2) ----------
+
+function projHome() {
+  const h = makeHome();
+  const proj = tmpDir("skills-io-proj-");
+  return { h, proj, pfile: path.join(proj, ".opencode/opencode.json") };
+}
+
+test("io: project file written in order skill → project → opencode → bundles", () => {
+  const { h, proj } = projHome();
+  // docs on in proj, plus beta "called" so all four kinds change
+  assert.equal(cli(h, ["on", "docs", "--project", proj]).code, 0);
+  const order = [];
+  const io = faultyIO({ rename: ([, b]) => order.push(b.startsWith(proj) ? "project" : path.relative(oc(h), b)) }, { rename: (a, b) => isTemp(a) && isTarget(a, b) });
+  fs.writeFileSync(path.join(proj, ".opencode/opencode.json"), '{"permissions":[]}\n');
+  const r = cli(h, ["set", "beta", "called"], io);
+  assert.equal(r.code, 0, r.err);
+  assert.deepEqual(order, ["skills/beta/SKILL.md", "project", "opencode.json", "skill-bundles.json"]);
+});
+
+test("io: fault in the project write rolls everything back (new and existing project files)", () => {
+  for (const existing of [false, true]) {
+    for (const failAt of ["temp", "rename-after"]) {
+      const { h, proj, pfile } = projHome();
+      if (existing) {
+        fs.mkdirSync(path.dirname(pfile));
+        fs.writeFileSync(pfile, '{\n  "model": "m",\n  "permissions": [{ "action": "bash", "resource": "*", "effect": "ask" }]\n}\n');
+      }
+      const snapH = snapshot(h);
+      const projBefore = existing ? fs.readFileSync(pfile, "utf8") : null;
+      // "on docs --project" + global "on docs" in one run so SKILL.md-free kinds all change:
+      const io =
+        failAt === "temp"
+          ? faultyIO({ writeNew: ([p]) => { if (p.startsWith(proj)) boom("injected project temp"); } }, { writeNew: isTemp })
+          : faultyIO({ rename: (a, n) => { if (n === 1) boom("injected rename after project"); } }, { rename: (a, b) => isTemp(a) && isTarget(a, b) });
+      const r = cli(h, ["on", "docs", "--project", proj], io);
+      assert.notEqual(r.code, 0, `${existing} ${failAt}`);
+      assert.match(r.err, /injected/);
+      assert.deepEqual(withoutBackups(snapshot(h)), snapH, `${existing} ${failAt}`);
+      if (existing) assert.equal(fs.readFileSync(pfile, "utf8"), projBefore);
+      else assert.ok(!fs.existsSync(pfile), "created project file removed on rollback");
+      assert.ok(!fs.readdirSync(proj, { recursive: true }).some((f) => String(f).endsWith(".tmp")));
+      noTmp(h);
+    }
+  }
+});
+
+test("io: project file changed on disk after load aborts; foreign write during rollback is rescued", () => {
+  const { h, proj, pfile } = projHome();
+  fs.mkdirSync(path.dirname(pfile));
+  fs.writeFileSync(pfile, '{"permissions":[]}\n');
+  const snap = snapshot(h);
+  let done = false;
+  const io = faultyIO({ writeNew: ([p]) => { if (!done && p.includes(".skill-bundles.json.")) { done = true; fs.appendFileSync(pfile, " "); } } }, { writeNew: isTemp });
+  let r = cli(h, ["on", "docs", "--project", proj], io);
+  assert.equal(r.code, 1, r.err);
+  assert.match(r.err, /\.opencode\/opencode\.json: file changed on disk, re-run/);
+  assert.equal(fs.readFileSync(pfile, "utf8"), '{"permissions":[]}\n ');
+  assert.deepEqual(withoutBackups(snapshot(h)), snap);
+
+  fs.writeFileSync(pfile, '{"permissions":[]}\n');
+  // project goes out at rename 0; someone rewrites it; rename 1 fails → rescue, theirs kept
+  const io2 = faultyIO({ rename: (a, n) => { if (n === 1) { fs.writeFileSync(pfile, "theirs"); boom("injected"); } } }, { rename: (a, b) => isTemp(a) && isTarget(a, b) });
+  r = cli(h, ["on", "docs", "--project", proj], io2);
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /changed by someone else, not restored: .*\.opencode\/opencode\.json \(original kept in .*rescue-/);
+  assert.equal(fs.readFileSync(pfile, "utf8"), "theirs");
+  const rescue = fs.readdirSync(path.dirname(pfile)).find((f) => f.includes("rescue-"));
+  assert.equal(fs.readFileSync(path.join(path.dirname(pfile), rescue), "utf8"), '{"permissions":[]}\n');
+  // no daily backup is made for project files
+  assert.ok(!fs.readdirSync(path.dirname(pfile)).some((f) => /skill-bundles-\d{8}$/.test(f)));
+});

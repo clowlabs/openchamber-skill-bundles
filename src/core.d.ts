@@ -5,6 +5,8 @@ export interface Bundle {
   name: string;
   enabled: boolean;
   skills: string[];
+  /** v0.2: normalized project dirs (absolute or "~/…"), sorted; absent when none. */
+  projects?: string[];
 }
 
 export interface State {
@@ -14,6 +16,8 @@ export interface State {
   overrides: Record<string, Mode>;
   /** Optional { [skillId]: projectDir[] }; absent when empty. */
   projectCopies?: Record<string, string[]>;
+  /** v0.2: every project dir whose file we have written skill rules into; absent when empty. */
+  managedProjects?: string[];
 }
 
 export interface ProjectRef {
@@ -66,7 +70,13 @@ export function isBuiltin(id: string): boolean;
 export function backupName(date?: Date): string;
 export function summary(state: State, allIds: string[]): Summary;
 
-export function parseBundles(text: string): State;
+export interface HomeOption {
+  /** Absolute home dir. When given, project dirs under it are stored as "~/…". */
+  home?: string;
+}
+
+/** With opts.home, stored project-dir aliases are migrated to canonical form and deduped. */
+export function parseBundles(text: string, opts?: HomeOption): State;
 export function serializeBundles(state: State): string;
 export function effectiveMode(state: State, id: string): Mode;
 export function groups(state: State, allIds: string[]): Group[];
@@ -99,15 +109,17 @@ export function looksBinary(text: string): boolean;
 
 // ---------- save planner ----------
 
-export type WriteKind = "skill" | "opencode" | "bundles";
+export type WriteKind = "skill" | "project" | "opencode" | "bundles";
 
 export interface PlannedWrite {
   kind: WriteKind;
   /** Present when kind === "skill". */
   id?: string;
-  /** "~/"-relative path (SKILLS_DIR/<id>/SKILL.md, OPENCODE_PATH or BUNDLES_PATH). */
+  /** Present when kind === "project": the normalized project dir. */
+  dir?: string;
+  /** SKILLS_DIR/<id>/SKILL.md, "<dir>/.opencode/opencode.json", OPENCODE_PATH or BUNDLES_PATH ("~/…" or absolute). */
   path: string;
-  /** Text as read; null only for a bundles file that does not exist yet (seeding). */
+  /** Text as read; null for a file that does not exist yet (bundles when seeding, a new project file). */
   before: string | null;
   after: string;
 }
@@ -125,16 +137,29 @@ export interface ChangePlan {
   writes: PlannedWrite[];
   skipped: Skipped[];
   order: WriteKind[];
+  /** `next` with managedProjects updated to what this plan writes; the bundles write serializes it. */
+  state: State;
 }
 
 /** Errors thrown by planChange carry which file they concern. */
 export interface PlanError extends Error {
-  file: "opencode" | "skill";
+  file: "opencode" | "skill" | "project";
+  /** Project dir when file === "project". */
   id?: string;
 }
 
-export const PUBLISH_ORDER: ["skill", "opencode", "bundles"];
-export function planChange(prev: PrevFiles, next: State, allIds: string[]): ChangePlan;
+export const PUBLISH_ORDER: ["skill", "project", "opencode", "bundles"];
+/**
+ * projectTexts: text of "<dir>/.opencode/opencode.json" for every dir in projectTargets(next)
+ * (null = missing). Required when next has any project targets.
+ */
+export function planChange(
+  prev: PrevFiles,
+  next: State,
+  allIds: string[],
+  projectTexts?: Record<string, string | null>,
+  opts?: HomeOption,
+): ChangePlan;
 
 // ---------- writer lock protocol ----------
 
@@ -165,3 +190,29 @@ export function panelLockRecord(token: string, now: number): string;
 export function parseLock(text: string): LockInfo;
 /** info null = no lock file. "free" and "stale" may both be taken over. */
 export function classifyLock(info: LockInfo | null, opts: ClassifyLockOptions): LockVerdict;
+
+// ---------- per-project bundles (v0.2) ----------
+
+/** ".opencode/opencode.json" */
+export const PROJECT_CONFIG_REL: ".opencode/opencode.json";
+/**
+ * Canonical spelling. Absolute or "~/…"; "." segments, repeated and trailing "/" collapsed; ".."
+ * throws. With opts.home, a dir under home becomes "~/…" (home itself "~").
+ */
+export function normalizeProjectDir(dir: string, opts?: HomeOption): string;
+/** "<dir>/.opencode/opencode.json" */
+export function projectConfigPath(dir: string): string;
+export function setBundleProjects(state: State, bundleId: string, dirs: string[], opts?: HomeOption): State;
+export function addBundleProject(state: State, bundleId: string, dir: string, opts?: HomeOption): State;
+/** Removes the dir under any spelling that canonicalizes to the same dir. */
+export function removeBundleProject(state: State, bundleId: string, dir: string, opts?: HomeOption): State;
+/** Canonical project dirs where the skill is allowed (through any bundle listing the dir), sorted. */
+export function projectsFor(state: State, skillId: string, opts?: HomeOption): string[];
+/** Canonical dirs whose project file must be read and planned: bundle projects ∪ managedProjects, sorted. */
+export function projectTargets(state: State, opts?: HomeOption): string[];
+/** All stored project dirs in canonical form, aliases merged. Returns `state` itself if already canonical. */
+export function canonicalizeProjects(state: State, opts?: HomeOption): State;
+/** Rename dirs per `aliases` (dir → dir to keep), e.g. after an adapter finds two are one folder. */
+export function mergeProjectDirs(state: State, aliases: Record<string, string>): State;
+/** Pure. Replaces only skill rules with one allow per id (no deny). null in + no ids → null out. */
+export function applyProjectPermissions(text: string | null, skillIds: string[]): string | null;

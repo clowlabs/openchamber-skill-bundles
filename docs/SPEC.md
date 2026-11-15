@@ -167,3 +167,52 @@ The seed's enabled bundles (dev + plan) reproduce today's hand-written rules exa
 | workspace | repo root of `~/Projects/Extensions` except `skill-bundles/` |
 
 Tests: `node --test skill-bundles/test/` (built-in runner, no deps).
+
+## Per-project bundles (v0.2)
+
+Verified 2026-11-14 with `opencode run`: rules in `<project>/.opencode/opencode.json` are applied
+after the global ones, so a project `allow` beats the global `deny *`.
+
+- Bundle gains optional `projects: string[]` (absolute or `~/` dirs, normalized like
+  `projectSkillDir`'s dir: no `..`, no trailing `/`, deduped, sorted). Absent/empty = omitted on
+  serialize (old files round-trip byte-for-byte).
+- State gains optional `managedProjects: string[]`: every project dir whose file we have ever written
+  skill rules into. Used to remove rules when a dir leaves every bundle. Omitted when empty.
+- Project file: `<dir>/.opencode/opencode.json`. Its skill rules = one allow per skill in any bundle
+  that lists `dir` (sorted), and NO `deny *` (the global deny already applies). A skill whose
+  effective global mode is not off is still listed (harmless). A dir in managedProjects but in no
+  bundle gets its skill rules removed (other rules/keys untouched; empty permissions array kept).
+  Missing file → created as `{"$schema": "https://opencode.ai/config.json", "permissions": [...]}`
+  only when there is at least one rule. Never delete files.
+- Edit = same textual splice as `applyPermissions` (only `action:"skill"` rules replaced), new pure
+  core fn `applyProjectPermissions(text|null, skillIds) -> text|null` (null in + no ids = null out).
+- `planChange` gets an optional 4th arg `projectTexts: {[dir]: string|null}` and emits writes with
+  `kind: "project"`, `path: "<dir>/.opencode/opencode.json"`, ordered after skills and before
+  global opencode (PUBLISH_ORDER becomes ["skill","project","opencode","bundles"]). Same
+  conflict/rollback/lock rules as other targets.
+- Core helpers: `setBundleProjects(state, bundleId, dirs)`, `addBundleProject`, `removeBundleProject`,
+  `projectsFor(state, skillId) -> dirs`, `projectTargets(state) -> dirs to write`.
+- "When called" can't differ per project (it lives in the shared SKILL.md); project rules only allow.
+- CLI: `skills on <bundle> --project <dir>`, `skills off <bundle> --project <dir>`,
+  `skills projects [<bundle>]`. Mutations go through planChange.
+  - `<dir>`: absolute stays; `~/…` is stored as `~/…` (expanded against `--home` only for I/O);
+    relative is resolved against the cwd. `on` requires the dir to exist; `~` alone is refused.
+  - Every project target file (missing → null) is a planned input exactly like the global files:
+    snapshotted at load, symlinks resolved (and re-verified before rename), conflict-checked,
+    and included in rollback/rescue. A project file we created is deleted again on rollback.
+  - **No daily backup for project files**, by choice: we only ever replace `action:"skill"` rules
+    there (everything else is a byte-preserving splice), and rollback/rescue covers failed runs.
+  - `list` appends ` +N project(s)` to a bundle that has projects.
+  - **Aliases.** Core canonicalizes every project dir (`normalizeProjectDir(dir, {home})`): `.`
+    segments, repeated and trailing `/` collapsed, `..` refused, and with `home` a dir under home is
+    spelled `~/…`. parseBundles (given `{home}`) migrates stored aliases; projectTargets,
+    projectsFor and planChange group by canonical dir, so each file gets ONE write with the union.
+    Callers pass `home` (core is pure). The CLI additionally realpaths every target and merges dirs
+    that are the same physical folder under the spelling listed first (bundle order, then
+    managedProjects), printing a note; `on --project` reuses a stored spelling of the same folder.
+  - `managedProjects` is carried in the plan's `state`: a dir is added when a write leaves rules in
+    its file, and dropped once it is in no bundle (its rules are removed by that same plan).
+- Panel: bundle header "Projects…" control + header right-click → checklist of OpenChamber projects
+  (listProjects, skip chats dir) with filter + "Add folder…" text field (absolute/`~/` path);
+  header badge "Off · N projects" / "On · +N projects"; skill detail lists its projects.
+  Manifest filesystem adds "~/**/.opencode/opencode.json" and "/**/.opencode/opencode.json".

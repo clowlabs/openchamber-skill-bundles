@@ -72,6 +72,14 @@ ln -s "$PWD/openchamber-skill-bundles/bin/skills" ~/.local/bin/skills
 
 No network access, no background service, no OpenCode plugin.
 
+## Updating
+
+- **Extension:** if you installed from the GitHub URL, OpenChamber checks for new versions on its
+  own (soon after it opens, then every few hours) and shows **Update** on the card in
+  Settings → Extensions. If a new version asks for more permissions, you approve them again there.
+- **`skills` command:** run `git pull` in the folder you cloned. The link on your PATH keeps
+  pointing at it.
+
 ## The `skills` command
 
 ```

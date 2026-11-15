@@ -1,8 +1,10 @@
 // "Send skill to project": the context menu and the folder copy.
-import { HostRequestError, type HostClient } from '@openchamber/sdk';
+import { type HostClient } from '@openchamber/sdk';
 import * as core from '../src/core.js';
+import {
+  button, closePopup, codeOf, createPopup, note, projects, projectsNote, shortDir, watchProjects, type Project,
+} from './popup';
 
-export type Project = { id: string; name: string; directory: string };
 export type SendDeps = {
   host: HostClient;
   /** Why this skill can't be sent, or null. */
@@ -19,49 +21,10 @@ const FILES_MAX = 2000;
 const HINT = 'Click = move · ⌥/Alt-click = duplicate';
 
 let deps: SendDeps;
-let projects: Project[] = [];
-let projectsState: 'idle' | 'loading' | 'ready' | 'error' = 'idle';
-let projectsError = '';
-let subscribed = false;
-let onProjectsChange: (() => void) | null = null;
 
 export function initSend(d: SendDeps) {
   deps = d;
 }
-
-function codeOf(e: unknown) {
-  return e instanceof HostRequestError ? e.code : '';
-}
-
-function ensureProjects() {
-  if (subscribed) return;
-  subscribed = true;
-  projectsState = 'loading';
-  const apply = (snap: { state: string; projects: Project[] }) => {
-    projects = snap.projects.filter((p) => !core.isChatsDir(p.directory)).sort((a, b) => a.name.localeCompare(b.name));
-    projectsState = snap.state === 'error' ? 'error' : snap.state === 'ready' ? 'ready' : 'loading';
-    if (snap.state === 'error') projectsError = 'OpenChamber could not list projects.';
-    onProjectsChange?.();
-  };
-  const fail = (e: unknown) => {
-    subscribed = false;
-    projectsState = 'error';
-    projectsError = codeOf(e) === 'NOT_GRANTED'
-      ? 'Needs the “sessions” permission. Re-approve Skill Bundles in Settings → Extensions.'
-      : `Could not list projects: ${e instanceof Error ? e.message : String(e)}`;
-    onProjectsChange?.();
-  };
-  deps.host.listProjects().then(apply, fail);
-  deps.host.onProjects(apply).catch((e) => {
-    subscribed = false;
-    console.warn('skill-bundles: onProjects failed', e);
-  });
-}
-
-function homeOf(dir: string) {
-  return /^(\/home\/[^/]+|\/Users\/[^/]+|\/root)(?=\/|$)/.exec(dir)?.[1];
-}
-const shortDir = (dir: string) => core.shortenDir(dir, homeOf(dir));
 
 // ---------- copy ----------
 
@@ -140,33 +103,10 @@ async function copySkill(id: string, project: Project, move: boolean) {
 
 // ---------- menu ----------
 
-let open: { close: () => void } | null = null;
-
-export function closeSendMenu() {
-  open?.close();
-}
+export const closeSendMenu = closePopup;
 
 export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolean, returnFocus?: HTMLElement | null) {
-  closeSendMenu();
-  ensureProjects();
   const blocked = deps.blockedReason(id);
-
-  const menu = document.createElement('div');
-  menu.className = 'sb-ctx';
-  menu.setAttribute('role', 'menu');
-  menu.tabIndex = -1;
-  const title = document.createElement('div');
-  title.className = 'sb-ctx-title';
-  menu.appendChild(title);
-  let filterInput: HTMLInputElement | null = null;
-  const list = document.createElement('div');
-  list.className = 'sb-ctx-items';
-  menu.appendChild(list);
-  const foot = document.createElement('div');
-  foot.className = 'sb-ctx-foot';
-  foot.textContent = blocked ?? HINT;
-  menu.appendChild(foot);
-
   let altDown = altAtOpen;
   let filter = '';
   let busy = false;
@@ -174,14 +114,22 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
   const dup = () => altDown;
   let staleFiles: string[] | null = []; // null = listing failed
 
+  let unwatch = () => {};
+  const pop = createPopup({
+    itemSelector: 'button.sb-ctx-item',
+    returnFocus,
+    onKey: (e) => { if (e.key === 'Alt') { altDown = e.type === 'keydown'; paintTitle(); } },
+    onClose: () => unwatch(),
+  });
+  const { menu, title, list, foot } = pop;
+  foot.textContent = blocked ?? HINT;
+
   const paintTitle = () => {
     title.textContent = `${dup() ? 'Duplicate' : 'Move'} ${id} to…`;
     menu.setAttribute('aria-label', title.textContent);
     menu.classList.toggle('dup', dup());
     for (const b of list.querySelectorAll<HTMLElement>('.sb-ctx-icon')) b.textContent = dup() ? '⧉' : '→';
   };
-
-  const items = () => [...list.querySelectorAll<HTMLButtonElement>('button.sb-ctx-item:not([disabled])')];
 
   const activate = async (p: Project, alt: boolean, overwrite = false) => {
     if (busy || blocked) return;
@@ -206,10 +154,10 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
         menu.querySelector<HTMLButtonElement>('.sb-ctx-confirm button')?.focus();
         return;
       }
-      close();
+      pop.close();
       await deps.enqueue(() => copySkill(id, p, move));
     } catch (e) {
-      close();
+      pop.close();
       deps.toastError(e, `Could not send ${id}`);
     }
   };
@@ -217,17 +165,10 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
   const paint = () => {
     const keep = document.activeElement instanceof HTMLElement && menu.contains(document.activeElement) ? document.activeElement.dataset.pid : undefined;
     list.textContent = '';
-    if (projects.length > 8 && !filterInput) {
-      filterInput = document.createElement('input');
-      filterInput.className = 'sb-ctx-filter';
-      filterInput.placeholder = 'Filter projects';
-      filterInput.setAttribute('aria-label', 'Filter projects');
-      filterInput.addEventListener('input', () => { filter = filterInput!.value; paint(); });
-      menu.insertBefore(filterInput, list);
-    }
+    pop.ensureFilter(projects.length, 'Filter projects', (v) => { filter = v; paint(); });
     const shown: Project[] = core.filterProjects(projects, filter);
-    if (projectsState === 'error') list.appendChild(note(projectsError));
-    else if (!shown.length) list.appendChild(note(projectsState === 'loading' ? 'Loading projects…' : filter ? 'No matching projects' : 'No projects in OpenChamber'));
+    const status = projectsNote(shown.length, filter);
+    if (status) list.appendChild(note(status));
     for (const p of shown) {
       if (confirmFor === p.id) {
         const c = document.createElement('div');
@@ -281,85 +222,7 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
 
   const focusItem = (pid: string) => list.querySelector<HTMLElement>(`[data-pid="${CSS.escape(pid)}"]`)?.focus();
 
-  const onKey = (e: KeyboardEvent) => {
-    if (e.key === 'Alt') { altDown = e.type === 'keydown'; paintTitle(); }
-    if (e.type !== 'keydown') return;
-    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); return; }
-    const all = items();
-    const i = all.indexOf(document.activeElement as HTMLButtonElement);
-    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-      e.preventDefault();
-      if (!all.length) return;
-      const n = e.key === 'ArrowDown' ? (i + 1) % all.length : i <= 0 ? all.length - 1 : i - 1;
-      all[n].focus();
-    } else if (e.key === 'Home' || e.key === 'End') {
-      e.preventDefault();
-      (e.key === 'Home' ? all[0] : all[all.length - 1])?.focus();
-    } else if (e.key === 'Enter' && document.activeElement === filterInput) {
-      e.preventDefault();
-      all[0]?.click();
-    } else if (e.key === 'Tab') {
-      e.preventDefault();
-      (filterInput && document.activeElement !== filterInput ? filterInput : all[0])?.focus();
-    }
-  };
-  const onDown = (e: PointerEvent) => { if (!menu.contains(e.target as Node)) close(); };
-  const onBlur = () => close();
-
-  function close() {
-    if (open?.close !== close) return;
-    open = null;
-    onProjectsChange = null;
-    document.removeEventListener('keydown', onKey, true);
-    document.removeEventListener('keyup', onKey, true);
-    document.removeEventListener('pointerdown', onDown, true);
-    window.removeEventListener('blur', onBlur);
-    window.removeEventListener('resize', onBlur);
-    menu.remove();
-    if (returnFocus?.isConnected) returnFocus.focus();
-  }
-
-  open = { close };
-  onProjectsChange = () => paint();
-  document.addEventListener('keydown', onKey, true);
-  document.addEventListener('keyup', onKey, true);
-  document.addEventListener('pointerdown', onDown, true);
-  window.addEventListener('blur', onBlur);
-  window.addEventListener('resize', onBlur);
-  menu.addEventListener('contextmenu', (e) => e.preventDefault());
-
-  menu.style.left = '0px';
-  menu.style.top = '0px';
-  menu.style.visibility = 'hidden';
-  document.body.appendChild(menu);
+  unwatch = watchProjects(paint);
   paint();
-  place(menu, x, y);
-  menu.style.visibility = '';
-  (filterInput ?? items()[0] ?? menu).focus();
-}
-
-function place(menu: HTMLElement, x: number, y: number) {
-  const pad = 4;
-  const r = menu.getBoundingClientRect();
-  const vw = window.innerWidth, vh = window.innerHeight;
-  let left = x + r.width + pad > vw ? x - r.width : x;
-  let top = y + r.height + pad > vh ? y - r.height : y;
-  left = Math.max(pad, Math.min(left, vw - r.width - pad));
-  top = Math.max(pad, Math.min(top, vh - r.height - pad));
-  menu.style.left = `${left}px`;
-  menu.style.top = `${top}px`;
-}
-
-function button(text: string, cls: string) {
-  const b = document.createElement('button');
-  b.type = 'button';
-  b.className = cls;
-  if (text) b.textContent = text;
-  return b;
-}
-function note(text: string) {
-  const n = document.createElement('div');
-  n.className = 'sb-ctx-note';
-  n.textContent = text;
-  return n;
+  pop.show(x, y);
 }

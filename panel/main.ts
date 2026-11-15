@@ -14,6 +14,8 @@ import {
 import * as core from '../src/core.js';
 import type { Group, Mode } from '../src/core.js';
 import { closeSendMenu, initSend, openSendMenu } from './send';
+import { initPopup, setHomeSource } from './popup';
+import { openProjectsMenu, refreshProjectsMenu } from './projects';
 import { deferRender, endDrag, initDrag, isDragging, onPillDown } from './drag';
 import { renderDetail } from './detail';
 import { $, el, HAND_EDIT, MODE_LABEL, UNBUNDLED, type Disposable } from './dom';
@@ -24,6 +26,8 @@ import { connectHost } from '@openchamber/sdk';
 
 const host = connectHost();
 setHost(host);
+initPopup(host);
+setHomeSource(() => S.home);
 
 /** View-only state. */
 const V = {
@@ -165,6 +169,26 @@ function renderGroup(g: Group, root: HTMLElement) {
     head.appendChild(el('span', 'sb-group-name', g.name));
     head.appendChild(el('span', 'sb-group-count', V.query ? `${visible.length}/${g.skills.length}` : `${g.skills.length}`));
     if (!g.synthetic) {
+      const n = g.projects?.length ?? 0;
+      if (n) {
+        const badge = el('span');
+        head.appendChild(badge);
+        const label = g.enabled ? `On · +${n} project${n > 1 ? 's' : ''}` : `Off · ${n} project${n > 1 ? 's' : ''}`;
+        badge.title = (g.projects ?? []).join('\n');
+        groupMounts.push(mountBadge(badge, { label, tone: g.enabled ? 'success' : 'info' }));
+      }
+      const pb = el('button', 'sb-proj-btn', 'Projects');
+      pb.type = 'button';
+      pb.setAttribute('aria-haspopup', 'dialog');
+      pb.title = 'Turn this bundle on in specific projects';
+      if (n) pb.appendChild(el('span', 'sb-proj-count', String(n)));
+      pb.addEventListener('click', () => { const r = pb.getBoundingClientRect(); openProjectsMenu(g.id, r.left, r.bottom, pb); });
+      head.appendChild(pb);
+      head.addEventListener('contextmenu', (e) => {
+        if ((e.target as HTMLElement).closest('.sb-pill')) return;
+        e.preventDefault();
+        openProjectsMenu(g.id, e.clientX, e.clientY, pb);
+      });
       const sw = el('span'); head.appendChild(sw);
       groupMounts.push(mountSwitch(sw, { label: '', checked: g.enabled, onChange: (on) => commit((s) => core.setBundleEnabled(s, g.id, on)) }));
       const m = el('span'); head.appendChild(m);
@@ -325,6 +349,7 @@ function render() {
   renderGroups();
   renderDetail(V.selected);
   renderLight();
+  refreshProjectsMenu();
 }
 
 hooks.render = render;

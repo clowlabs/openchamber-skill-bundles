@@ -1,6 +1,6 @@
 {
   "name": "skill-bundles",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Turn OpenCode skills on and off in named bundles.",
@@ -35,7 +35,11 @@
         "~/.config/opencode/skills/**",
         "~/.config/opencode/.skill-bundles.lock",
         "~/**/.opencode/skills/**",
-        "/**/.opencode/skills/**"
+        "/**/.opencode/skills/**",
+        "~/**/.opencode/opencode.json",
+        "/**/.opencode/opencode.json",
+        "~/**/.opencode/opencode.json.skill-bundles-rescue-*",
+        "/**/.opencode/opencode.json.skill-bundles-rescue-*"
       ]
     }
   },

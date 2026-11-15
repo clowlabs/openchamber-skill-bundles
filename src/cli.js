@@ -14,6 +14,9 @@ Usage:
   skills show <bundle>                 skills in a bundle with their modes
   skills on <bundle...>                enable bundles
   skills off <bundle...>               disable bundles
+  skills on|off <bundle...> --project <dir>
+                                       allow/stop allowing a bundle in one project only
+  skills projects [<bundle>]           project dirs per bundle
   skills set <skill> auto|called|off|clear
                                        per-skill override (clear removes it)
   skills move <skill> <toBundle> [--from <bundle>] [--copy]
@@ -79,18 +82,19 @@ let print = (s) => process.stdout.write(s + "\n");
 let warn = (s) => process.stderr.write(s + "\n");
 
 function parseArgs(argv) {
-  const opts = { dryRun: false, home: null, from: null, copy: false };
+  const opts = { dryRun: false, home: null, from: null, copy: false, project: null };
   const pos = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") opts.dryRun = true;
     else if (a === "--copy") opts.copy = true;
-    else if (a === "--home" || a === "--from") {
+    else if (a === "--home" || a === "--from" || a === "--project") {
       const v = argv[++i];
       if (v === undefined) throw new CliError(`${a} needs a value`);
       opts[a.slice(2)] = v;
     } else if (a.startsWith("--home=")) opts.home = a.slice(7);
     else if (a.startsWith("--from=")) opts.from = a.slice(7);
+    else if (a.startsWith("--project=")) opts.project = a.slice(10);
     else if (a === "-h" || a === "--help") pos.unshift("help");
     else if (a.startsWith("--")) throw new CliError(`unknown option ${a}`);
     else pos.push(a);
@@ -128,12 +132,14 @@ function suggest(word, candidates) {
 
 function makeEnv(opts, homeDefault) {
   const home = path.resolve(opts.home ?? homeDefault);
+  // project dirs stored as given form: "~/…" stays "~/…" (expanded against home only for I/O)
   const expand = (p) => (p.startsWith("~") ? path.join(home, p.slice(1)) : p);
   return {
     home,
     bundlesPath: expand(core.BUNDLES_PATH),
     opencodePath: expand(core.OPENCODE_PATH),
     skillsDir: expand(core.SKILLS_DIR),
+    expand,
   };
 }
 
@@ -184,7 +190,7 @@ function loadAll(env) {
   }
   let state;
   try {
-    state = core.parseBundles(bundlesText);
+    state = core.parseBundles(bundlesText, { home: env.home });
   } catch (e) {
     throw new CliError(`${seeded ? "seed" : env.bundlesPath}: ${e.message}`);
   }
@@ -228,6 +234,24 @@ function diff(file, oldText, newText) {
 const MAX_HOPS = 40;
 
 // Follows a symlink chain to the file that should actually be written.
+// A path whose parent dirs do not exist yet (e.g. a project's new .opencode/): realpath the deepest
+// existing ancestor and append the missing tail, so the identity stays the same once it is created.
+function resolveMissing(p) {
+  const tail = [];
+  let cur = p;
+  for (;;) {
+    const up = path.dirname(cur);
+    tail.unshift(path.basename(cur));
+    if (up === cur) return p;
+    cur = up;
+    try {
+      return path.join(io.realpath(cur), ...tail);
+    } catch (e) {
+      if (e.code !== "ENOENT" && e.code !== "ENOTDIR") throw e;
+    }
+  }
+}
+
 function realTarget(p) {
   const seen = new Set();
   let cur = path.resolve(p);
@@ -244,7 +268,7 @@ function realTarget(p) {
         realParent = io.realpath(parent);
         if (!io.stat(realParent).isDirectory()) throw new Error("not a directory");
       } catch {
-        if (!viaLink) return cur;
+        if (!viaLink) return resolveMissing(cur);
         throw new CliError(`${p}: symlink target directory ${parent} does not exist`);
       }
       return path.join(realParent, path.basename(cur));
@@ -275,22 +299,66 @@ function tempPath(real) {
 }
 
 
+// Physical identity of a project dir: realpath when it exists, else the expanded path.
+function physicalDir(env, dir) {
+  const p = env.expand(dir);
+  try {
+    return io.realpath(p);
+  } catch (e) {
+    if (e.code === "ENOENT") return path.resolve(p);
+    throw new CliError(`${dir}: ${e.code === "ELOOP" ? "symlink cycle" : e.message}`);
+  }
+}
+
+// Canonical dirs that are the same physical folder (symlinks, bind spellings) are merged under
+// the spelling listed first: stored spellings in bundle order, then managedProjects.
+function mergePhysicalAliases(env, state) {
+  const order = [];
+  for (const d of [...state.bundles.flatMap((b) => b.projects ?? []), ...(state.managedProjects ?? [])]) {
+    if (!order.includes(d)) order.push(d);
+  }
+  const first = new Map();
+  const aliases = Object.create(null);
+  for (const d of order) {
+    const key = physicalDir(env, d);
+    if (first.has(key)) aliases[d] = first.get(key);
+    else first.set(key, d);
+  }
+  if (!Object.keys(aliases).length) return state;
+  for (const [a, b] of Object.entries(aliases)) warn(`skills: note: ${a} and ${b} are the same folder; using ${b}`);
+  return core.mergeProjectDirs(state, aliases);
+}
+
 // Plans every file change with core.planChange, then writes them (or prints diffs).
 function commit(env, ctx, state, opts) {
   for (const t of [env.opencodePath, env.bundlesPath]) realTarget(t); // clean errors for bad symlinks
   const ocOld = readOrNull(env.opencodePath);
   ctx.inputs.set(env.opencodePath, ocOld);
   if (ocOld === null) throw new CliError(`${env.opencodePath} not found`);
+  state = mergePhysicalAliases(env, state);
+  // every project target is an input: read it (missing → null) and snapshot it like any other
+  const projectTexts = Object.create(null);
+  for (const dir of core.projectTargets(state, { home: env.home })) {
+    const file = env.expand(core.projectConfigPath(dir));
+    realTarget(file);
+    const t = ctx.inputs.has(file) ? ctx.inputs.get(file) : readOrNull(file);
+    ctx.inputs.set(file, t);
+    projectTexts[dir] = t;
+  }
   let plan;
   try {
-    plan = core.planChange({ bundlesText: ctx.originalBundlesText, opencodeText: ocOld, skillMds: ctx.skillMds }, state, ctx.allIds);
+    plan = core.planChange({ bundlesText: ctx.originalBundlesText, opencodeText: ocOld, skillMds: ctx.skillMds }, state, ctx.allIds, projectTexts, { home: env.home });
   } catch (e) {
     throw new CliError(e.file === "opencode" ? `${env.opencodePath}: ${e.message}` : e.message);
   }
   for (const { id, reason } of plan.skipped) {
     print(`skipped skills/${id}/SKILL.md (left unchanged; allow rule still applied): ${reason}`);
   }
-  const where = (w) => (w.kind === "skill" ? path.join(env.skillsDir, w.id, "SKILL.md") : w.kind === "opencode" ? env.opencodePath : env.bundlesPath);
+  const where = (w) =>
+    w.kind === "skill" ? path.join(env.skillsDir, w.id, "SKILL.md")
+    : w.kind === "project" ? env.expand(w.path)
+    : w.kind === "opencode" ? env.opencodePath
+    : env.bundlesPath;
   const writes = plan.writes.map((w) => ({ ...w, file: where(w) }));
   if (opts.dryRun) {
     if (!writes.length) print("(dry run) no changes");
@@ -304,6 +372,7 @@ function commit(env, ctx, state, opts) {
     if (w.kind === "skill") ctx.skillMds[w.id] = w.after;
     if (w.kind === "bundles") ctx.originalBundlesText = w.after;
   }
+  ctx.state = plan.state;
   return writes.length;
 }
 
@@ -536,7 +605,16 @@ function need(pos, n, usage) {
 function bundleLine(g, state) {
   const on = g.skills.filter((id) => core.effectiveMode(state, id) !== "off").length;
   const flag = g.synthetic ? "   " : g.enabled ? "on " : "off";
-  return `${flag}  ${g.id.padEnd(16)} ${`${on}/${g.skills.length} on`.padEnd(11)} ${g.name}`;
+  const n = state.bundles.find((b) => b.id === g.id)?.projects?.length ?? 0;
+  const proj = n ? ` +${n} project${n === 1 ? "" : "s"}` : "";
+  return `${flag}  ${g.id.padEnd(16)} ${`${on}/${g.skills.length} on`.padEnd(11)} ${g.name}${proj}`;
+}
+
+// "--project <dir>": absolute stays, "~"/"~/…" stays "~/…", anything else is resolved against cwd.
+function projectArg(dir) {
+  if (dir === "~" || dir === "~/") throw new CliError("--project: use a project directory, not your home directory");
+  if (dir.startsWith("~/") || path.isAbsolute(dir)) return dir;
+  return path.resolve(process.cwd(), dir);
 }
 
 function totals(state, allIds) {
@@ -577,6 +655,10 @@ function run(env, opts, pos, cmd) {
     print(`seeded ${env.bundlesPath} from defaults`);
   }
 
+  // Stored spellings of one physical folder are merged before any mutation, so `off --project`
+  // removes the assignment whichever spelling it was stored under.
+  if (cmd === "on" || cmd === "off") state = mergePhysicalAliases(env, state);
+
   switch (cmd) {
     case "list": {
       if (ctx.seeded && opts.dryRun) commit(env, ctx, state, opts);
@@ -611,6 +693,27 @@ function run(env, opts, pos, cmd) {
     case "off": {
       need(pos, 1, `${cmd} <bundle...>`);
       const ids = pos.map((r) => resolveBundle(state, r));
+      if (opts.project !== null) {
+        let dir;
+        try {
+          dir = core.normalizeProjectDir(projectArg(opts.project), { home: env.home });
+          if (dir === "~") throw new Error("--project: use a project directory, not your home directory");
+          if (cmd === "on") {
+            let st = null;
+            try { st = io.stat(env.expand(dir)); } catch {}
+            if (!st?.isDirectory()) throw new Error(`project directory ${dir} does not exist`);
+          }
+          // an alias of a dir already stored is the same project: use the stored spelling
+          const key = physicalDir(env, dir);
+          const stored = [...state.bundles.flatMap((b) => b.projects ?? []), ...(state.managedProjects ?? [])]
+            .find((d) => d !== dir && physicalDir(env, d) === key);
+          if (stored) dir = stored;
+          for (const id of ids) state = cmd === "on" ? core.addBundleProject(state, id, dir, { home: env.home }) : core.removeBundleProject(state, id, dir, { home: env.home });
+        } catch (e) {
+          throw new CliError(e.message);
+        }
+        return mutate(state, `${cmd === "on" ? "allowed" : "stopped allowing"} ${ids.join(", ")} in ${dir}`);
+      }
       for (const id of ids) state = core.setBundleEnabled(state, id, cmd === "on");
       return mutate(state, `${cmd === "on" ? "enabled" : "disabled"} ${ids.join(", ")}; ${totals(state, ctx.allIds)}`);
     }
@@ -657,8 +760,22 @@ function run(env, opts, pos, cmd) {
     }
     case "sync":
       return mutate(state, `synced; ${totals(state, ctx.allIds)}`);
+    case "projects": {
+      const bs = pos.length ? pos.map((r) => state.bundles.find((b) => b.id === resolveBundle(state, r))) : state.bundles;
+      let any = false;
+      for (const b of bs) {
+        if (!pos.length && !b.projects?.length) continue;
+        any = true;
+        print(`${b.id}${b.projects?.length ? "" : " (no projects)"}`);
+        for (const d of b.projects ?? []) print(`  ${d}`);
+      }
+      if (!any) print("no bundle has projects");
+      const orphan = (state.managedProjects ?? []).filter((d) => !state.bundles.some((b) => (b.projects ?? []).includes(d)));
+      if (!pos.length && orphan.length) print(`pending rule removal: ${orphan.join(", ")} (run "skills sync")`);
+      return 0;
+    }
     default:
-      throw new CliError(`unknown command "${cmd}".${suggest(cmd, ["list", "show", "on", "off", "set", "move", "new", "rename", "rm", "sync", "status", "help"])} Run "skills help".`);
+      throw new CliError(`unknown command "${cmd}".${suggest(cmd, ["list", "show", "on", "off", "set", "move", "new", "rename", "rm", "sync", "status", "projects", "help"])} Run "skills help".`);
   }
 }
 

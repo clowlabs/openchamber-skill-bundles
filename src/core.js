@@ -27,7 +27,7 @@ const uniq = (arr) => [...new Set(arr)];
 
 // ---------- bundles state ----------
 
-export function parseBundles(text) {
+export function parseBundles(text, { home } = {}) {
   let raw;
   try {
     raw = JSON.parse(text);
@@ -55,7 +55,10 @@ export function parseBundles(text) {
     if (!Array.isArray(skills) || skills.some((s) => typeof s !== "string" || !s)) {
       throw new Error(`${where}.skills must be an array of non-empty strings`);
     }
-    return { id: b.id, name: b.name || b.id, enabled: b.enabled === true, skills: uniq(skills) };
+    const out = { id: b.id, name: b.name || b.id, enabled: b.enabled === true, skills: uniq(skills) };
+    const projects = parseDirList(b.projects, `${where}.projects`, home);
+    if (projects) out.projects = projects;
+    return out;
   });
   const ov = raw.overrides ?? {};
   if (!ov || typeof ov !== "object" || Array.isArray(ov)) throw new Error("skill-bundles.json: \"overrides\" must be an object");
@@ -67,17 +70,24 @@ export function parseBundles(text) {
   const out = { version: 1, bundles, overrides };
   const pc = parseProjectCopies(raw.projectCopies);
   if (pc) out.projectCopies = pc;
+  const mp = parseDirList(raw.managedProjects, "skill-bundles.json: managedProjects", home);
+  if (mp) out.managedProjects = mp;
   return out;
 }
 
 export function serializeBundles(state) {
   const out = {
     version: 1,
-    bundles: state.bundles.map((b) => ({ id: b.id, name: b.name, enabled: !!b.enabled, skills: [...b.skills] })),
+    bundles: state.bundles.map((b) => {
+      const o = { id: b.id, name: b.name, enabled: !!b.enabled, skills: [...b.skills] };
+      if (b.projects?.length) o.projects = dirList(b.projects);
+      return o;
+    }),
     overrides: copyOverrides(state.overrides),
   };
   const pc = parseProjectCopies(state.projectCopies);
   if (pc) out.projectCopies = pc;
+  if (state.managedProjects?.length) out.managedProjects = dirList(state.managedProjects);
   return JSON.stringify(out, null, 2) + "\n";
 }
 
@@ -112,12 +122,39 @@ export function markMovedToProject(state, id, projectDir) {
   return setOverride(addProjectCopy(state, id, projectDir), id, "off");
 }
 
-function normalizeDir(dir) {
-  if (typeof dir !== "string" || !(dir.startsWith("/") || dir.startsWith("~/"))) {
+// Normalized, deduped, sorted dir list.
+function dirList(dirs, home) {
+  return uniq(dirs.map((d) => normalizeDir(d, home))).sort();
+}
+
+// Optional dir list from a file: undefined when absent or empty. Stored aliases are migrated
+// to their canonical spelling and deduped.
+function parseDirList(v, where, home) {
+  if (v === undefined || v === null) return undefined;
+  if (!Array.isArray(v) || v.some((d) => typeof d !== "string" || !d)) throw new Error(`${where} must be an array of directory strings`);
+  let out;
+  try {
+    out = dirList(v, home);
+  } catch (e) {
+    throw new Error(`${where}: ${e.message}`);
+  }
+  return out.length ? out : undefined;
+}
+
+// Canonical spelling: "." segments, repeated and trailing slashes collapsed; ".." refused.
+// With `home`, a dir under home is spelled "~/…" (home itself "~"), so the two spellings meet.
+function normalizeDir(dir, home) {
+  if (typeof dir !== "string" || !(dir.startsWith("/") || dir === "~" || dir.startsWith("~/"))) {
     throw new Error(`Project directory must be absolute: ${JSON.stringify(dir)}`);
   }
-  const d = dir.replace(/\/+$/, "") || "/";
-  if (d.split("/").some((s) => s === "..")) throw new Error(`Project directory must not contain "..": ${dir}`);
+  const tilde = dir === "~" || dir.startsWith("~/");
+  const segs = (tilde ? dir.slice(1) : dir).split("/").filter((x) => x !== "" && x !== ".");
+  if (segs.includes("..")) throw new Error(`Project directory must not contain "..": ${dir}`);
+  let d = tilde ? (segs.length ? `~/${segs.join("/")}` : "~") : `/${segs.join("/")}`;
+  if (!tilde && typeof home === "string" && home.startsWith("/")) {
+    const h = normalizeDir(home);
+    if (h !== "/" && (d === h || d.startsWith(h + "/"))) d = d === h ? "~" : `~${d.slice(h.length)}`;
+  }
   return d;
 }
 
@@ -277,7 +314,7 @@ export function applyPermissions(opencodeText, state, allIds) {
 }
 
 // Textual edit: replace (or append) one top-level key's value, leaving every other byte intact.
-function replaceTopLevelValue(text, key, value) {
+function replaceTopLevelValue(text, key, value, renderOld) {
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   let i = 0;
   const ws = () => { while (i < text.length && /\s/.test(text[i])) i++; };
@@ -334,7 +371,11 @@ function replaceTopLevelValue(text, key, value) {
     ws();
     if (text[i] === ",") i++;
   }
-  if (hit) return text.slice(0, hit.vStart) + render(lineIndent(hit.keyStart)) + text.slice(hit.vEnd);
+  if (hit) {
+    const indent = lineIndent(hit.keyStart);
+    const raw = renderOld?.(text.slice(hit.vStart, hit.vEnd), indent, eol);
+    return text.slice(0, hit.vStart) + (raw ?? render(indent)) + text.slice(hit.vEnd);
+  }
   const close = i;
   const indent = keyIndent ?? "  ";
   const entry = `${JSON.stringify(key)}: ${render(indent)}`;
@@ -662,8 +703,8 @@ export function syncPlan(state, allIds, skillMds) {
 
 // ---------- save planner (shared by CLI and panel) ----------
 
-/** Publication order for every adapter: SKILL.md files, then opencode.json, then skill-bundles.json. */
-export const PUBLISH_ORDER = ["skill", "opencode", "bundles"];
+/** Publication order for every adapter: SKILL.md, project opencode.json files, global opencode.json, skill-bundles.json. */
+export const PUBLISH_ORDER = ["skill", "project", "opencode", "bundles"];
 
 const tag = (e, file, id) => Object.assign(e instanceof Error ? e : new Error(String(e)), { file, ...(id ? { id } : {}) });
 
@@ -671,9 +712,11 @@ const tag = (e, file, id) => Object.assign(e instanceof Error ? e : new Error(St
  * Pure: everything that must be written to move from `prev` (texts as read) to `next`.
  * prev.bundlesText null = file absent (seeding). Errors carry `.file` ("opencode" | "skill").
  */
-export function planChange(prev, next, allIds) {
+export function planChange(prev, next, allIds, projectTexts, { home } = {}) {
+  next = canonicalizeProjects(next, { home }); // one write per physical spelling of a dir
   if (typeof prev?.opencodeText !== "string") throw tag(new Error("opencode.json not found"), "opencode");
   const mds = prev.skillMds ?? Object.create(null);
+  const ptexts = projectTexts ?? Object.create(null);
   let plan;
   try {
     plan = syncPlan(next, allIds, mds);
@@ -691,13 +734,33 @@ export function planChange(prev, next, allIds) {
     const before = hasOwn(mds, id) ? mds[id] : undefined;
     if (before !== undefined && after !== before) writes.push({ kind: "skill", id, path: `${SKILLS_DIR}/${id}/SKILL.md`, before, after });
   }
+  // project files: every target dir; managedProjects follows what is actually written
+  const managed = new Set(next.managedProjects ?? []);
+  for (const dir of projectTargets(next)) {
+    if (!hasOwn(ptexts, dir)) throw tag(new Error(`project file for ${dir} was not read`), "project", dir);
+    const before = ptexts[dir];
+    let after;
+    try {
+      after = applyProjectPermissions(before, projectSkills(next, dir));
+    } catch (e) {
+      throw tag(new Error(`${projectConfigPath(dir)}: ${e.message}`), "project", dir);
+    }
+    if (after !== null && after !== before) {
+      writes.push({ kind: "project", dir, path: projectConfigPath(dir), before, after });
+    }
+    const inBundle = next.bundles.some((b) => (b.projects ?? []).includes(dir));
+    if (inBundle && after !== null) managed.add(dir);
+    else if (!inBundle) managed.delete(dir); // rules removed by this plan (or none were there)
+  }
+  const finalState = { ...next, managedProjects: [...managed].sort() };
+  if (!finalState.managedProjects.length) delete finalState.managedProjects;
   if (opencodeAfter !== prev.opencodeText) {
     writes.push({ kind: "opencode", path: OPENCODE_PATH, before: prev.opencodeText, after: opencodeAfter });
   }
-  const bundlesAfter = serializeBundles(next);
+  const bundlesAfter = serializeBundles(finalState);
   const bundlesBefore = prev.bundlesText ?? null;
   if (bundlesAfter !== bundlesBefore) writes.push({ kind: "bundles", path: BUNDLES_PATH, before: bundlesBefore, after: bundlesAfter });
-  return { writes, skipped: plan.skipped, order: [...PUBLISH_ORDER] };
+  return { writes, skipped: plan.skipped, order: [...PUBLISH_ORDER], state: finalState };
 }
 
 // ---------- writer lock protocol (shared by CLI and panel; I/O stays in the adapters) ----------
@@ -751,4 +814,171 @@ export function classifyLock(info, { now, mtimeMs, pidAlive, host } = {}) {
     return pidAlive(info.pid) ? "held" : "stale";
   }
   return age(mtimeMs) > LOCK_UNPARSEABLE_STALE_MS ? "stale" : "held";
+}
+
+// ---------- per-project bundles (v0.2) ----------
+
+export const PROJECT_CONFIG_REL = ".opencode/opencode.json";
+
+/** Normalized project dir (absolute or "~/…", no "..", no trailing "/"); throws otherwise. */
+export function normalizeProjectDir(dir, { home } = {}) {
+  return normalizeDir(dir, home);
+}
+
+/** `<dir>/.opencode/opencode.json` for a normalized dir. */
+export function projectConfigPath(dir) {
+  const d = normalizeDir(dir);
+  return `${d === "/" ? "" : d}/${PROJECT_CONFIG_REL}`;
+}
+
+const withProjects = (b, dirs) => {
+  const { projects, ...rest } = b;
+  return dirs.length ? { ...rest, projects: dirs } : rest;
+};
+
+/**
+ * Every bundle's projects and managedProjects in canonical spelling (aliases merged, deduped).
+ * Returns `state` itself when nothing changes.
+ */
+export function canonicalizeProjects(state, { home } = {}) {
+  let changed = false;
+  const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+  const bundles = state.bundles.map((b) => {
+    if (!b.projects) return b;
+    const list = dirList(b.projects, home);
+    if (same(list, b.projects)) return b;
+    changed = true;
+    return withProjects(b, list);
+  });
+  let managed = state.managedProjects;
+  if (managed) {
+    const list = dirList(managed, home);
+    if (!same(list, managed)) { changed = true; managed = list; }
+  }
+  if (!changed) return state;
+  const out = { ...state, bundles };
+  if (managed?.length) out.managedProjects = managed;
+  else delete out.managedProjects;
+  return out;
+}
+
+/**
+ * Merge dirs that callers found to be the same folder: `aliases` maps a canonical dir to the
+ * canonical dir it should be stored as. Pure; adapters decide aliases (e.g. via realpath).
+ */
+export function mergeProjectDirs(state, aliases) {
+  const to = (d) => (hasOwn(aliases, d) ? aliases[d] : d);
+  const bundles = state.bundles.map((b) => (b.projects ? withProjects(b, uniq(b.projects.map(to)).sort()) : b));
+  const out = { ...state, bundles };
+  if (state.managedProjects) {
+    const m = uniq(state.managedProjects.map(to)).sort();
+    if (m.length) out.managedProjects = m;
+    else delete out.managedProjects;
+  }
+  return out;
+}
+
+export function setBundleProjects(state, bundleId, dirs, { home } = {}) {
+  requireBundle(state, bundleId);
+  const list = dirList(dirs ?? [], home);
+  return mapBundle(state, bundleId, (b) => withProjects(b, list));
+}
+
+export function addBundleProject(state, bundleId, dir, opts = {}) {
+  const b = requireBundle(state, bundleId);
+  return setBundleProjects(state, bundleId, [...(b.projects ?? []), dir], opts);
+}
+
+export function removeBundleProject(state, bundleId, dir, opts = {}) {
+  const b = requireBundle(state, bundleId);
+  const d = normalizeDir(dir, opts.home);
+  return setBundleProjects(state, bundleId, (b.projects ?? []).filter((x) => normalizeDir(x, opts.home) !== d), opts);
+}
+
+/** Canonical project dirs where `skillId` is allowed (via any bundle that lists the dir), sorted. */
+export function projectsFor(state, skillId, opts = {}) {
+  const s = canonicalizeProjects(state, opts);
+  return uniq(s.bundles.filter((b) => b.skills.includes(skillId)).flatMap((b) => b.projects ?? [])).sort();
+}
+
+/** Skill ids allowed in canonical `dir`, sorted (state must already be canonical). */
+function projectSkills(state, dir) {
+  return uniq(state.bundles.filter((b) => (b.projects ?? []).includes(dir)).flatMap((b) => b.skills)).sort();
+}
+
+/** Canonical dirs whose project file must be (re)written: bundle projects ∪ managedProjects. Sorted. */
+export function projectTargets(state, opts = {}) {
+  const s = canonicalizeProjects(state, opts);
+  return uniq([...s.bundles.flatMap((b) => b.projects ?? []), ...(s.managedProjects ?? [])]).sort();
+}
+
+const NEW_PROJECT_FILE = (rules) => JSON.stringify({ $schema: "https://opencode.ai/config.json", permissions: rules }, null, 2) + "\n";
+
+/**
+ * Pure: project opencode.json text with its skill rules replaced by one allow per id (no deny).
+ * null text = file missing; returns null when there is nothing to write.
+ */
+export function applyProjectPermissions(text, skillIds) {
+  const ids = uniq(skillIds).sort();
+  const allows = ids.map((id) => ({ action: "skill", resource: id, effect: "allow" }));
+  if (text === null || text === undefined) return allows.length ? NEW_PROJECT_FILE(allows) : null;
+  let cfg;
+  try {
+    cfg = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`not valid JSON: ${e.message}`);
+  }
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) throw new Error("must be a JSON object");
+  if (hasOwn(cfg, "permissions") && !Array.isArray(cfg.permissions)) {
+    throw new Error("\"permissions\" exists but is not an array; fix it by hand");
+  }
+  const existing = cfg.permissions ?? [];
+  const hadSkill = existing.some((r) => r && r.action === "skill");
+  if (!allows.length && !hadSkill) return text; // nothing of ours to remove
+  const kept = existing.filter((r) => !(r && r.action === "skill"));
+  // Keep non-skill entries byte-for-byte; only our allows are freshly rendered.
+  const keepRaw = (arrText, indent, eol) => {
+    const spans = arrayElementSpans(arrText);
+    if (!spans || spans.length !== existing.length) return null;
+    const items = spans.filter((_, i) => !(existing[i] && existing[i].action === "skill"));
+    const inner = indent + "  ";
+    const ours = allows.map((r) => JSON.stringify(r, null, 2).split("\n").join(eol + inner));
+    const all = [...items, ...ours];
+    return all.length ? `[${eol}${all.map((x) => inner + x).join("," + eol)}${eol}${indent}]` : "[]";
+  };
+  return replaceTopLevelValue(text, "permissions", [...kept, ...allows], keepRaw);
+}
+
+// Raw source text of each element of a JSON array literal; null if it cannot be split safely.
+function arrayElementSpans(arr) {
+  let i = 0;
+  const out = [];
+  const ws = () => { while (i < arr.length && /\s/.test(arr[i])) i++; };
+  ws();
+  if (arr[i] !== "[") return null;
+  i++;
+  for (;;) {
+    ws();
+    if (arr[i] === "]") return out;
+    const start = i;
+    let depth = 0;
+    while (i < arr.length) {
+      const c = arr[i];
+      if (c === '"') {
+        i++;
+        while (i < arr.length && arr[i] !== '"') i += arr[i] === "\\" ? 2 : 1;
+        i++;
+        continue;
+      }
+      if (c === "{" || c === "[") depth++;
+      else if (c === "}" || c === "]") {
+        if (depth === 0) break;
+        depth--;
+      } else if (c === "," && depth === 0) break;
+      i++;
+    }
+    if (i >= arr.length) return null;
+    out.push(arr.slice(start, i).trimEnd());
+    if (arr[i] === ",") i++;
+  }
 }

@@ -554,7 +554,7 @@ test("isChatsDir / shortenDir / filterProjects / looksBinary", () => {
 // ---------- R1: planChange ----------
 
 test("R1 planChange: order, kinds, paths, no-ops, seeding, error tags", () => {
-  assert.deepEqual(core.PUBLISH_ORDER, ["skill", "opencode", "bundles"]);
+  assert.deepEqual(core.PUBLISH_ORDER, ["skill", "project", "opencode", "bundles"]);
   const prevState = S({ bundles: [{ id: "a", enabled: true, skills: ["zeta", "archify"] }] });
   const prev = {
     bundlesText: core.serializeBundles(prevState),
@@ -563,7 +563,7 @@ test("R1 planChange: order, kinds, paths, no-ops, seeding, error tags", () => {
   };
   const next = core.setOverride(core.setOverride(prevState, "zeta", "called"), "archify", "called");
   const p = core.planChange(prev, next, ["zeta", "archify"]);
-  assert.deepEqual(p.order, ["skill", "opencode", "bundles"]);
+  assert.deepEqual(p.order, ["skill", "project", "opencode", "bundles"]);
   assert.deepEqual(p.writes.map((w) => [w.kind, w.id ?? null]), [["skill", "archify"], ["skill", "zeta"], ["bundles", null]]);
   assert.equal(p.writes[0].path, "~/.config/opencode/skills/archify/SKILL.md");
   assert.equal(p.writes[0].before, ARCHIFY);
@@ -646,4 +646,224 @@ test("R2 lock fixture matrix: parseLock + classifyLock", () => {
   assert.equal(core.PANEL_LOCK_TTL_MS, 60_000);
   assert.equal(core.LOCK_UNPARSEABLE_STALE_MS, 600_000);
   assert.equal(core.LOCK_PATH, "~/.config/opencode/.skill-bundles.lock");
+});
+
+// ---------- per-project bundles (v0.2) ----------
+
+test("P1 projects/managedProjects round-trip; old files byte-identical", () => {
+  const seed = readFileSync(fileURLToPath(new URL("../data/default-bundles.json", import.meta.url)), "utf8");
+  assert.equal(core.serializeBundles(core.parseBundles(seed)), seed);
+  const old = core.serializeBundles(base());
+  assert.equal(core.serializeBundles(core.parseBundles(old)), old);
+  assert.ok(!old.includes("projects") && !old.includes("managedProjects"));
+  const raw = { version: 1, bundles: [{ id: "a", name: "A", enabled: false, skills: ["x"], projects: ["/p/b/", "~/a", "/p/b"] }], overrides: {}, managedProjects: ["/z", "/p/b"] };
+  const s = core.parseBundles(JSON.stringify(raw));
+  assert.deepEqual(s.bundles[0].projects, ["/p/b", "~/a"]);
+  assert.deepEqual(s.managedProjects, ["/p/b", "/z"]);
+  const text = core.serializeBundles(s);
+  assert.equal(core.serializeBundles(core.parseBundles(text)), text);
+  // empty lists are omitted
+  const e = core.parseBundles(JSON.stringify({ ...raw, bundles: [{ ...raw.bundles[0], projects: [] }], managedProjects: [] }));
+  assert.equal(e.bundles[0].projects, undefined);
+  assert.ok(!core.serializeBundles(e).includes("rojects"));
+  for (const bad of [["rel/dir"], ["/a/../b"], [1], "x"]) {
+    assert.throws(() => core.parseBundles(JSON.stringify({ ...raw, bundles: [{ ...raw.bundles[0], projects: bad }] })), /projects/);
+  }
+  assert.throws(() => core.parseBundles(JSON.stringify({ ...raw, managedProjects: ["nope"] })), /managedProjects/);
+});
+
+test("P2 bundle project helpers, projectsFor, projectTargets", () => {
+  let s = base();
+  s = core.addBundleProject(s, "a", "/p/one/");
+  s = core.addBundleProject(s, "a", "/p/one");
+  s = core.addBundleProject(s, "b", "~/two");
+  assert.deepEqual(s.bundles[0].projects, ["/p/one"]);
+  assert.deepEqual(base().bundles[0].projects, undefined);
+  assert.deepEqual(core.projectsFor(s, "y"), ["/p/one", "~/two"]);
+  assert.deepEqual(core.projectsFor(s, "x"), ["/p/one"]);
+  assert.deepEqual(core.projectsFor(s, "nope"), []);
+  assert.deepEqual(core.projectTargets({ ...s, managedProjects: ["/old"] }), ["/old", "/p/one", "~/two"]);
+  s = core.removeBundleProject(s, "a", "/p/one/");
+  assert.equal("projects" in s.bundles[0], false);
+  s = core.setBundleProjects(s, "b", ["/z", "/a", "/z"]);
+  assert.deepEqual(s.bundles[1].projects, ["/a", "/z"]);
+  assert.throws(() => core.addBundleProject(s, "a", "rel"), /absolute/);
+  assert.throws(() => core.addBundleProject(s, "nope", "/x"), /Unknown bundle/);
+  assert.equal(core.projectConfigPath("/p/x/"), "/p/x/.opencode/opencode.json");
+  assert.equal(core.projectConfigPath("~/p"), "~/p/.opencode/opencode.json");
+  assert.equal(core.normalizeProjectDir("/a//"), "/a");
+});
+
+test("P3 applyProjectPermissions splice", () => {
+  // missing file
+  assert.equal(core.applyProjectPermissions(null, []), null);
+  const created = core.applyProjectPermissions(null, ["b", "a", "a"]);
+  assert.deepEqual(JSON.parse(created), {
+    $schema: "https://opencode.ai/config.json",
+    permissions: [{ action: "skill", resource: "a", effect: "allow" }, { action: "skill", resource: "b", effect: "allow" }],
+  });
+  assert.ok(created.endsWith("}\n"));
+  // existing: keeps keys, order, other rules, escapes; no deny *
+  const src = '{\n  "model": "x\\u00b7y",\n  "permissions": [\n    { "action": "bash", "resource": "*", "effect": "ask" },\n    { "action": "skill", "resource": "old", "effect": "allow" },\n    { "action": "edit", "resource": "*", "effect": "deny" }\n  ],\n  "z": 1\n}\n';
+  const out = core.applyProjectPermissions(src, ["s1"]);
+  assert.ok(out.startsWith('{\n  "model": "x\\u00b7y",\n  "permissions": ['));
+  assert.ok(out.endsWith('\n  "z": 1\n}\n'));
+  assert.deepEqual(JSON.parse(out).permissions.map((r) => [r.action, r.resource]), [["bash", "*"], ["edit", "*"], ["skill", "s1"]]);
+  assert.ok(!JSON.parse(out).permissions.some((r) => r.resource === "*" && r.action === "skill"));
+  // removal: skill rules gone, others kept, permissions array kept even when empty
+  const removed = core.applyProjectPermissions(out, []);
+  assert.deepEqual(JSON.parse(removed).permissions.map((r) => r.action), ["bash", "edit"]);
+  const onlySkill = core.applyProjectPermissions('{"permissions":[{"action":"skill","resource":"a","effect":"allow"}]}', []);
+  assert.deepEqual(JSON.parse(onlySkill), { permissions: [] });
+  // nothing of ours and nothing to add: untouched (no permissions key added)
+  assert.equal(core.applyProjectPermissions('{"a":1}', []), '{"a":1}');
+  const added = core.applyProjectPermissions('{"a":1}', ["q"]);
+  assert.deepEqual(JSON.parse(added), { a: 1, permissions: [{ action: "skill", resource: "q", effect: "allow" }] });
+  // idempotent
+  assert.equal(core.applyProjectPermissions(out, ["s1"]), out);
+  assert.throws(() => core.applyProjectPermissions('{"permissions":{}}', ["a"]), /not an array/);
+  assert.throws(() => core.applyProjectPermissions("[]", ["a"]), /JSON object/);
+  assert.throws(() => core.applyProjectPermissions('{"permissions":[],"permissions":[]}', ["a"]), /duplicate/);
+});
+
+test("P4 planChange with project writes: order, managedProjects lifecycle", () => {
+  const ids = ["x", "y", "z"];
+  const s0 = base();
+  const prev = (state, extra = {}) => ({
+    bundlesText: core.serializeBundles(state),
+    opencodeText: core.applyPermissions('{"permissions":[]}\n', state, ids),
+    skillMds: { x: "---\nname: x\n---\n" },
+    ...extra,
+  });
+  // add a project to disabled bundle b (y, z) and override x → called
+  const s1 = core.setOverride(core.addBundleProject(s0, "b", "/proj"), "x", "called");
+  assert.throws(() => core.planChange(prev(s0), s1, ids), (e) => e.file === "project" && e.id === "/proj");
+  const p1 = core.planChange(prev(s0), s1, ids, { "/proj": null });
+  assert.deepEqual(p1.order, ["skill", "project", "opencode", "bundles"]);
+  assert.deepEqual(p1.writes.map((w) => w.kind), ["skill", "project", "bundles"]);
+  const pw = p1.writes[1];
+  assert.equal(pw.path, "/proj/.opencode/opencode.json");
+  assert.equal(pw.dir, "/proj");
+  assert.equal(pw.before, null);
+  assert.deepEqual(JSON.parse(pw.after).permissions.map((r) => r.resource), ["y", "z"]);
+  assert.deepEqual(p1.state.managedProjects, ["/proj"]);
+  assert.deepEqual(JSON.parse(p1.writes[2].after).managedProjects, ["/proj"]);
+  // global change too → project before opencode
+  const p1b = core.planChange(prev(s0), core.setBundleEnabled(s1, "b", true), ids, { "/proj": null });
+  assert.deepEqual(p1b.writes.map((w) => w.kind), ["skill", "project", "opencode", "bundles"]);
+  // remove the project: rules removed, dir leaves managedProjects in the same plan
+  const s2 = core.removeBundleProject(p1.state, "b", "/proj");
+  const p2 = core.planChange(prev(p1.state, { skillMds: { x: p1.writes[0].after } }), s2, ids, { "/proj": pw.after });
+  assert.deepEqual(p2.writes.map((w) => w.kind), ["project", "bundles"]);
+  assert.deepEqual(JSON.parse(p2.writes[0].after), { $schema: "https://opencode.ai/config.json", permissions: [] });
+  assert.equal(p2.state.managedProjects, undefined);
+  assert.ok(!p2.writes[1].after.includes("managedProjects"));
+  // dir with no rules (missing file) never becomes managed and writes nothing
+  const empty = core.addBundleProject(core.createBundle(s0, "E"), "e", "/empty");
+  const p3 = core.planChange(prev(s0), empty, ids, { "/empty": null });
+  assert.deepEqual(p3.writes.map((w) => w.kind), ["bundles"]);
+  assert.equal(p3.state.managedProjects, undefined);
+  // re-plan from final state is a no-op
+  const p4 = core.planChange({ ...prev(p1.state), skillMds: { x: p1.writes[0].after } }, p1.state, ids, { "/proj": pw.after });
+  assert.deepEqual(p4.writes, []);
+  // bad project file tagged
+  assert.throws(() => core.planChange(prev(s0), s1, ids, { "/proj": '{"permissions":3}' }), (e) => e.file === "project" && /\/proj\/\.opencode\/opencode\.json/.test(e.message));
+});
+
+// ---------- project dir aliases ----------
+
+test("A1 normalizeProjectDir collapses ., //, trailing /. and maps $HOME to ~", () => {
+  const n = (d, o) => core.normalizeProjectDir(d, o);
+  assert.equal(n("/p/."), "/p");
+  assert.equal(n("/p/./q//r/"), "/p/q/r");
+  assert.equal(n("//p///"), "/p");
+  assert.equal(n("/"), "/");
+  assert.equal(n("/./"), "/");
+  assert.equal(n("~/x/./y/."), "~/x/y");
+  assert.equal(n("~//x"), "~/x");
+  const home = { home: "/home/u/" };
+  assert.equal(n("/home/u/x", home), "~/x");
+  assert.equal(n("/home/u/./x/", home), "~/x");
+  assert.equal(n("/home/u", home), "~");
+  assert.equal(n("/home/user2/x", home), "/home/user2/x"); // prefix, not under home
+  assert.equal(n("/home/u/x"), "/home/u/x"); // no home given: stays absolute
+  assert.equal(n("~/x", home), "~/x");
+  assert.equal(n("/p", { home: "/" }), "/p"); // root home never rewrites
+  assert.throws(() => n("/a/../b"), /\.\./);
+  assert.throws(() => n("rel"), /absolute/);
+});
+
+test("A2 every alias form groups into one write holding the union", () => {
+  const home = "/home/u";
+  const ids = ["a1", "b1"];
+  const mk = (pa, pb) =>
+    core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [
+        { id: "a", name: "A", enabled: false, skills: ["a1"], projects: [pa] },
+        { id: "b", name: "B", enabled: false, skills: ["b1"], projects: [pb] },
+      ],
+      overrides: {},
+    }));
+  const prev = (s) => ({ bundlesText: core.serializeBundles(s), opencodeText: '{"permissions":[]}', skillMds: {} });
+  for (const [pa, pb, canon] of [
+    ["/home/u/p", "~/p", "~/p"],
+    ["/p", "/p/.", "/p"],
+    ["/p/", "//p", "/p"],
+    ["~/p/./", "/home/u//p", "~/p"],
+  ]) {
+    // stored aliases migrate on parse when home is known
+    const s = core.parseBundles(core.serializeBundles(mk(pa, pb)), { home });
+    assert.deepEqual(s.bundles.map((b) => b.projects), [[canon], [canon]], `${pa} | ${pb}`);
+    assert.deepEqual(core.projectTargets(s), [canon]);
+    const plan = core.planChange(prev(s), s, ids, { [canon]: null }, { home });
+    const pw = plan.writes.filter((w) => w.kind === "project");
+    assert.equal(pw.length, 1, `${pa} | ${pb}`);
+    assert.deepEqual(JSON.parse(pw[0].after).permissions.map((r) => r.resource), ["a1", "b1"]);
+    // removing through the OTHER spelling leaves the first bundle's allows in place
+    const s2 = core.removeBundleProject(plan.state, "b", pa, { home });
+    const plan2 = core.planChange({ ...prev(plan.state), bundlesText: plan.writes.at(-1).after }, s2, ids, { [canon]: pw[0].after }, { home });
+    const pw2 = plan2.writes.filter((w) => w.kind === "project");
+    assert.equal(pw2.length, 1);
+    assert.deepEqual(JSON.parse(pw2[0].after).permissions.map((r) => r.resource), ["a1"], `${pa} | ${pb}`);
+    assert.deepEqual(plan2.state.managedProjects, [canon]);
+  }
+  // planChange canonicalizes even a non-canonical in-memory state (no parse), with home
+  const raw = mk("/home/u/p", "~/p/.");
+  assert.deepEqual(core.projectTargets(raw, { home }), ["~/p"]);
+  assert.deepEqual(core.projectsFor(raw, "b1", { home }), ["~/p"]);
+  const plan = core.planChange(prev(raw), raw, ids, { "~/p": null }, { home });
+  assert.equal(plan.writes.filter((w) => w.kind === "project").length, 1);
+  assert.deepEqual(plan.state.bundles.map((b) => b.projects), [["~/p"], ["~/p"]]);
+});
+
+test("A3 stored-alias migration: parse dedupes managedProjects and bundle lists", () => {
+  const text = JSON.stringify({
+    version: 1,
+    bundles: [{ id: "a", name: "A", enabled: false, skills: ["x"], projects: ["/home/u/p", "~/p/", "/q/.", "/q"] }],
+    overrides: {},
+    managedProjects: ["/home/u/p/.", "~/p", "/q//"],
+  });
+  const s = core.parseBundles(text, { home: "/home/u" });
+  assert.deepEqual(s.bundles[0].projects, ["/q", "~/p"]);
+  assert.deepEqual(s.managedProjects, ["/q", "~/p"]);
+  const without = core.parseBundles(text);
+  assert.deepEqual(without.bundles[0].projects, ["/home/u/p", "/q", "~/p"]); // home unknown: only syntactic
+  assert.equal(core.canonicalizeProjects(s, { home: "/home/u" }), s); // already canonical: same object
+  const merged = core.mergeProjectDirs(s, { "/q": "~/p" });
+  assert.deepEqual(merged.bundles[0].projects, ["~/p"]);
+  assert.deepEqual(merged.managedProjects, ["~/p"]);
+});
+
+test("A4 applyProjectPermissions keeps non-skill entries byte-for-byte", () => {
+  const src = '{\n  "permissions": [\n    {"action":"bash","resource":"rm \\u002a","effect":"ask"},\n    { "action": "skill", "resource": "old", "effect": "allow" },\n    { "action": "edit",   "resource": "*", "effect": "deny" }\n  ]\n}\n';
+  const out = core.applyProjectPermissions(src, ["n"]);
+  assert.ok(out.includes('    {"action":"bash","resource":"rm \\u002a","effect":"ask"},\n'));
+  assert.ok(out.includes('    { "action": "edit",   "resource": "*", "effect": "deny" },\n'));
+  assert.deepEqual(JSON.parse(out).permissions.map((r) => r.resource), ["rm *", "*", "n"]);
+  assert.equal(core.applyProjectPermissions(out, ["n"]), out);
+  const gone = core.applyProjectPermissions(out, []);
+  assert.ok(gone.includes('{"action":"bash","resource":"rm \\u002a","effect":"ask"}'));
+  assert.deepEqual(JSON.parse(gone).permissions.length, 2);
+  assert.equal(core.applyProjectPermissions('{"permissions":[{"action":"skill","resource":"a","effect":"allow"}]}', []), '{"permissions":[]}');
 });

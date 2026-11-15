@@ -543,3 +543,215 @@ test("R1 planChange + fake executor matches real CLI writes for each command", (
     assert.match(r.out, new RegExp(`— ${plan.writes.length} files? changed`), argv.join(" "));
   }
 });
+
+// ---------- per-project bundles (v0.2) ----------
+
+test("P5 e2e: on --project writes project rules, off --project removes them, dir leaves managedProjects", () => {
+  const h = makeHome();
+  const proj = tmpDir("skills-proj-");
+  const pfile = path.join(proj, ".opencode/opencode.json");
+  assert.equal(run(h, "sync").code, 0); // fixture's global file starts unsynced
+  const globalBefore = read(h, "opencode.json");
+
+  let r = run(h, "on", "docs", "--project", proj);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, new RegExp(`allowed docs in ${proj.replace(/[.]/g, "\\.")}`));
+  assert.deepEqual(JSON.parse(fs.readFileSync(pfile, "utf8")), {
+    $schema: "https://opencode.ai/config.json",
+    permissions: [{ action: "skill", resource: "beta", effect: "allow" }],
+  });
+  assert.equal(read(h, "opencode.json"), globalBefore, "global rules untouched");
+  let s = json(h, "skill-bundles.json");
+  assert.deepEqual(s.bundles.find((b) => b.id === "docs").projects, [proj]);
+  assert.deepEqual(s.managedProjects, [proj]);
+  assert.equal(s.bundles.find((b) => b.id === "docs").enabled, false);
+
+  r = run(h, "list");
+  assert.match(r.out, /^off\s+docs\s+0\/1 on\s+Docs \+1 project$/m);
+  r = run(h, "projects");
+  assert.match(r.out, new RegExp(`^docs\\n  ${proj.replace(/[.]/g, "\\.")}$`, "m"));
+  assert.match(run(h, "projects", "dev").out, /^dev \(no projects\)$/m);
+
+  // a second bundle in the same project merges rules
+  assert.equal(run(h, "on", "dev", "--project", proj).code, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(pfile, "utf8")).permissions.map((x) => x.resource), ["alpha", "beta", "gamma"]);
+  assert.match(run(h, "list").out, /Dev \+1 project$/m);
+  assert.equal(run(h, "off", "dev", "--project", proj).code, 0);
+
+  // other keys and rules in the project file survive
+  const t = JSON.parse(fs.readFileSync(pfile, "utf8"));
+  fs.writeFileSync(pfile, JSON.stringify({ model: "m", ...t, permissions: [{ action: "bash", resource: "*", effect: "ask" }, ...t.permissions] }, null, 2) + "\n");
+
+  r = run(h, "off", "docs", "--project", proj);
+  assert.equal(r.code, 0, r.err);
+  const after = JSON.parse(fs.readFileSync(pfile, "utf8"));
+  assert.equal(after.model, "m");
+  assert.deepEqual(after.permissions, [{ action: "bash", resource: "*", effect: "ask" }]);
+  s = json(h, "skill-bundles.json");
+  assert.equal(s.bundles.find((b) => b.id === "docs").projects, undefined);
+  assert.equal(s.managedProjects, undefined);
+  assert.doesNotMatch(read(h, "skill-bundles.json"), /rojects/);
+  assert.match(run(h, "projects").out, /no bundle has projects/);
+  // idempotent
+  r = run(h, "sync");
+  assert.match(r.out, /0 files changed/);
+});
+
+test("P6 --project: relative dirs resolve against cwd, ~/ stays ~/, bad dirs rejected", () => {
+  const h = makeHome();
+  const parent = tmpDir("skills-cwd-");
+  fs.mkdirSync(path.join(parent, "rel"));
+  let r = spawnSync(process.execPath, [BIN, "on", "docs", "--project", "rel", "--home", h], { encoding: "utf8", cwd: parent });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(json(h, "skill-bundles.json").bundles.find((b) => b.id === "docs").projects, [path.join(parent, "rel")]);
+  // ~/ form: stored as ~/..., file written under --home
+  fs.mkdirSync(path.join(h, "code/app"), { recursive: true });
+  r = run(h, "on", "dev", "--project", "~/code/app/");
+  assert.equal(r.code, 0, r.err);
+  assert.deepEqual(json(h, "skill-bundles.json").bundles.find((b) => b.id === "dev").projects, ["~/code/app"]);
+  assert.ok(fs.existsSync(path.join(h, "code/app/.opencode/opencode.json")));
+  // dry run writes nothing
+  const snap = snapshot(h);
+  r = run(h, "off", "dev", "--project", "~/code/app", "--dry-run");
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /code\/app\/\.opencode\/opencode\.json/);
+  assert.deepEqual(snapshot(h), snap);
+  // rejected
+  assert.match(run(h, "on", "dev", "--project", "/no/such/dir").err, /does not exist/);
+  assert.match(run(h, "on", "dev", "--project", "~").err, /not your home directory/);
+  assert.match(run(h, "on", "dev", "--project", "/a/../b").err, /\.\./);
+  const r2 = spawnSync(process.execPath, [BIN, "--home", h, "on", "dev", "--project"], { encoding: "utf8" });
+  assert.match(r2.stderr, /--project needs a value/);
+});
+
+test("P7 project file symlink: written through, link kept", () => {
+  const h = makeHome();
+  const proj = tmpDir("skills-proj-ln-");
+  const real = tmpDir("skills-proj-real-");
+  fs.mkdirSync(path.join(proj, ".opencode"));
+  fs.writeFileSync(path.join(real, "oc.json"), '{"model":"m"}\n');
+  fs.symlinkSync(path.join(real, "oc.json"), path.join(proj, ".opencode/opencode.json"));
+  assert.equal(run(h, "on", "docs", "--project", proj).code, 0);
+  assert.ok(fs.lstatSync(path.join(proj, ".opencode/opencode.json")).isSymbolicLink());
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(real, "oc.json"), "utf8")).permissions.map((r) => r.resource), ["beta"]);
+  // invalid project file aborts the whole save
+  fs.writeFileSync(path.join(real, "oc.json"), '{"permissions": 1}');
+  const snap = snapshot(h);
+  const r = run(h, "set", "alpha", "called");
+  assert.equal(r.code, 1);
+  assert.match(r.err, /\.opencode\/opencode\.json: "permissions" exists but is not an array/);
+  assert.deepEqual(snapshot(h), snap);
+});
+
+// ---------- project dir aliases ----------
+
+test("A5 CLI: two spellings of one project → union in one file; off via the other keeps the rest", () => {
+  const h = makeHome();
+  fs.mkdirSync(path.join(h, "code/app"), { recursive: true });
+  const abs = path.join(h, "code/app");
+  const pfile = path.join(abs, ".opencode/opencode.json");
+  const allows = () => JSON.parse(fs.readFileSync(pfile, "utf8")).permissions.map((r) => r.resource);
+  for (const [first, second] of [[abs, "~/code/app"], ["~/code/app", abs + "/."], [abs + "//", "~/code/./app/"]]) {
+    fs.rmSync(path.join(abs, ".opencode"), { recursive: true, force: true });
+    assert.equal(run(h, "on", "docs", "--project", first).code, 0);
+    assert.equal(run(h, "on", "dev", "--project", second).code, 0);
+    let s = json(h, "skill-bundles.json");
+    assert.deepEqual(s.bundles.map((b) => b.projects), [["~/code/app"], ["~/code/app"]], `${first} | ${second}`);
+    assert.deepEqual(s.managedProjects, ["~/code/app"]);
+    assert.deepEqual(allows(), ["alpha", "beta", "gamma"]);
+    assert.equal(run(h, "off", "dev", "--project", first).code, 0);
+    assert.deepEqual(allows(), ["beta"], `${first} | ${second}`);
+    assert.equal(run(h, "off", "docs", "--project", second).code, 0);
+    assert.deepEqual(allows(), []);
+    assert.equal(json(h, "skill-bundles.json").managedProjects, undefined);
+  }
+  assert.match(run(h, "on", "dev", "--project", h).err, /not your home directory/);
+});
+
+test("A6 CLI: symlinked project dir merges under the stored spelling", () => {
+  const h = makeHome();
+  const real = tmpDir("skills-alias-real-");
+  const link = path.join(tmpDir("skills-alias-ln-"), "link");
+  fs.symlinkSync(real, link);
+  const pfile = path.join(real, ".opencode/opencode.json");
+  assert.equal(run(h, "on", "docs", "--project", real).code, 0);
+  assert.equal(run(h, "on", "dev", "--project", link).code, 0);
+  let s = json(h, "skill-bundles.json");
+  assert.deepEqual(s.bundles.map((b) => b.projects), [[real], [real]]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(pfile, "utf8")).permissions.map((r) => r.resource), ["alpha", "beta", "gamma"]);
+  assert.equal(run(h, "off", "dev", "--project", link).code, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(pfile, "utf8")).permissions.map((r) => r.resource), ["beta"]);
+
+  // a hand-edited file holding both spellings is merged (with a note) under the spelling listed
+  // first (bundle order: dev comes before docs), instead of fighting over one file
+  const t = json(h, "skill-bundles.json");
+  t.bundles.find((b) => b.id === "dev").projects = [link];
+  fs.writeFileSync(path.join(oc(h), "skill-bundles.json"), JSON.stringify(t, null, 2) + "\n");
+  const r = run(h, "sync");
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.err, new RegExp(`${real.replace(/[.]/g, "\\.")} and ${link.replace(/[.]/g, "\\.")} are the same folder; using ${link.replace(/[.]/g, "\\.")}`));
+  s = json(h, "skill-bundles.json");
+  assert.deepEqual(s.bundles.map((b) => b.projects), [[link], [link]]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(pfile, "utf8")).permissions.map((r) => r.resource), ["alpha", "beta", "gamma"]);
+  assert.ok(!fs.existsSync(path.join(link, ".opencode/opencode.json.tmp")));
+});
+
+test("A7 CLI: stored $HOME aliases migrate to ~/ on the next write", () => {
+  const h = makeHome();
+  fs.mkdirSync(path.join(h, "p"));
+  const t = json(h, "skill-bundles.json");
+  t.bundles[1].projects = [path.join(h, "p") + "/.", "~/p"];
+  t.managedProjects = [path.join(h, "p")];
+  fs.writeFileSync(path.join(oc(h), "skill-bundles.json"), JSON.stringify(t, null, 2) + "\n");
+  assert.equal(run(h, "sync").code, 0);
+  const s = json(h, "skill-bundles.json");
+  assert.deepEqual(s.bundles[1].projects, ["~/p"]);
+  assert.deepEqual(s.managedProjects, ["~/p"]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(h, "p/.opencode/opencode.json"), "utf8")).permissions.map((r) => r.resource), ["beta"]);
+  assert.match(run(h, "sync").out, /0 files changed/);
+});
+
+test("A8 off --project removes the assignment when legacy state holds real path + symlink spelling", () => {
+  const h = makeHome();
+  const real = tmpDir("skills-legacy-real-");
+  const link = path.join(tmpDir("skills-legacy-ln-"), "link");
+  fs.symlinkSync(real, link);
+  const t = json(h, "skill-bundles.json");
+  t.bundles.find((b) => b.id === "docs").projects = [real, link];
+  t.managedProjects = [real, link];
+  fs.writeFileSync(path.join(oc(h), "skill-bundles.json"), JSON.stringify(t, null, 2) + "\n");
+  fs.mkdirSync(path.join(real, ".opencode"));
+  fs.writeFileSync(path.join(real, ".opencode/opencode.json"), JSON.stringify({ permissions: [{ action: "skill", resource: "beta", effect: "allow" }] }) + "\n");
+  for (const spelling of [link, real]) {
+    const r = run(h, "off", "docs", "--project", spelling);
+    assert.equal(r.code, 0, r.err);
+    const s = json(h, "skill-bundles.json");
+    assert.equal(s.bundles.find((b) => b.id === "docs").projects, undefined, spelling);
+    assert.equal(s.managedProjects, undefined, spelling);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(real, ".opencode/opencode.json"), "utf8")).permissions, []);
+    // restore legacy state for the second spelling
+    fs.writeFileSync(path.join(oc(h), "skill-bundles.json"), JSON.stringify(t, null, 2) + "\n");
+    fs.writeFileSync(path.join(real, ".opencode/opencode.json"), JSON.stringify({ permissions: [{ action: "skill", resource: "beta", effect: "allow" }] }) + "\n");
+  }
+});
+
+test("A9 first save through a symlinked project dir with no .opencode yet succeeds", () => {
+  const h = makeHome();
+  const real = tmpDir("skills-first-real-");
+  const link = path.join(tmpDir("skills-first-ln-"), "link");
+  fs.symlinkSync(real, link);
+  const r = run(h, "on", "docs", "--project", link);
+  assert.equal(r.code, 0, r.err);
+  assert.doesNotMatch(r.err, /points elsewhere|retarget/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(real, ".opencode/opencode.json"), "utf8")).permissions.map((x) => x.resource), ["beta"]);
+  assert.ok(fs.lstatSync(link).isSymbolicLink());
+  assert.match(run(h, "sync").out, /0 files changed/);
+  // also through a symlinked ancestor two levels up
+  const realRoot = tmpDir("skills-first-root-");
+  fs.mkdirSync(path.join(realRoot, "sub"));
+  const lroot = path.join(tmpDir("skills-first-lroot-"), "lr");
+  fs.symlinkSync(realRoot, lroot);
+  const r2 = run(h, "on", "dev", "--project", path.join(lroot, "sub"));
+  assert.equal(r2.code, 0, r2.err);
+  assert.ok(fs.existsSync(path.join(realRoot, "sub/.opencode/opencode.json")));
+});

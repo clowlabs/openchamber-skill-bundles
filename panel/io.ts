@@ -18,12 +18,44 @@ export const S = {
   skillMds: {} as Record<string, string>,
   opencodeText: '',
   bundlesText: null as string | null,
+  /** User's home dir, derived once at load (undefined = unknown: textual collapsing only). */
+  home: undefined as string | undefined,
+  homeDerived: false,
   pending: 0,
   descDraft: null as { id: string; value: string } | null,
 };
 
 /** Set by main: full and stats-only re-render. */
 export const hooks = { render: () => {}, renderLight: () => {} };
+
+/** `{ home }` for every core call that takes it. */
+export const homeOpt = () => (S.home ? { home: S.home } : {});
+
+const CHATS_SUFFIX = '/.config/openchamber/chats';
+/**
+ * The SDK doesn't expose the home dir. Derive it from OpenChamber's project dirs: (1) the chats
+ * dir is `<home>/.config/openchamber/chats[/…]`; (2) else a shared `/home/<u>` or `/Users/<u>`
+ * prefix. Undefined when neither works. Pure; exported for tests.
+ */
+export function homeFromDirs(dirs: string[]): string | undefined {
+  for (const d of dirs) {
+    const i = d.indexOf(CHATS_SUFFIX);
+    if (i > 0 && (d.length === i + CHATS_SUFFIX.length || d[i + CHATS_SUFFIX.length] === '/')) return d.slice(0, i);
+  }
+  const homes = new Set(dirs.map((d) => /^(\/home\/[^/]+|\/Users\/[^/]+)(?=\/|$)/.exec(d)?.[1]).filter(Boolean));
+  return homes.size === 1 ? [...homes][0] : undefined;
+}
+
+async function deriveHome() {
+  if (S.homeDerived) return;
+  try {
+    const snap = await host.listProjects();
+    S.home = homeFromDirs(snap.projects.map((p) => p.directory));
+    S.homeDerived = snap.state === 'ready' || S.home != null; // retry next load while still loading
+  } catch (e) {
+    console.warn('skill-bundles: could not list projects to find the home folder', e);
+  }
+}
 
 export const skillPath = (id: string) => `${core.SKILLS_DIR}/${id}/SKILL.md`;
 export const mode = (id: string) => core.effectiveMode(S.state!, id);
@@ -177,6 +209,7 @@ async function pool<T>(items: T[], size: number, fn: (item: T) => Promise<void>)
 }
 
 export async function load() {
+  await deriveHome();
   let dirs: string[] = [];
   try {
     const { entries } = await host.listDir(core.SKILLS_DIR);
@@ -200,18 +233,22 @@ export async function load() {
   fm.clear();
   S.opencodeText = opencodeText;
   S.bundlesText = bundlesText;
-  S.state = bundlesText == null ? null : core.parseBundles(bundlesText);
+  S.state = bundlesText == null ? null : core.parseBundles(bundlesText, homeOpt());
   S.loaded = true;
 }
 
 // ---------- save ----------
 
-function planFor(next: State): ChangePlan {
+type ProjectTexts = Record<string, string | null>;
+
+function planFor(next: State, projectTexts: ProjectTexts): ChangePlan {
   try {
-    return core.planChange({ bundlesText: S.bundlesText, opencodeText: S.opencodeText, skillMds: S.skillMds }, next, S.allIds);
+    return core.planChange({ bundlesText: S.bundlesText, opencodeText: S.opencodeText, skillMds: S.skillMds }, next, S.allIds, projectTexts, homeOpt());
   } catch (e) {
     const pe = e as Partial<PlanError>;
-    const where = pe.file === 'skill' ? (pe.id ? `skills/${pe.id}/SKILL.md` : 'SKILL.md') : pe.file === 'opencode' ? 'opencode.json' : '';
+    const where = pe.file === 'skill' ? (pe.id ? `skills/${pe.id}/SKILL.md` : 'SKILL.md')
+      : pe.file === 'opencode' ? 'opencode.json'
+      : pe.file === 'project' ? (pe.id ? core.projectConfigPath(pe.id) : 'project opencode.json') : '';
     const msg = errText(e);
     throw new RefusedError(where && !msg.includes(where) ? `${where}: ${msg}` : msg);
   }
@@ -229,38 +266,61 @@ async function refreshSkillMds(ids: string[]) {
   return changed;
 }
 
+/** Text of `<dir>/.opencode/opencode.json` for every dir the next state touches (missing → null). */
+async function readProjectTexts(next: State): Promise<ProjectTexts> {
+  const out: ProjectTexts = {};
+  await pool(core.projectTargets(next, homeOpt()), 8, async (dir) => {
+    out[dir] = await readOptional(core.projectConfigPath(dir));
+  });
+  return out;
+}
+const sameTexts = (a: ProjectTexts, b: ProjectTexts) =>
+  Object.keys(a).length === Object.keys(b).length && Object.keys(a).every((k) => k in b && a[k] === b[k]);
+
 async function save(next: State) {
-  const first = planFor(next); // refuse early, before taking the lock
-  await withLock(() => saveLocked(next, first));
+  // Refuse early, before taking the lock (project files read now; re-read under the lock).
+  const projectTexts = await readProjectTexts(next);
+  const first = planFor(next, projectTexts);
+  await withLock(() => saveLocked(next, first, projectTexts));
 }
 
-// Order: SKILL.md edits, opencode.json, skill-bundles.json last. Undo what was written on failure.
-async function saveLocked(next: State, first: ChangePlan) {
+// Order: core.PUBLISH_ORDER (SKILL.md, project files, opencode.json, skill-bundles.json last).
+async function saveLocked(next: State, first: ChangePlan, firstTexts: ProjectTexts) {
   // Bundle files changed under us: abort and reload (the caller handles StaleError).
-  const [onDisk, bundlesOnDisk] = await Promise.all([host.readFile(core.OPENCODE_PATH), readOptional(core.BUNDLES_PATH)]);
+  const [onDisk, bundlesOnDisk, projectTexts] = await Promise.all([
+    host.readFile(core.OPENCODE_PATH), readOptional(core.BUNDLES_PATH), readProjectTexts(next),
+  ]);
   if (onDisk.content !== S.opencodeText) throw new StaleError('opencode.json changed on disk');
   if (bundlesOnDisk !== S.bundlesText) throw new StaleError('skill-bundles.json changed on disk');
 
-  // SKILL.md-only changes merge: base every edit on text read under the lock.
-  let plan = first;
-  for (let i = 0; i < 5 && (await refreshSkillMds(skillIds(plan))); i++) plan = planFor(next);
+  // SKILL.md and project-file changes merge: core only splices skill rules, so plan on the
+  // text read under the lock.
+  let plan = sameTexts(firstTexts, projectTexts) ? first : planFor(next, projectTexts);
+  for (let i = 0; i < 5 && (await refreshSkillMds(skillIds(plan))); i++) plan = planFor(next, projectTexts);
 
-  // plan.writes is already in core.PUBLISH_ORDER. Undo what was written on failure.
-  const written: { path: string; before: string }[] = [];
+  // Undo what was written on failure. Project files are shared with the user, so each is
+  // re-read right before its write and merged, and only restored if still exactly what we wrote.
+  const written: Written[] = [];
   try {
     for (const w of plan.writes) {
       if (w.kind === 'opencode') {
         const bak = core.OPENCODE_PATH.replace(/[^/]+$/, core.backupName());
         if ((await host.stat(bak)).kind === 'missing') await host.writeFile(bak, S.opencodeText);
       }
+      if (w.kind === 'project') {
+        const fresh = await readOptional(w.path);
+        const after = fresh === w.before ? w.after : core.applyProjectPermissions(fresh, projectSkillIds(w.after));
+        if (after == null || after === fresh) continue; // nothing of ours to write
+        await host.writeFile(w.path, after);
+        written.push({ kind: 'project', path: w.path, before: fresh, wrote: after });
+        continue;
+      }
       await host.writeFile(w.path, w.after);
       // A bundles file that didn't exist (seeding) has nothing to restore; it is written last anyway.
-      if (w.before != null) written.push({ path: w.path, before: w.before });
+      if (w.before != null) written.push({ kind: w.kind, path: w.path, before: w.before, wrote: w.after });
     }
   } catch (e) {
-    for (const { path, before } of written.reverse()) {
-      try { await host.writeFile(path, before); } catch (r) { toastError(r, `Could not restore ${path}`); }
-    }
+    await rollback(written);
     throw e;
   }
   for (const w of plan.writes) {
@@ -268,8 +328,53 @@ async function saveLocked(next: State, first: ChangePlan) {
     else if (w.kind === 'opencode') S.opencodeText = w.after;
     else if (w.kind === 'bundles') S.bundlesText = w.after;
   }
-  S.state = next;
+  S.state = plan.state ?? next;
   toastSkipped(plan.skipped);
+}
+
+type Written = { kind: string; path: string; before: string | null; wrote: string };
+
+/** Skill ids allowed by a project file text we generated. */
+function projectSkillIds(text: string): string[] {
+  try {
+    const perms = (JSON.parse(text) as { permissions?: { action?: string; resource?: string }[] }).permissions ?? [];
+    return perms.filter((r) => r.action === 'skill' && typeof r.resource === 'string').map((r) => r.resource as string);
+  } catch {
+    return [];
+  }
+}
+
+const rescueName = (path: string) =>
+  `${path}.skill-bundles-rescue-${new Date().toISOString().replace(/[-:.]/g, '').replace('T', '-').slice(0, 15)}-${Math.random().toString(36).slice(2, 8)}`;
+
+async function rollback(written: Written[]) {
+  for (const w of [...written].reverse()) {
+    try {
+      if (w.kind !== 'project') {
+        if (w.before != null) await host.writeFile(w.path, w.before);
+        continue;
+      }
+      const current = await readOptional(w.path);
+      if (current === w.wrote) {
+        // Untouched since our write: undo. A file we created can't be deleted, so empty its skill rules.
+        const restore = w.before ?? core.applyProjectPermissions(w.wrote, []);
+        if (restore != null) await host.writeFile(w.path, restore);
+        continue;
+      }
+      // Someone edited it after our write: leave their version, keep the pre-save text aside.
+      let rescued = '';
+      if (w.before != null) {
+        rescued = rescueName(w.path);
+        await host.writeFile(rescued, w.before);
+      }
+      void host.toast({
+        kind: 'error', dismiss: true, persistent: true, copy: { text: rescued || w.path },
+        message: `Save failed and ${w.path} was edited meanwhile, so it was left as is (it may still hold this save's skill rules).${rescued ? ` Its earlier version is in ${rescued}.` : ''}`,
+      });
+    } catch (r) {
+      toastError(r, `Could not restore ${w.path}`);
+    }
+  }
 }
 
 function toastSkipped(skipped: ChangePlan['skipped']) {
@@ -363,7 +468,7 @@ export function seedDefaults() {
   void enqueue(async () => {
     if (S.state) return;
     try {
-      await save(core.parseBundles(JSON.stringify(seed)));
+      await save(core.parseBundles(JSON.stringify(seed), homeOpt()));
       void host.toast({ kind: 'success', message: 'Created skill-bundles.json from the default bundles.' });
     } catch (e) {
       await reloadAfter(e);
