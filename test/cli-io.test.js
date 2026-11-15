@@ -358,3 +358,53 @@ test("io: project file changed on disk after load aborts; foreign write during r
   // no daily backup is made for project files
   assert.ok(!fs.readdirSync(path.dirname(pfile)).some((f) => /skill-bundles-\d{8}$/.test(f)));
 });
+
+test("io: skill in ~/.claude/skills writes to that file and detects conflict on disk", () => {
+  const h = makeHome();
+  const claudeDir = path.join(h, ".claude/skills/ext-skill");
+  fs.mkdirSync(claudeDir, { recursive: true });
+  const md = path.join(claudeDir, "SKILL.md");
+  fs.writeFileSync(md, "---\nname: ext-skill\ndescription: external\n---\nbody\n");
+
+  const order = [];
+  const io = faultyIO({ rename: ([, b]) => order.push(b) }, { rename: (a, b) => isTemp(a) && isTarget(a, b) });
+  const r = cli(h, ["set", "ext-skill", "called"], io);
+  assert.equal(r.code, 0, r.err);
+  assert.deepEqual(order, [md, path.join(oc(h), "opencode.json"), path.join(oc(h), "skill-bundles.json")]);
+  assert.match(fs.readFileSync(md, "utf8"), /opencode\/autoinvoke: false/);
+
+  // Concurrent edit on ~/.claude/skills/ext-skill/SKILL.md aborts cleanly
+  let done = false;
+  const io2 = faultyIO({
+    writeNew: ([p]) => { if (!done && p.includes(".skill-bundles.json.")) { done = true; fs.appendFileSync(md, " "); } },
+  }, { writeNew: isTemp });
+  const r2 = cli(h, ["set", "ext-skill", "auto"], io2);
+  assert.equal(r2.code, 1, r2.err);
+  assert.match(r2.err, /ext-skill\/SKILL\.md: file changed on disk, re-run/);
+});
+
+test("io: opencode.json skills sources changing mid-command aborts with nothing written", () => {
+  const h = makeHome();
+  const extra = path.join(h, "extra/beta");
+  fs.mkdirSync(extra, { recursive: true });
+  fs.writeFileSync(path.join(extra, "SKILL.md"), "---\nname: beta\ndescription: x\n---\n");
+  const ocp = path.join(oc(h), "opencode.json");
+  const before = snapshot(h);
+  let n = 0;
+  const io = faultyIO({
+    readFile: (args) => {
+      // second read of opencode.json is commit's; another writer adds a skills source before it
+      if (args[0] === ocp && n++ === 1) {
+        const cfg = JSON.parse(fs.readFileSync(ocp, "utf8"));
+        cfg.skills = ["~/extra"];
+        fs.writeFileSync(ocp, JSON.stringify(cfg, null, 2) + "\n");
+      }
+    },
+  });
+  const r = cli(h, ["set", "beta", "called"], io);
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /"skills" sources changed/);
+  const after = snapshot(h);
+  delete before[ocp]; delete after[ocp];
+  assert.deepEqual(after, before);
+});

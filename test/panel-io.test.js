@@ -479,3 +479,181 @@ test("counts: 0 live → 0%, ~0 tokens; nothing installed → 0%", async () => {
   expect(counts.livePct({ live: 0, installed: 0 })).toBe(0);
   expect([950, 1000, 1600, 9999, 12345, 1250000].map(counts.formatTokens)).toEqual(["950", "1k", "1.6k", "10k", "12k", "1.3M"]);
 });
+
+// ---------- multi-root skill discovery ----------
+
+test("discovery: all three roots, precedence, flat .md, nested, and symlinked skill dir", async () => {
+  put("~/.claude/skills/claude-only/SKILL.md", skillMd("Claude only"));
+  put("~/.claude/skills/flat-one.md", skillMd("Flat one"));
+  put("~/.claude/skills/shared/SKILL.md", skillMd("From claude"));
+  put("~/.agents/skills/shared/SKILL.md", skillMd("From agents"));
+  put("~/.agents/skills/team/sub/nested-one/SKILL.md", skillMd("Nested"));
+  put("~/.agents/skills/team/sub/nested-one/inner/SKILL.md", skillMd("Should not be a separate skill"));
+  put("~/.config/opencode/skills/shared/SKILL.md", skillMd("From opencode"));
+  put("~/custom-skills/extra/SKILL.md", skillMd("From config"));
+  put(core.OPENCODE_PATH, JSON.stringify({ $schema: "x", skills: ["~/custom-skills"], permissions: [] }, null, 2) + "\n");
+
+  // Real symlink in ~/.agents/skills pointing to an external skill folder.
+  put("~/ext-store/linked-skill/SKILL.md", skillMd("Linked"));
+  fs.mkdirSync(real("~/.agents/skills"), { recursive: true });
+  fs.symlinkSync(real("~/ext-store/linked-skill"), real("~/.agents/skills/linked-skill"));
+
+  await io.load();
+  expect(io.S.unreachable).toEqual([]);
+  for (const id of ["alpha", "beta", "claude-only", "flat-one", "nested-one", "shared", "extra", "linked-skill"]) {
+    expect(io.S.allIds).toContain(id);
+  }
+  expect(io.S.allIds).not.toContain("inner");
+
+  // Precedence: ~/.config/opencode/skills wins over ~/.agents/skills and ~/.claude/skills.
+  expect(io.skillPath("shared")).toBe("~/.config/opencode/skills/shared/SKILL.md");
+  expect(io.meta("shared").description).toBe("From opencode");
+
+  // Flat .md has dir === null and real path.
+  expect(io.S.skillRefs["flat-one"].dir).toBe(null);
+  expect(io.skillPath("flat-one")).toBe("~/.claude/skills/flat-one.md");
+  expect(io.S.skillRefs["nested-one"].dir).toBe("~/.agents/skills/team/sub/nested-one");
+  expect(io.S.skillRefs["linked-skill"].dir).toBe("~/.agents/skills/linked-skill");
+
+  // status/counts.ts sees the exact same discovered ids.
+  const statusIds = await counts.listSkillIds(fx.host);
+  expect(statusIds).toEqual(io.S.allIds);
+  const c = await counts.readCounts(fx.host);
+  expect(c.installed).toBe(io.S.allIds.length);
+});
+
+test("discovery: BAD_PATH on a custom root or symlink entry is collected in unreachable without throwing", async () => {
+  put(core.OPENCODE_PATH, JSON.stringify({ $schema: "x", skills: ["/outside/skills"], permissions: [] }, null, 2) + "\n");
+  put("~/ext-store/bad-target/SKILL.md", skillMd("Bad"));
+  fs.mkdirSync(real("~/.agents/skills"), { recursive: true });
+  fs.symlinkSync(real("~/ext-store/bad-target"), real("~/.agents/skills/bad-link"));
+
+  const h = fakeHost();
+  const origListDir = h.listDir;
+  const origStat = h.stat;
+  h.listDir = async (p) => {
+    if (p === "/outside/skills") throw new HostRequestError("BAD_PATH", "outside declared globs");
+    return origListDir(p);
+  };
+  h.stat = async (p) => {
+    if (p === "~/.agents/skills/bad-link") throw new HostRequestError("BAD_PATH", "symlink outside globs");
+    return origStat(p);
+  };
+  io.setHost(h);
+  await io.load();
+  expect(io.S.allIds).toContain("alpha");
+  expect(io.S.allIds).not.toContain("bad-link");
+  expect(io.S.unreachable).toEqual(
+    expect.arrayContaining([
+      { path: "/outside/skills", code: "BAD_PATH" },
+      { path: "~/.agents/skills/bad-link", code: "BAD_PATH" },
+    ]),
+  );
+});
+
+test("saveDescription and applyChange write to a ~/.claude/skills file", async () => {
+  put("~/.claude/skills/claude-only/SKILL.md", skillMd("Old claude desc"));
+  await io.load();
+  expect(io.skillPath("claude-only")).toBe("~/.claude/skills/claude-only/SKILL.md");
+
+  io.saveDescription("claude-only", "Updated claude desc");
+  await settle();
+  await settle();
+  expect(read("~/.claude/skills/claude-only/SKILL.md")).toContain("description: Updated claude desc");
+
+  await io.enqueue(async () => {
+    expect(await io.applyChange((s) => core.setOverride(s, "claude-only", "called"))).toBe(true);
+  });
+  await settle();
+  expect(read("~/.claude/skills/claude-only/SKILL.md")).toContain("opencode/autoinvoke: false");
+});
+
+test("discovery: a symlink loop is bounded and reported, other skills still load", async () => {
+  fs.mkdirSync(real("~/.agents/skills"), { recursive: true });
+  for (const n of ["l1", "l2", "l3", "l4"]) fs.symlinkSync(real("~/.agents/skills"), real(`~/.agents/skills/${n}`));
+  const h = fakeHost();
+  let lists = 0;
+  const orig = h.listDir;
+  h.listDir = async (p) => { lists++; return orig(p); };
+  io.setHost(h);
+  await io.load();
+  expect(io.S.allIds).toContain("alpha");
+  expect(lists).toBeLessThanOrEqual(2000 + 10);
+  expect(io.S.unreachable.some((u) => u.code === "TRUNCATED")).toBe(true);
+});
+
+test("load: one unreadable SKILL.md is reported, the rest still loads", async () => {
+  put("~/.agents/skills/locked/SKILL.md", skillMd("Locked"));
+  const h = fakeHost();
+  const orig = h.readFile;
+  h.readFile = async (p) => {
+    if (p === "~/.agents/skills/locked/SKILL.md") throw new HostRequestError("DENIED", "nope");
+    return orig(p);
+  };
+  io.setHost(h);
+  await io.load();
+  expect(io.S.loaded).toBe(true);
+  expect(io.S.allIds).toContain("locked");
+  expect(io.S.allIds).toContain("alpha");
+  expect(io.S.skillMds.locked).toBeUndefined();
+  expect(io.S.unreachable).toContainEqual({ path: "~/.agents/skills/locked/SKILL.md", code: "DENIED" });
+});
+
+test("load: an unreadable SKILL.md blocks its mode controls and 'called' is refused", async () => {
+  put("~/.agents/skills/locked/SKILL.md", skillMd("Locked"));
+  const h = fakeHost();
+  const orig = h.readFile;
+  h.readFile = async (p) => {
+    if (p === "~/.agents/skills/locked/SKILL.md") throw new HostRequestError("DENIED", "nope");
+    return orig(p);
+  };
+  io.setHost(h);
+  await io.load();
+  expect(io.fmError("locked")).toContain("could not be read");
+  await io.enqueue(async () => {
+    expect(await io.applyChange((s) => core.setOverride(s, "locked", "called"))).toBe(false);
+  });
+  expect(read("~/.agents/skills/locked/SKILL.md")).not.toContain("autoinvoke");
+});
+
+test("load: incomplete discovery keeps unseen allow rules and blocks 'when called'", async () => {
+  put(core.OPENCODE_PATH, JSON.stringify({ $schema: "x", skills: ["/outside/skills"], permissions: [
+    { action: "skill", resource: "*", effect: "deny" }, { action: "skill", resource: "external", effect: "allow" },
+  ] }, null, 2) + "\n");
+  const h = fakeHost();
+  const orig = h.listDir;
+  h.listDir = async (p) => {
+    if (p === "/outside/skills") throw new HostRequestError("BAD_PATH", "outside");
+    return orig(p);
+  };
+  io.setHost(h);
+  await io.load();
+  expect(io.S.incomplete).toBe(true);
+  await io.enqueue(async () => {
+    expect(await io.applyChange((s) => core.setBundleEnabled(s, "b", true))).toBe(true);
+  });
+  const allows = JSON.parse(read(core.OPENCODE_PATH)).permissions.filter((r) => r.effect === "allow").map((r) => r.resource);
+  expect(allows).toContain("external");
+  await io.enqueue(async () => {
+    expect(await io.applyChange((s) => core.setOverride(s, "alpha", "called"))).toBe(false);
+  });
+  expect(read("~/.config/opencode/skills/alpha/SKILL.md")).not.toContain("autoinvoke");
+});
+
+test("home: an absolute or ~/ config source makes discovery incomplete (home can't be verified)", async () => {
+  put(core.OPENCODE_PATH, JSON.stringify({ $schema: "x", skills: ["/home/other/.config/opencode/skills", "~/"], permissions: [] }, null, 2) + "\n");
+  fx.projects = [{ id: "p", name: "p", directory: "/home/other/proj" }];
+  io.S.homeDerived = false;
+  io.S.home = undefined;
+  await io.load();
+  expect(io.S.incomplete).toBe(true);
+  expect(io.S.unreachable.filter((u) => u.code === "NO_HOME").map((u) => u.path).sort()).toEqual(["/home/other/.config/opencode/skills", "~"]);
+});
+
+test("home: stock and ~/x sources need no home and stay complete", async () => {
+  put("~/team-skills/t1/SKILL.md", skillMd("T1"));
+  put(core.OPENCODE_PATH, JSON.stringify({ $schema: "x", skills: ["~/team-skills"], permissions: [] }, null, 2) + "\n");
+  await io.load();
+  expect(io.S.incomplete).toBe(false);
+  expect(io.S.allIds).toContain("t1");
+});

@@ -406,7 +406,7 @@ test("R3-8 auto skill with unsupported SKILL.md is skipped, others still saved",
   fs.writeFileSync(md, weird);
   let r = run(h, "set", "beta", "auto");
   assert.equal(r.code, 0, r.err);
-  assert.match(r.out, /skipped skills\/beta\/SKILL\.md .*flow-style/);
+  assert.match(r.out, /skipped .*skills\/beta\/SKILL\.md .*flow-style/);
   assert.equal(fs.readFileSync(md, "utf8"), weird);
   assert.ok(skillRules(h).some((x) => x.resource === "beta"));
   r = run(h, "set", "beta", "called");
@@ -754,4 +754,182 @@ test("A9 first save through a symlinked project dir with no .opencode yet succee
   const r2 = run(h, "on", "dev", "--project", path.join(lroot, "sub"));
   assert.equal(r2.code, 0, r2.err);
   assert.ok(fs.existsSync(path.join(realRoot, "sub/.opencode/opencode.json")));
+});
+
+// ---------- multi-root skill discovery (OpenCode V2) ----------
+
+function writeSkill(dir, name, extraFm = "") {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "SKILL.md"),
+    `---\nname: ${name}\ndescription: ${name} skill\n${extraFm}---\nbody for ${name}\n`,
+  );
+}
+
+test("D1 discovery across all three global roots, flat *.md, nested, hidden/node_modules/depth", () => {
+  const h = makeHome();
+  // ~/.claude/skills: claude-only + shared (overridden by agents & opencode)
+  writeSkill(path.join(h, ".claude/skills/claude-only"), "claude-only");
+  writeSkill(path.join(h, ".claude/skills/shared"), "shared-claude");
+
+  // ~/.agents/skills: flat foo.md, nested teams/release, shared, hidden, node_modules, depth 6 vs 7
+  fs.mkdirSync(path.join(h, ".agents/skills"), { recursive: true });
+  fs.writeFileSync(path.join(h, ".agents/skills/foo.md"), "---\ndescription: flat foo\n---\n");
+  writeSkill(path.join(h, ".agents/skills/teams/release"), "release");
+  writeSkill(path.join(h, ".agents/skills/shared"), "shared-agents");
+  writeSkill(path.join(h, ".agents/skills/.secret-dir"), "secret-dir");
+  writeSkill(path.join(h, ".agents/skills/node_modules/pkg"), "pkg");
+  // depth 6 (allowed: a/b/c/d/e/at6 -> SKILL.md inside at6) vs depth 7 (too deep)
+  writeSkill(path.join(h, ".agents/skills/a/b/c/d/e/at6"), "at6");
+  writeSkill(path.join(h, ".agents/skills/x/b/c/d/e/f/at7"), "at7");
+
+  // ~/.config/opencode/skills already has alpha, beta, gamma; add shared to override both claude & agents
+  writeSkill(path.join(oc(h), "skills/shared"), "shared-oc");
+
+  const r = run(h, "status");
+  assert.equal(r.code, 0, r.err);
+  for (const id of ["claude-only", "foo", "release", "shared", "at6", "alpha", "beta", "gamma"]) {
+    assert.match(r.out, new RegExp(`\\b${id}\\b`), `expected ${id} in status`);
+  }
+  for (const skip of ["secret-dir", "pkg", "at7"]) {
+    assert.doesNotMatch(r.out, new RegExp(`\\b${skip}\\b`), `did not expect ${skip} in status`);
+  }
+
+  // Precedence: editing `shared` to called modifies ~/.config/opencode/skills/shared/SKILL.md, not claude/agents
+  assert.equal(run(h, "set", "shared", "called").code, 0);
+  assert.match(read(h, "skills/shared/SKILL.md"), /opencode\/autoinvoke: false/);
+  assert.doesNotMatch(fs.readFileSync(path.join(h, ".claude/skills/shared/SKILL.md"), "utf8"), /autoinvoke/);
+  assert.doesNotMatch(fs.readFileSync(path.join(h, ".agents/skills/shared/SKILL.md"), "utf8"), /autoinvoke/);
+
+  // Editing claude-only writes to ~/.claude/skills/claude-only/SKILL.md and NOT ~/.config/opencode/skills
+  assert.equal(run(h, "set", "claude-only", "called").code, 0);
+  assert.match(fs.readFileSync(path.join(h, ".claude/skills/claude-only/SKILL.md"), "utf8"), /opencode\/autoinvoke: false/);
+  assert.ok(!fs.existsSync(path.join(oc(h), "skills/claude-only")));
+
+  // Editing flat foo.md writes to ~/.agents/skills/foo.md
+  assert.equal(run(h, "set", "foo", "called").code, 0);
+  assert.match(fs.readFileSync(path.join(h, ".agents/skills/foo.md"), "utf8"), /opencode\/autoinvoke: false/);
+});
+
+test("D2 precedence: .agents beats .claude when not in .config/opencode", () => {
+  const h = makeHome();
+  writeSkill(path.join(h, ".claude/skills/both"), "both-claude");
+  writeSkill(path.join(h, ".agents/skills/both"), "both-agents");
+
+  assert.equal(run(h, "set", "both", "called").code, 0);
+  assert.match(fs.readFileSync(path.join(h, ".agents/skills/both/SKILL.md"), "utf8"), /opencode\/autoinvoke: false/);
+  assert.doesNotMatch(fs.readFileSync(path.join(h, ".claude/skills/both/SKILL.md"), "utf8"), /autoinvoke/);
+});
+
+test("D3 symlinked skill dir and symlink cycle in skill root", () => {
+  const h = makeHome();
+  const target = path.join(h, ".agents/skills/linked-src");
+  writeSkill(target, "linked-src");
+  fs.symlinkSync(target, path.join(oc(h), "skills/linked-skill"));
+  // Symlink cycle inside ~/.agents/skills should not hang or crash
+  fs.mkdirSync(path.join(h, ".agents/skills/loop-dir"), { recursive: true });
+  fs.symlinkSync(path.join(h, ".agents/skills/loop-dir"), path.join(h, ".agents/skills/loop-dir/self"));
+
+  const r = run(h, "set", "linked-skill", "called");
+  assert.equal(r.code, 0, r.err);
+  assert.match(fs.readFileSync(path.join(target, "SKILL.md"), "utf8"), /opencode\/autoinvoke: false/);
+  assert.match(run(h, "status").out, /\blinked-skill\b/);
+});
+
+test("D4 opencode.json skills array: ~/extra picked up, URL and relative ignored", () => {
+  const h = makeHome();
+  const extraDir = path.join(h, "extra");
+  writeSkill(path.join(extraDir, "from-extra"), "from-extra");
+  const relDir = path.join(h, "rel-skills");
+  writeSkill(path.join(relDir, "from-rel"), "from-rel");
+
+  const ocp = path.join(oc(h), "opencode.json");
+  const cfg = JSON.parse(fs.readFileSync(ocp, "utf8"));
+  cfg.skills = ["~/extra", "https://example.com/catalog", "rel-skills"];
+  fs.writeFileSync(ocp, JSON.stringify(cfg, null, 2) + "\n");
+
+  const r = run(h, "set", "from-extra", "called");
+  assert.equal(r.code, 0, r.err);
+  assert.match(fs.readFileSync(path.join(extraDir, "from-extra/SKILL.md"), "utf8"), /opencode\/autoinvoke: false/);
+  assert.doesNotMatch(run(h, "status").out, /\bfrom-rel\b/);
+});
+
+test("D5 unreadable root warns and skips instead of crashing", { skip: process.getuid?.() === 0 }, () => {
+  const h = makeHome();
+  const claudeSkills = path.join(h, ".claude/skills");
+  fs.mkdirSync(claudeSkills, { recursive: true });
+  fs.chmodSync(claudeSkills, 0o000);
+  try {
+    const r = run(h, "list");
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.err, /warning: skipping .*\.claude\/skills/);
+  } finally {
+    fs.chmodSync(claudeSkills, 0o755);
+  }
+});
+
+test("D6 two symlinks to one skill folder are two ids; a real ancestor loop is cut", () => {
+  const h = makeHome();
+  fs.symlinkSync(path.join(oc(h), "skills/beta"), path.join(oc(h), "skills/beta-alias"));
+  fs.mkdirSync(path.join(h, ".agents/skills/loop"), { recursive: true });
+  fs.symlinkSync(path.join(h, ".agents/skills"), path.join(h, ".agents/skills/loop/up"));
+  const r = run(h, "status");
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /\bbeta\b/);
+  assert.match(r.out, /\bbeta-alias\b/);
+});
+
+test("D7 a SKILL.md at a configured source root is one skill named after the folder", () => {
+  const h = makeHome();
+  writeSkill(path.join(h, "single-skill"), "single-skill");
+  writeSkill(path.join(h, "single-skill/inner"), "inner");
+  const ocp = path.join(oc(h), "opencode.json");
+  const cfg = JSON.parse(fs.readFileSync(ocp, "utf8"));
+  cfg.skills = ["~/single-skill"];
+  fs.writeFileSync(ocp, JSON.stringify(cfg, null, 2) + "\n");
+  const r = run(h, "status");
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /\bsingle-skill\b/);
+  assert.doesNotMatch(r.out, /\binner\b/);
+});
+
+test("D8 a huge low-precedence source does not starve a higher one; a truncated scan blocks SKILL.md edits", () => {
+  const h = makeHome();
+  for (let i = 0; i < 2001; i++) fs.mkdirSync(path.join(h, ".claude/skills", `d${i}`), { recursive: true });
+  fs.writeFileSync(path.join(h, ".claude/skills/foo.md"), "---\ndescription: claude foo\n---\n");
+  writeSkill(path.join(oc(h), "skills/foo"), "foo");
+  const st = run(h, "status");
+  assert.equal(st.code, 0, st.err);
+  assert.match(st.out, /\bfoo\b/);
+  assert.match(st.err, /stopped scanning/);
+  const r = run(h, "set", "foo", "called");
+  assert.notEqual(r.code, 0);
+  assert.match(r.err, /could not be read|when called/);
+  assert.doesNotMatch(read(h, "skills/foo/SKILL.md"), /autoinvoke/);
+  assert.doesNotMatch(fs.readFileSync(path.join(h, ".claude/skills/foo.md"), "utf8"), /autoinvoke/);
+});
+
+test("D9 tilde and absolute spellings of one source dedupe like OpenCode", () => {
+  const h = makeHome();
+  writeSkill(path.join(oc(h), "skills/foo"), "foo");
+  writeSkill(path.join(h, "custom/foo"), "foo");
+  const ocp = path.join(oc(h), "opencode.json");
+  const cfg = JSON.parse(fs.readFileSync(ocp, "utf8"));
+  cfg.skills = ["~/custom", path.join(h, ".config/opencode/skills")];
+  fs.writeFileSync(ocp, JSON.stringify(cfg, null, 2) + "\n");
+  assert.equal(run(h, "set", "foo", "called").code, 0);
+  assert.match(fs.readFileSync(path.join(h, "custom/foo/SKILL.md"), "utf8"), /autoinvoke: false/);
+  assert.doesNotMatch(read(h, "skills/foo/SKILL.md"), /autoinvoke/);
+});
+
+test("D10 a SKILL.md directly in a ~/ source is named after the home folder", () => {
+  const h = makeHome();
+  fs.writeFileSync(path.join(h, "SKILL.md"), "---\nname: homeskill\ndescription: x\n---\n");
+  const ocp = path.join(oc(h), "opencode.json");
+  const cfg = JSON.parse(fs.readFileSync(ocp, "utf8"));
+  cfg.skills = ["~/"];
+  fs.writeFileSync(ocp, JSON.stringify(cfg, null, 2) + "\n");
+  const r = run(h, "status");
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, new RegExp(`\\b${path.basename(h)}\\b`));
 });

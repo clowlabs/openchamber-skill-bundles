@@ -867,3 +867,45 @@ test("A4 applyProjectPermissions keeps non-skill entries byte-for-byte", () => {
   assert.deepEqual(JSON.parse(gone).permissions.length, 2);
   assert.equal(core.applyProjectPermissions('{"permissions":[{"action":"skill","resource":"a","effect":"allow"}]}', []), '{"permissions":[]}');
 });
+
+test("planChange: unreadable SKILL.md refuses 'called', skips 'auto' with a note", () => {
+  const st = S({ bundles: [{ id: "a", enabled: true, skills: ["x"] }] });
+  const prev = { bundlesText: core.serializeBundles(st), opencodeText: '{"permissions":[]}\n', skillMds: {}, unreadable: ["x"] };
+  assert.throws(() => core.planChange(prev, core.setOverride(st, "x", "called"), ["x"]), (e) => e.file === "skill" && e.id === "x");
+  const p = core.planChange(prev, st, ["x"]);
+  assert.deepEqual(p.skipped.map((s) => s.id), ["x"]);
+});
+
+test("planChange: incomplete discovery keeps every rule and restates only flipped ids", () => {
+  const st = S({ bundles: [{ id: "a", enabled: true, skills: ["x", "external"] }, { id: "b", enabled: false, skills: ["y"] }] });
+  const rules = [
+    { action: "skill", resource: "*", effect: "deny" },
+    { action: "skill", resource: "external", effect: "allow" },
+    { action: "skill", resource: "ghost", effect: "allow" },
+    { action: "skill", resource: "ghost", effect: "deny" },
+    { action: "skill", resource: "private-*", effect: "allow" },
+    { action: "skill", resource: "private-secret", effect: "deny" },
+    { action: "skill", resource: "x", effect: "allow" },
+  ];
+  const oc = JSON.stringify({ permissions: rules }, null, 2) + "\n";
+  const md = "---\nname: x\n---\n";
+  const prev = { bundlesText: core.serializeBundles(st), opencodeText: oc, skillMds: { x: md, y: md }, incomplete: true };
+  const perms = (p) => JSON.parse(p.writes.find((w) => w.kind === "opencode").after).permissions;
+  // turning bundle b on: only y is restated; ghost stays denied, private-* exceptions survive
+  const on = perms(core.planChange(prev, core.setBundleEnabled(st, "b", true), ["x", "y"]));
+  assert.deepEqual(on.slice(0, rules.length), rules);
+  assert.deepEqual(on.slice(rules.length), [{ action: "skill", resource: "y", effect: "allow" }]);
+  // turning bundle a off: external (not discovered) is restated as deny, not kept allowed
+  const off = perms(core.planChange(prev, core.setBundleEnabled(st, "a", false), ["x", "y"])); // external not discovered
+  assert.deepEqual(off.filter((r) => r.resource === "external"), [{ action: "skill", resource: "external", effect: "deny" }]);
+  assert.deepEqual(off.filter((r) => r.resource === "x"), [{ action: "skill", resource: "x", effect: "deny" }]);
+  // "when called" either way is refused; on/off with no SKILL.md edit needed is fine
+  assert.throws(() => core.planChange(prev, core.setOverride(st, "x", "called"), ["x", "y"]), (e) => e.file === "skill" && /when called/.test(e.message));
+  const called = S({ bundles: st.bundles, overrides: { x: "called" } });
+  assert.throws(() => core.planChange({ ...prev, bundlesText: core.serializeBundles(called) }, core.setOverride(called, "x", "auto"), ["x"]), /when called/);
+  // no SKILL.md is written while incomplete
+  assert.ok(!core.planChange(prev, core.setBundleEnabled(st, "b", true), ["x", "y"]).writes.some((w) => w.kind === "skill"));
+  // complete discovery still rewrites the skill rules from scratch
+  const q = perms(core.planChange({ ...prev, incomplete: false }, core.setBundleEnabled(st, "b", true), ["x", "y"]));
+  assert.ok(!q.some((r) => r.resource === "ghost" || r.resource === "private-*"));
+});

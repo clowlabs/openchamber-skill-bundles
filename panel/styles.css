@@ -5,6 +5,8 @@ html, body { margin: 0; background: var(--oc-bg); color: var(--oc-fg); font-fami
 .sb-title { font-weight: 600; font-size: 15px; }
 .sb-stats { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .sb-stats-line { color: var(--oc-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.sb-unreachable { color: var(--oc-muted); font-size: 12px; }
+.sb-unreachable:empty { display: none; }
 .sb-main { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 12px; flex: 1; min-height: 0; }
 .sb-left, .sb-right { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
 .sb-right { border: 1px solid var(--oc-border); border-radius: var(--oc-radius, 8px); padding: 12px; align-self: start; position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow: auto; }

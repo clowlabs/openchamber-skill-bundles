@@ -9,10 +9,14 @@ single skill's settings (description, "Agents use it", SKILL.md) in the same pag
 |---|---|---|
 | `~/.config/opencode/skill-bundles.json` | us | bundle definitions + per-skill overrides (schema below) |
 | `~/.config/opencode/opencode.json` | user (plain JSON, no comments) | we rewrite ONLY entries in `permissions` whose `action === "skill"` |
-| `~/.config/opencode/skills/<id>/SKILL.md` | user | frontmatter `metadata.opencode/autoinvoke` and `description` |
+| `<skill-root>/<id>/SKILL.md` or `<skill-root>/<id>.md` | user | frontmatter `metadata.opencode/autoinvoke` and `description` |
 
-Skill IDs = directory names under `~/.config/opencode/skills` (195 today, skip dotfiles) plus
-built-ins `opencode` and `report` (no SKILL.md; can only be auto/off; `called` → treat as `auto`).
+Skill IDs are discovered per OpenCode V2 rules: global roots `~/.claude/skills`, `~/.agents/skills`,
+`~/.config/opencode/skills` (in precedence order, later wins an ID), plus absolute/`~/` entries of
+`opencode.json`'s `skills` array. Within each root, root-level `*.md` files are flat skills and
+folders nested up to 6 levels containing `SKILL.md` are skills (hidden entries and `node_modules`
+skipped). Plus built-ins `opencode` and `report` (no SKILL.md; can only be auto/off; `called` →
+treat as `auto`).
 
 ## skill-bundles.json schema (version 1)
 

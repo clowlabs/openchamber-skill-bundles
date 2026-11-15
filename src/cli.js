@@ -2,6 +2,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as core from "./core.js";
+import * as discover from "./discover.js";
 import * as fsSafe from "../shared/node/fs-safe.js";
 import { createNodeIO, SafeFsError } from "../shared/node/fs-safe.js";
 
@@ -106,31 +107,102 @@ function makeEnv(opts, homeDefault) {
 
 const readOrNull = (p) => fsSafe.readOrNull(io, p);
 
-function loadAll(env) {
-  let entries = [];
-  try {
-    entries = io.readdir(env.skillsDir);
-  } catch (e) {
-    if (e.code !== "ENOENT") throw e; // only a missing skills dir itself means "no skills"
+function toSkillPath(refPath, home) {
+  if (refPath === "~" || refPath.startsWith("~/")) return refPath;
+  if (home !== "/" && (refPath === home || refPath.startsWith(home + "/"))) {
+    return "~" + refPath.slice(home.length);
   }
-  const ids = [];
-  for (const d of entries) {
-    if (d.name.startsWith(".")) continue;
-    if (d.isDirectory()) { ids.push(d.name); continue; }
-    if (!d.isSymbolicLink()) continue;
+  return refPath;
+}
+
+// Walks one source. Cycles are cut per branch (a directory that is its own ancestor), so two
+// symlinks to the same folder still count as two path-derived ids, as in OpenCode.
+function walkSkillRoot(env, root, problems) {
+  const rootAbs = env.expand(root);
+  const refs = [];
+  let left = discover.SKILL_SCAN_BUDGET;
+  const queue = [{ rel: "", ancestors: new Set() }];
+  while (queue.length) {
+    const { rel, ancestors } = queue.shift();
+    const dirAbs = rel ? path.join(rootAbs, rel) : rootAbs;
+    let realDir;
     try {
-      if (io.stat(path.join(env.skillsDir, d.name)).isDirectory()) ids.push(d.name);
+      realDir = io.realpath(dirAbs);
     } catch (e) {
-      warn(`skills: warning: skipping ${path.join(env.skillsDir, d.name)} (${e.code === "ENOENT" ? "dangling symlink" : e.code}); not a skill`);
+      if (e.code !== "ENOENT" && e.code !== "ENOTDIR") {
+        warn(`skills: warning: skipping ${dirAbs} (${e.code === "ELOOP" ? "symlink cycle" : e.code})`);
+        if (e.code !== "ELOOP") problems.push(`${dirAbs} (${e.code})`);
+      }
+      continue;
     }
+    if (ancestors.has(realDir)) continue;
+    if (left-- <= 0) {
+      warn(`skills: warning: stopped scanning ${rootAbs} after ${discover.SKILL_SCAN_BUDGET} folders; some skills may be missing`);
+      problems.push(`${rootAbs} (stopped after ${discover.SKILL_SCAN_BUDGET} folders)`);
+      break;
+    }
+    let raw;
+    try {
+      raw = io.readdir(dirAbs);
+    } catch (e) {
+      if (e.code !== "ENOENT") {
+        warn(`skills: warning: skipping ${dirAbs} (${e.code})`);
+        problems.push(`${dirAbs} (${e.code})`);
+      }
+      continue;
+    }
+    const entries = [];
+    for (const d of raw) {
+      if (discover.skipName(d.name)) continue;
+      if (d.isDirectory()) { entries.push({ name: d.name, kind: "directory" }); continue; }
+      if (d.isFile()) { entries.push({ name: d.name, kind: "file" }); continue; }
+      if (!d.isSymbolicLink()) continue;
+      const ep = path.join(dirAbs, d.name);
+      try {
+        const st = io.stat(ep);
+        if (st.isDirectory()) entries.push({ name: d.name, kind: "directory" });
+        else if (st.isFile()) entries.push({ name: d.name, kind: "file" });
+      } catch (e) {
+        warn(`skills: warning: skipping ${ep} (${e.code === "ENOENT" ? "dangling symlink" : e.code === "ELOOP" ? "symlink cycle" : e.code}); not a skill`);
+        // OpenCode ignores broken and looping links too; anything else may hide a skill.
+        if (e.code !== "ENOENT" && e.code !== "ELOOP") problems.push(`${ep} (${e.code})`);
+      }
+    }
+    const { skills, subdirs } = discover.classifySkillDir(root, rel, entries, { home: env.home });
+    refs.push(...skills);
+    const next = new Set(ancestors).add(realDir);
+    for (const s of subdirs) queue.push({ rel: s, ancestors: next });
   }
+  return refs;
+}
+
+function loadAll(env) {
+  const inputs = new Map(); // every file read → text as read (null = absent)
+  const opencodeText = readOrNull(env.opencodePath);
+  inputs.set(env.opencodePath, opencodeText);
+
+  const problems = []; // folders that could not be scanned: which file each id uses is then unknown
+  const perRoot = discover.skillRoots(opencodeText, { home: env.home }).map((r) => walkSkillRoot(env, r, problems));
+  const byId = discover.mergeSkillRefs(perRoot);
+  const ids = Object.keys(byId);
   const allIds = [...new Set([...ids, ...core.BUILTIN_SKILLS])].sort();
   const skillMds = Object.create(null);
-  const inputs = new Map(); // every file read → text as read (null = absent)
+  const skillPaths = Object.create(null);
+  const unreadable = [];
   for (const id of ids) {
-    const p = path.join(env.skillsDir, id, "SKILL.md");
-    const t = readOrNull(p);
-    inputs.set(p, t);
+    const ref = byId[id];
+    skillPaths[id] = toSkillPath(ref.path, env.home);
+    const abs = env.expand(ref.path);
+    let t;
+    try {
+      t = readOrNull(abs);
+    } catch (e) {
+      if (e.code !== "EACCES" && e.code !== "EPERM" && e.code !== "EISDIR") throw e;
+      warn(`skills: warning: cannot read ${abs} (${e.code})`);
+      unreadable.push(id);
+      continue;
+    }
+    inputs.set(abs, t);
     if (t !== null) skillMds[id] = t;
   }
   let bundlesText = readOrNull(env.bundlesPath);
@@ -147,7 +219,7 @@ function loadAll(env) {
   } catch (e) {
     throw new CliError(`${seeded ? "seed" : env.bundlesPath}: ${e.message}`);
   }
-  return { allIds, skillMds, state, seeded, inputs, originalBundlesText: seeded ? null : bundlesText };
+  return { allIds, skillMds, skillPaths, problems, unreadable, state, seeded, inputs, originalBundlesText: seeded ? null : bundlesText };
 }
 
 function diff(file, oldText, newText) {
@@ -220,8 +292,13 @@ function mergePhysicalAliases(env, state) {
 function commit(env, ctx, state, opts) {
   for (const t of [env.opencodePath, env.bundlesPath]) realTarget(t); // clean errors for bad symlinks
   const ocOld = readOrNull(env.opencodePath);
-  ctx.inputs.set(env.opencodePath, ocOld);
   if (ocOld === null) throw new CliError(`${env.opencodePath} not found`);
+  // Skill paths came from the config read at load; a changed `skills` list could move an id.
+  const seen = ctx.inputs.get(env.opencodePath) ?? null;
+  if (JSON.stringify(discover.skillRoots(seen, { home: env.home })) !== JSON.stringify(discover.skillRoots(ocOld, { home: env.home }))) {
+    throw new CliError(`${env.opencodePath}: its "skills" sources changed while this command ran; nothing written, run it again`);
+  }
+  ctx.inputs.set(env.opencodePath, ocOld);
   state = mergePhysicalAliases(env, state);
   // every project target is an input: read it (missing → null) and snapshot it like any other
   const projectTexts = Object.create(null);
@@ -234,15 +311,22 @@ function commit(env, ctx, state, opts) {
   }
   let plan;
   try {
-    plan = core.planChange({ bundlesText: ctx.originalBundlesText, opencodeText: ocOld, skillMds: ctx.skillMds }, state, ctx.allIds, projectTexts, { home: env.home });
+    plan = core.planChange(
+      { bundlesText: ctx.originalBundlesText, opencodeText: ocOld, skillMds: ctx.skillMds, skillPaths: ctx.skillPaths, unreadable: ctx.unreadable, incomplete: ctx.problems.length > 0 },
+      state,
+      ctx.allIds,
+      projectTexts,
+      { home: env.home },
+    );
   } catch (e) {
     throw new CliError(e.file === "opencode" ? `${env.opencodePath}: ${e.message}` : e.message);
   }
   for (const { id, reason } of plan.skipped) {
-    print(`skipped skills/${id}/SKILL.md (left unchanged; allow rule still applied): ${reason}`);
+    const p = env.expand(ctx.skillPaths?.[id] ?? `${core.SKILLS_DIR}/${id}/SKILL.md`);
+    print(`skipped ${p} (left unchanged; allow rule still applied): ${reason}`);
   }
   const where = (w) =>
-    w.kind === "skill" ? path.join(env.skillsDir, w.id, "SKILL.md")
+    w.kind === "skill" ? env.expand(w.path)
     : w.kind === "project" ? env.expand(w.path)
     : w.kind === "opencode" ? env.opencodePath
     : env.bundlesPath;

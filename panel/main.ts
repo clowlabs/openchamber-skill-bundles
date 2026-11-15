@@ -103,6 +103,15 @@ function renderBanner() {
       action: { label: 'Create from defaults', onClick: seedDefaults },
     });
   }
+  const unreach = $('unreachable');
+  const n = S.loaded ? S.unreachable.length : 0;
+  if (n > 0) {
+    unreach.textContent = `${n} skill location${n === 1 ? '' : 's'} couldn't be read, usually a skills folder from opencode.json or a symlink outside the folders this extension may open.${S.incomplete ? ' Until then on/off still works, but "when called", descriptions and sending to a project are blocked.' : ''} Hover for paths.`;
+    unreach.title = S.unreachable.map((u) => `${u.path} (${u.code})`).join('\n');
+  } else {
+    unreach.textContent = '';
+    unreach.removeAttribute('title');
+  }
 }
 
 // ---------- bundles view ----------
@@ -137,6 +146,7 @@ function menuAt(anchor: HTMLElement, id: string, alt: boolean) {
 function sendBlocked(id: string): string | null {
   if (core.isBuiltin(id)) return 'Built-in skill: it has no folder to send.';
   if (S.skillMds[id] == null) return 'This skill has no SKILL.md to send.';
+  if (S.incomplete) return "Some skill folders couldn't be read, so this may not be the copy OpenCode uses.";
   const err = fmError(id);
   if (err) return `Manual edit needed (${err}). ${HAND_EDIT}.`;
   return null;
@@ -420,6 +430,7 @@ async function boot() {
 initSend({
   host,
   blockedReason: (id) => (S.loaded && S.state ? sendBlocked(id) : 'Still loading.'),
+  skillRef: (id) => S.skillRefs[id],
   enqueue,
   // Already inside the queue (copySkill runs there), so apply directly instead of commit().
   markMoved: (id, dir) => applyChange((s) => core.markMovedToProject(s, id, dir)),

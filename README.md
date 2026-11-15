@@ -28,7 +28,7 @@ Nothing is deleted or moved out of your skills folder. Skill Bundles changes onl
 |---|---|
 | `~/.config/opencode/skill-bundles.json` | your bundles (created on first use) |
 | `~/.config/opencode/opencode.json` | the `permissions` rules with `action: "skill"`, and nothing else |
-| `~/.config/opencode/skills/<id>/SKILL.md` | the `opencode/autoinvoke` line, only for skills set to "When called"; also the description, if you edit it in the panel |
+| `<skill-root>/<id>/SKILL.md` (or `<skill-root>/<id>.md`) | the `opencode/autoinvoke` line, only for skills set to "When called"; also the description, if you edit it in the panel. Discovered from `~/.claude/skills`, `~/.agents/skills`, `~/.config/opencode/skills` (later wins), plus local paths in `opencode.json`'s `skills` array. |
 
 Safety:
 - It makes a daily backup (`opencode.json.skill-bundles-YYYYMMDD`).

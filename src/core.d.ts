@@ -46,7 +46,7 @@ export interface Skipped {
 }
 
 export interface SyncPlan {
-  opencode: (text: string) => string;
+  opencode: (text: string, opts?: { prevState?: State | null }) => string;
   skillEdits: SkillEdit[];
   skipped: Skipped[];
 }
@@ -93,11 +93,11 @@ export function createBundle(state: State, name: string): State;
 export function renameBundle(state: State, id: string, name: string): State;
 export function deleteBundle(state: State, id: string): State;
 
-export function applyPermissions(opencodeText: string, state: State, allIds: string[]): string;
+export function applyPermissions(opencodeText: string, state: State, allIds: string[], opts?: { prevState?: State | null }): string;
 export function readFrontmatter(skillMd: string): Frontmatter;
 export function setAutoinvoke(skillMd: string, on: boolean): string;
 export function setDescription(skillMd: string, text: string): string;
-export function syncPlan(state: State, allIds: string[], skillMds: Record<string, string>): SyncPlan;
+export function syncPlan(state: State, allIds: string[], skillMds: Record<string, string>, unreadable?: string[]): SyncPlan;
 
 export function addProjectCopy(state: State, id: string, projectDir: string): State;
 export function markMovedToProject(state: State, id: string, projectDir: string): State;
@@ -130,6 +130,12 @@ export interface PrevFiles {
   opencodeText: string;
   /** SKILL.md texts by skill id, as read. */
   skillMds: Record<string, string>;
+  /** Where each skill's markdown lives ("~/…" or absolute); missing ids default to SKILLS_DIR/<id>/SKILL.md. */
+  skillPaths?: Record<string, string>;
+  /** Skill ids that were found but whose markdown could not be read. */
+  unreadable?: string[];
+  /** Some skill folder could not be scanned: keep existing rules, restate only flipped ids, refuse "called" changes. */
+  incomplete?: boolean;
 }
 
 export interface ChangePlan {

@@ -2,8 +2,10 @@
 import { HostRequestError, type HostClient } from '@openchamber/sdk';
 import * as core from '../src/core.js';
 import type { ChangePlan, PlanError, State } from '../src/core.js';
+import type { SkillRef } from '../src/discover.js';
 import seed from '../data/default-bundles.json';
-import { errText as hostErrText, isNotFound, pool, readOptional as readOpt } from '../shared/panel/host';
+import { discoverSkills, type Unreachable } from './discover';
+import { errorCode, errText as hostErrText, pool, readOptional as readOpt } from '../shared/panel/host';
 import { createQueue } from '../shared/panel/queue';
 import { createPanelLock, LockedError, type PanelLock } from '../shared/panel/panel-lock';
 import { backupOnce, runTxn, type TxnWrite } from '../shared/panel/txn';
@@ -40,6 +42,13 @@ export const S = {
   state: null as State | null,
   loaded: false,
   allIds: [] as string[],
+  skillRefs: Object.create(null) as Record<string, SkillRef>,
+  skillPaths: Object.create(null) as Record<string, string>,
+  unreachable: [] as Unreachable[],
+  /** Some folder could not be scanned (unreachable roots, entries or truncation; not file reads). */
+  incomplete: false,
+  /** Ids found but whose markdown could not be read. */
+  unreadable: [] as string[],
   skillMds: {} as Record<string, string>,
   opencodeText: '',
   bundlesText: null as string | null,
@@ -69,7 +78,7 @@ async function deriveHome() {
   }
 }
 
-export const skillPath = (id: string) => `${core.SKILLS_DIR}/${id}/SKILL.md`;
+export const skillPath = (id: string) => S.skillPaths[id] ?? `${core.SKILLS_DIR}/${id}/SKILL.md`;
 export const mode = (id: string) => core.effectiveMode(S.state!, id);
 export const bundlesOf = (id: string) => (S.state ? S.state.bundles.filter((b) => b.skills.includes(id)) : []);
 
@@ -89,7 +98,7 @@ const fm = new Map<string, Meta>();
 
 export function meta(id: string): Meta {
   const md = S.skillMds[id];
-  if (md == null) return EMPTY;
+  if (md == null) return S.unreadable.includes(id) ? { ...EMPTY, error: `${skillPath(id)} could not be read` } : EMPTY;
   let m = fm.get(id);
   if (!m) {
     try {
@@ -137,25 +146,37 @@ const withLock = <T>(fn: () => Promise<T>) => lock.withLock(fn);
 
 export async function load() {
   await deriveHome();
-  let dirs: string[] = [];
-  try {
-    const { entries } = await host.listDir(core.SKILLS_DIR);
-    dirs = entries.filter((e) => e.kind === 'directory' && !e.name.startsWith('.')).map((e) => e.name);
-  } catch (e) {
-    if (!isNotFound(e)) throw e;
-  }
-  const allIds = [...new Set([...dirs, ...core.BUILTIN_SKILLS])].sort();
-
-  const mds: Record<string, string> = {};
-  const [, opencodeText, bundlesText] = await Promise.all([
-    pool(dirs, 8, async (id) => {
-      const text = await readOptional(skillPath(id));
-      if (text != null) mds[id] = text;
-    }),
+  const [opencodeText, bundlesText] = await Promise.all([
     host.readFile(core.OPENCODE_PATH).then((r) => r.content),
     readOptional(core.BUNDLES_PATH),
   ]);
+  const { skills, unreachable } = await discoverSkills(host, opencodeText);
+  const discoveredIds = Object.keys(skills);
+  const allIds = [...new Set([...discoveredIds, ...core.BUILTIN_SKILLS])].sort();
+  const skillPaths: Record<string, string> = Object.create(null);
+  for (const id of discoveredIds) skillPaths[id] = skills[id].path;
+
+  const incomplete = unreachable.length > 0;
+  const unreadable: string[] = [];
+  const mds: Record<string, string> = {};
+  await pool(discoveredIds, 8, async (id) => {
+    try {
+      const text = await readOptional(skillPaths[id]);
+      if (text != null) mds[id] = text;
+    } catch (e) {
+      // Listed but unreadable: keep the id (its allow rule still applies), leave the file alone.
+      const code = errorCode(e);
+      if (code !== 'DENIED' && code !== 'BAD_PATH' && code !== 'FILE_TOO_LARGE') throw e;
+      unreachable.push({ path: skillPaths[id], code });
+      unreadable.push(id);
+    }
+  });
   S.allIds = allIds;
+  S.skillRefs = skills;
+  S.skillPaths = skillPaths;
+  S.unreachable = unreachable;
+  S.incomplete = incomplete;
+  S.unreadable = unreadable.sort();
   S.skillMds = mds;
   fm.clear();
   S.opencodeText = opencodeText;
@@ -170,10 +191,16 @@ type ProjectTexts = Record<string, string | null>;
 
 function planFor(next: State, projectTexts: ProjectTexts): ChangePlan {
   try {
-    return core.planChange({ bundlesText: S.bundlesText, opencodeText: S.opencodeText, skillMds: S.skillMds }, next, S.allIds, projectTexts, homeOpt());
+    return core.planChange(
+      { bundlesText: S.bundlesText, opencodeText: S.opencodeText, skillMds: S.skillMds, skillPaths: S.skillPaths, unreadable: S.unreadable, incomplete: S.incomplete },
+      next,
+      S.allIds,
+      projectTexts,
+      homeOpt(),
+    );
   } catch (e) {
     const pe = e as Partial<PlanError>;
-    const where = pe.file === 'skill' ? (pe.id ? `skills/${pe.id}/SKILL.md` : 'SKILL.md')
+    const where = pe.file === 'skill' ? (pe.id ? skillPath(pe.id) : 'SKILL.md')
       : pe.file === 'opencode' ? 'opencode.json'
       : pe.file === 'project' ? (pe.id ? core.projectConfigPath(pe.id) : 'project opencode.json') : '';
     const msg = errText(e);
@@ -186,8 +213,9 @@ const skillIds = (p: ChangePlan) => p.writes.flatMap((w) => (w.kind === 'skill' 
 async function refreshSkillMds(ids: string[]) {
   let changed = false;
   await pool(ids, 8, async (id) => {
-    const fresh = await readOptional(skillPath(id));
-    if (fresh == null) throw new StaleError(`${id}/SKILL.md disappeared`);
+    const p = skillPath(id);
+    const fresh = await readOptional(p);
+    if (fresh == null) throw new StaleError(`${p} disappeared`);
     if (fresh !== S.skillMds[id]) { setMd(id, fresh); changed = true; }
   });
   return changed;
@@ -336,14 +364,16 @@ export function saveDescription(id: string, text: string) {
       try { return core.setDescription(md, text); } catch (e) { throw new RefusedError(errText(e)); }
     };
     try {
+      if (S.incomplete) throw new RefusedError(`some skill folders could not be read, so it is unclear which SKILL.md ${id} uses`);
       apply(S.skillMds[id]); // refuse early, before taking the lock
       await withLock(async () => {
         // Apply to the file as it is now, so a CLI mode change since load survives.
-        const fresh = await readOptional(skillPath(id));
-        if (fresh == null) throw new StaleError(`${id}/SKILL.md disappeared`);
+        const p = skillPath(id);
+        const fresh = await readOptional(p);
+        if (fresh == null) throw new StaleError(`${p} disappeared`);
         if (fresh !== S.skillMds[id]) setMd(id, fresh);
         const next = apply(fresh);
-        if (next !== fresh) await host.writeFile(skillPath(id), next);
+        if (next !== fresh) await host.writeFile(p, next);
         setMd(id, next);
       });
     } catch (e) {

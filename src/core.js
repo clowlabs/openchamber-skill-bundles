@@ -296,7 +296,12 @@ export function deleteBundle(state, id) {
 
 // ---------- opencode.json ----------
 
-export function applyPermissions(opencodeText, state, allIds) {
+/** Every skill id a state mentions (bundle members and overrides). */
+function stateIds(state) {
+  return uniq([...state.bundles.flatMap((b) => b.skills), ...Object.keys(state.overrides ?? {})]);
+}
+
+export function applyPermissions(opencodeText, state, allIds, { prevState = null } = {}) {
   let cfg;
   try {
     cfg = JSON.parse(opencodeText);
@@ -308,8 +313,21 @@ export function applyPermissions(opencodeText, state, allIds) {
     throw new Error("opencode.json: \"permissions\" exists but is not an array; fix it by hand");
   }
   const existing = cfg.permissions ?? [];
-  const kept = existing.filter((r) => !(r && r.action === "skill"));
   const ids = uniq([...allIds, ...BUILTIN_SKILLS]).sort();
+  if (prevState) {
+    // Ids the bundles mention count too: an undiscovered skill can still be switched on or off.
+    ids.push(...stateIds(prevState), ...stateIds(state));
+    ids.splice(0, ids.length, ...uniq(ids).sort());
+    // Discovery was incomplete, so rules may cover skills we could not see. Keep every rule in
+    // order and only restate the ids whose mode this change actually flips (last rule wins).
+    const changed = ids.filter((id) => (effectiveMode(prevState, id) === "off") !== (effectiveMode(state, id) === "off"));
+    if (!changed.length) return opencodeText;
+    const set = new Set(changed);
+    const keep = (r) => !(r && r.action === "skill" && set.has(r.resource));
+    const add = changed.map((id) => ({ action: "skill", resource: id, effect: effectiveMode(state, id) === "off" ? "deny" : "allow" }));
+    return spliceTopLevelArray(opencodeText, "permissions", { keep, add, label: "opencode.json" });
+  }
+  const kept = existing.filter((r) => !(r && r.action === "skill"));
   const allows = ids
     .filter((id) => effectiveMode(state, id) !== "off")
     .map((id) => ({ action: "skill", resource: id, effect: "allow" }));
@@ -385,14 +403,20 @@ function mentionsDisable(md) {
   });
 }
 
-export function syncPlan(state, allIds, skillMds) {
+export function syncPlan(state, allIds, skillMds, unreadable = []) {
   const skillEdits = [];
   const skipped = [];
+  const blind = new Set(unreadable);
   for (const id of uniq(allIds)) {
     if (isBuiltin(id)) continue;
     const text = hasOwn(skillMds, id) ? skillMds[id] : undefined;
-    if (typeof text !== "string") continue;
     const mode = effectiveMode(state, id);
+    if (typeof text !== "string") {
+      // Found but unreadable: "called" needs an edit we cannot make; "auto" may hide an opt-out.
+      if (blind.has(id) && mode === "called") throw Object.assign(new Error(`${id}: SKILL.md could not be read, so it cannot be set to "when called"`), { id });
+      if (blind.has(id) && mode === "auto") skipped.push({ id, reason: "SKILL.md could not be read" });
+      continue;
+    }
     if (mode === "off") continue;
     const want = mode !== "called";
     let next;
@@ -408,7 +432,7 @@ export function syncPlan(state, allIds, skillMds) {
     }
     if (next !== text) skillEdits.push({ id, next });
   }
-  return { opencode: (text) => applyPermissions(text, state, allIds), skillEdits, skipped };
+  return { opencode: (text, opts) => applyPermissions(text, state, allIds, opts), skillEdits, skipped };
 }
 
 // ---------- save planner (shared by CLI and panel) ----------
@@ -429,20 +453,40 @@ export function planChange(prev, next, allIds, projectTexts, { home } = {}) {
   const ptexts = projectTexts ?? Object.create(null);
   let plan;
   try {
-    plan = syncPlan(next, allIds, mds);
+    plan = syncPlan(next, allIds, mds, prev.unreadable ?? []);
   } catch (e) {
-    throw tag(e, "skill");
+    throw tag(e, "skill", e?.id);
+  }
+  let prevState = null;
+  if (prev.incomplete) {
+    if (typeof prev.bundlesText !== "string") throw tag(new Error("Some skill folders could not be read; create skill-bundles.json once they can be"), "skill");
+    prevState = parseBundles(prev.bundlesText, { home });
+    // An unscanned folder may hold a higher-precedence copy of any skill, so changes that depend
+    // on which SKILL.md is used ("when called" either way) are refused. On/off stays available.
+    const blocked = uniq([...allIds, ...stateIds(prevState), ...stateIds(next)]).filter((id) => {
+      const a = effectiveMode(prevState, id), b = effectiveMode(next, id);
+      return a !== b && (a === "called" || b === "called");
+    }).sort();
+    if (blocked.length) {
+      throw tag(new Error(`Some skill folders could not be read, so it is unclear which SKILL.md ${blocked.join(", ")} uses; "when called" can't be changed until they can. On/off still works.`), "skill", blocked[0]);
+    }
+  }
+  if (prevState && plan.skillEdits.length) {
+    // Permission-only while incomplete: no SKILL.md is touched, since it may be the wrong copy.
+    for (const { id } of plan.skillEdits) plan.skipped.push({ id, reason: "some skill folders could not be read, so SKILL.md was left alone" });
+    plan.skillEdits = [];
   }
   let opencodeAfter;
   try {
-    opencodeAfter = plan.opencode(prev.opencodeText);
+    opencodeAfter = plan.opencode(prev.opencodeText, prevState ? { prevState } : undefined);
   } catch (e) {
     throw tag(e, "opencode");
   }
   const writes = [];
   for (const { id, next: after } of [...plan.skillEdits].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
     const before = hasOwn(mds, id) ? mds[id] : undefined;
-    if (before !== undefined && after !== before) writes.push({ kind: "skill", id, path: `${SKILLS_DIR}/${id}/SKILL.md`, before, after });
+    const path = hasOwn(prev.skillPaths, id) ? prev.skillPaths[id] : `${SKILLS_DIR}/${id}/SKILL.md`;
+    if (before !== undefined && after !== before) writes.push({ kind: "skill", id, path, before, after });
   }
   // project files: every target dir; managedProjects follows what is actually written
   const managed = new Set(next.managedProjects ?? []);

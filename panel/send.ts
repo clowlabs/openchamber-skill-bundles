@@ -1,6 +1,7 @@
 // "Send skill to project": the context menu and the folder copy.
 import { type HostClient } from '@openchamber/sdk';
 import * as core from '../src/core.js';
+import type { SkillRef } from '../src/discover.js';
 import {
   button, closePopup, codeOf, createPopup, note, projectList, projectsNote, shortDir, watchProjects, type Project,
 } from './popup';
@@ -9,6 +10,8 @@ export type SendDeps = {
   host: HostClient;
   /** Why this skill can't be sent, or null. */
   blockedReason: (id: string) => string | null;
+  /** Discovered skill location (real dir or flat .md file). */
+  skillRef: (id: string) => SkillRef | undefined;
   /** Run fn in the panel's write queue; resolves when done. */
   enqueue: (task: () => Promise<void>) => Promise<boolean>;
   /** Persist "moved": global off + projectCopies note. Runs inside the queue; reports its own errors. */
@@ -31,6 +34,19 @@ export function initSend(d: SendDeps) {
 type FileCopy = { rel: string; content: string };
 const utf8 = new TextEncoder();
 
+async function readTextFile(path: string, label: string): Promise<string> {
+  let content: string;
+  try {
+    content = (await deps.host.readFile(path)).content;
+  } catch (err) {
+    if (codeOf(err) === 'FILE_TOO_LARGE') throw new Error(`${label} is larger than 2 MB`);
+    throw new Error(`${label} could not be read as text (${codeOf(err) || (err as Error).message})`);
+  }
+  if (utf8.encode(content).length > FILE_MAX) throw new Error(`${label} is larger than 2 MB`);
+  if (core.looksBinary(content)) throw new Error(`${label} is not UTF-8 text`);
+  return content;
+}
+
 /**
  * Walk `root`. `strict` reads every file and throws on anything that can't be copied
  * (non-regular, too many, over 2 MB, not text); `preview` only lists paths, capped silently.
@@ -51,31 +67,23 @@ async function walkFiles(root: string, mode: 'strict' | 'preview'): Promise<{ re
       if (e.kind === 'directory') { await walk(r); continue; }
       if (!strict) { out.push({ rel: r }); continue; }
       if (e.kind !== 'file') throw new Error(`${r} is not a regular file (symlink or special file)`);
-      let content: string;
-      try {
-        content = (await deps.host.readFile(`${root}/${r}`)).content;
-      } catch (err) {
-        if (codeOf(err) === 'FILE_TOO_LARGE') throw new Error(`${r} is larger than 2 MB`);
-        throw new Error(`${r} could not be read as text (${codeOf(err) || (err as Error).message})`);
-      }
-      if (utf8.encode(content).length > FILE_MAX) throw new Error(`${r} is larger than 2 MB`);
-      if (core.looksBinary(content)) throw new Error(`${r} is not UTF-8 text`);
-      out.push({ rel: r, content });
+      out.push({ rel: r, content: await readTextFile(`${root}/${r}`, r) });
     }
   };
   await walk('');
   return out;
 }
 
-const skillSrc = (id: string) => `${core.SKILLS_DIR}/${id}`;
-
-/** Copy the whole skill folder. Reads and checks every file before writing any. */
+/** Copy the whole skill folder (or flat .md file as SKILL.md). Reads and checks every file before writing any. */
 async function copySkill(id: string, project: Project, move: boolean) {
-  const src = skillSrc(id);
+  const ref = deps.skillRef(id);
+  const removeTarget = ref ? (ref.dir ?? ref.path) : `${core.SKILLS_DIR}/${id}`;
   const dest = core.projectSkillDir(project.directory, id);
   let files: FileCopy[];
   try {
-    files = await walkFiles(src, 'strict');
+    files = ref && ref.dir == null
+      ? [{ rel: 'SKILL.md', content: await readTextFile(ref.path, `${id}.md`) }]
+      : await walkFiles(ref?.dir ?? `${core.SKILLS_DIR}/${id}`, 'strict');
   } catch (e) {
     deps.toastError(e, `Not copied — ${id}`);
     return;
@@ -96,8 +104,8 @@ async function copySkill(id: string, project: Project, move: boolean) {
   }
   void deps.host.toast({
     kind: 'success', dismiss: true,
-    message: `Moved to ${project.name} — global copy turned off (delete ${src} to remove it)`,
-    copy: { text: src },
+    message: `Moved to ${project.name} — global copy turned off (delete ${removeTarget} to remove it)`,
+    copy: { text: removeTarget },
   });
 }
 
@@ -142,7 +150,11 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
       if (!overwrite && (await deps.host.stat(dest)).kind !== 'missing') {
         // The SDK can't delete, so files only in the old copy survive an overwrite.
         try {
-          const [srcFiles, destFiles] = await Promise.all([walkFiles(skillSrc(id), 'preview'), walkFiles(dest, 'preview')]);
+          const ref = deps.skillRef(id);
+          const [srcFiles, destFiles] = await Promise.all([
+            ref && ref.dir == null ? Promise.resolve([{ rel: 'SKILL.md' }]) : walkFiles(ref?.dir ?? `${core.SKILLS_DIR}/${id}`, 'preview'),
+            walkFiles(dest, 'preview'),
+          ]);
           const have = new Set(srcFiles.map((f) => f.rel));
           staleFiles = destFiles.map((f) => f.rel).filter((f) => !have.has(f));
         } catch (e) {

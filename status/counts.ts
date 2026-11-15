@@ -2,7 +2,8 @@
 // and tests. No writes, no lock.
 import * as core from '../src/core.js';
 import type { State } from '../src/core.js';
-import { isNotFound, readOptional, type FileHost } from '../shared/panel/host';
+import { discoverSkills } from '../panel/discover';
+import { readOptional, type FileHost } from '../shared/panel/host';
 
 export type SkillCounts = {
   /** Skills agents can use (auto + called). */
@@ -17,16 +18,11 @@ export type SkillCounts = {
   fromOpencode: boolean;
 };
 
-/** Same id list as the panel: skill folders (no dotfiles) plus built-ins, sorted. */
-export async function listSkillIds(host: FileHost): Promise<string[]> {
-  let dirs: string[] = [];
-  try {
-    const { entries } = await host.listDir(core.SKILLS_DIR);
-    dirs = entries.filter((e) => e.kind === 'directory' && !e.name.startsWith('.')).map((e) => e.name);
-  } catch (e) {
-    if (!isNotFound(e)) throw e;
-  }
-  return [...new Set([...dirs, ...core.BUILTIN_SKILLS])].sort();
+/** Same id list as the panel: discovered skills across all roots plus built-ins, sorted. */
+export async function listSkillIds(host: FileHost, opencodeText?: string | null): Promise<string[]> {
+  const oc = opencodeText === undefined ? await readOptional(host, core.OPENCODE_PATH) : opencodeText;
+  const { skills } = await discoverSkills(host, oc);
+  return [...new Set([...Object.keys(skills), ...core.BUILTIN_SKILLS])].sort();
 }
 
 type Rule = { action?: unknown; resource?: unknown; effect?: unknown };
@@ -76,11 +72,11 @@ export function countsFromState(state: State | null, allIds: string[], opencodeT
 
 /** Read the files and count. */
 export async function readCounts(host: FileHost): Promise<SkillCounts> {
-  const [allIds, bundlesText, opencodeText] = await Promise.all([
-    listSkillIds(host),
+  const [bundlesText, opencodeText] = await Promise.all([
     readOptional(host, core.BUNDLES_PATH),
     readOptional(host, core.OPENCODE_PATH),
   ]);
+  const allIds = await listSkillIds(host, opencodeText);
   const state = bundlesText == null ? null : core.parseBundles(bundlesText);
   return countsFromState(state, allIds, opencodeText);
 }
