@@ -1,0 +1,220 @@
+{
+  "formatter": true,
+  "$schema": "https://opencode.ai/config.json",
+  "skills": [],
+  "agents": {
+    "title": {
+      "model": "example/small-model"
+    }
+  },
+  "mcp": {
+    "servers": {
+      "docs": {
+        "type": "remote",
+        "url": "https://mcp.example.com"
+      }
+    }
+  },
+  "websearch": {
+    "provider": "example"
+  },
+  "providers": {
+    "example": {
+      "name": "Example \u00b7 Provider",
+      "settings": {
+        "baseURL": "https://api.example.com/v1",
+        "apiKey": "{env:EXAMPLE_API_KEY}"
+      },
+      "models": {
+        "model-a": {
+          "name": "Model A · example"
+        }
+      }
+    }
+  },
+  "plugins": [
+    "./plugins/example"
+  ],
+  "permissions": [
+    {
+      "action": "skill",
+      "resource": "*",
+      "effect": "deny"
+    },
+    {
+      "action": "skill",
+      "resource": "systematic-debugging",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "test-driven-development",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "test-suite-health-analysis",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "requesting-code-review",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "simplify-code",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "ast-grep",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "codebase-inspection",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "code-wiki",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "context7-docs",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "rest-graphql-debug",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "node-inspect-debugger",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "python-debugpy",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "nodejs-backend-patterns",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "vite",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "security-best-practices",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "security-threat-model",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "secrets-management",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "docker-management",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "observability-and-instrumentation",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "principle-make-operations-idempotent",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "agent-merge-conflict-arbiter",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "opencode",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "claude-code",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "codex",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "fastmcp",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "archify",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "architecture-decision-records",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "architecture-diagram",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "system-atlas",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "grill-me",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "spike",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "one-three-one-rule",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "decision-questionnaire",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "grounded-citations",
+      "effect": "allow"
+    },
+    {
+      "action": "skill",
+      "resource": "arxiv",
+      "effect": "allow"
+    }
+  ]
+}

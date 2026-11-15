@@ -1,0 +1,17 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "skill-bundles",
+      "devDependencies": {
+        "@openchamber/sdk": "2.7.1",
+      },
+    },
+  },
+  "packages": {
+    "@openchamber/sdk": ["@openchamber/sdk@2.7.1", "", { "dependencies": { "zod": "^4.3.6" }, "bin": { "openchamber-guest-check": "scripts/check-guest.ts", "openchamber-guest-bundle": "scripts/bundle-guest.ts" } }, "sha512-TpIHXj1pwlU0Efhzpi218gtKV04MEc6LSaoXeynz+KnFb/zbEuUHJ5NU6lvAH74oSywiHxVqewJwLB5ZTSZiOQ=="],
+
+    "zod": ["zod@4.6.7", "", {}, "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg=="],
+  }
+}

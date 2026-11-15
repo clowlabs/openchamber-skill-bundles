@@ -1,0 +1,16 @@
+{
+  "formatter": true,
+  "agents": {
+    "title": { "model": "openai/gpt\u00b7mini", "note": "a \u00b7 b \"q\" \\ \/" }
+  },
+  "permissions": [
+    { "action": "bash", "resource": "*", "effect": "ask" },
+    {
+      "action": "skill",
+      "resource": "*",
+      "effect": "deny"
+    },
+    { "action": "skill", "resource": "old", "effect": "allow" }
+  ],
+  "plugins": ["x\u00b7y"]
+}

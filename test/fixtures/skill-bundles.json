@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "bundles": [
+    { "id": "dev", "name": "Dev", "enabled": true, "skills": ["alpha", "gamma"] },
+    { "id": "docs", "name": "Docs", "enabled": false, "skills": ["beta"] }
+  ],
+  "overrides": { "gamma": "called" }
+}

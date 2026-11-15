@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "x/y",
+  "permissions": [
+    { "action": "bash", "resource": "rm *", "effect": "ask" },
+    { "action": "skill", "resource": "*", "effect": "deny" },
+    { "action": "skill", "resource": "beta", "effect": "allow" },
+    { "action": "edit", "resource": "*", "effect": "allow" }
+  ],
+  "mcp": { "a": { "type": "local" } }
+}

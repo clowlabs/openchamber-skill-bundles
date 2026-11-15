@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Skill Bundles</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="sb-header">
+      <div class="sb-title">Skill Bundles</div>
+      <div class="sb-stats" id="stats"></div>
+    </header>
+    <div id="banner"></div>
+    <div class="sb-main">
+      <section class="sb-left">
+        <div class="sb-toolbar">
+          <div id="tabs"></div>
+          <div id="search" class="sb-search"></div>
+        </div>
+        <div class="sb-legend">
+          <span><i class="sb-dot auto"></i>Automatically</span>
+          <span><i class="sb-dot called"></i>When called</span>
+          <span><i class="sb-dot off"></i>Off</span>
+          <span class="sb-hint">Drag to move · Alt-drop to copy</span>
+        </div>
+        <div class="sb-new" id="new-bundle"></div>
+        <div id="groups" class="sb-groups"></div>
+      </section>
+      <aside class="sb-right" id="detail"></aside>
+    </div>
+  </div>
+  <script src="main.js"></script>
+</body>
+</html>

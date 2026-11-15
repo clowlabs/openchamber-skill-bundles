@@ -1,0 +1,48 @@
+{
+  "name": "skill-bundles",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Turn OpenCode skills on and off in named bundles.",
+  "bin": {
+    "skills": "bin/skills"
+  },
+  "scripts": {
+    "build": "openchamber-guest-bundle panel/main.ts panel/main.js",
+    "test": "node --test test/ && bun test test/panel-io.test.js",
+    "test:panel": "bun test test/panel-io.test.js"
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "2.7.1"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "id": "skill-bundles",
+    "name": "Skill Bundles",
+    "icon": "stack",
+    "contributes": {
+      "panel": {
+        "entry": "panel/index.html"
+      },
+      "page": true,
+      "capabilities": [
+        "sessions"
+      ],
+      "filesystem": [
+        "~/.config/opencode/skill-bundles.json",
+        "~/.config/opencode/opencode.json",
+        "~/.config/opencode/opencode.json.skill-bundles-*",
+        "~/.config/opencode/skills/**",
+        "~/.config/opencode/.skill-bundles.lock",
+        "~/**/.opencode/skills/**",
+        "/**/.opencode/skills/**"
+      ]
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nightshine8/openchamber-skill-bundles"
+  },
+  "homepage": "https://github.com/nightshine8/openchamber-skill-bundles#readme"
+}
