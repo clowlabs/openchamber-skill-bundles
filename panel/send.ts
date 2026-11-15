@@ -1,15 +1,22 @@
-// "Send skill to project": the context menu and the folder copy.
-import { type HostClient } from '@openchamber/sdk';
+// "Move / duplicate skill to…": context menu for bundles and projects, plus the project folder copy.
+import type { HostClient } from '@openchamber/sdk';
 import * as core from '../src/core.js';
+import type { State } from '../src/core.js';
 import type { SkillRef } from '../src/discover.js';
+import { HAND_EDIT } from './dom';
+import { S, bundlesOf, commit, fmError, orderBundles } from './io';
 import {
-  button, closePopup, codeOf, createPopup, note, projectList, projectsNote, shortDir, watchProjects, type Project,
+  button, closePopup, codeOf, createPopup, note, projectList, projectsNote, replace, shortDir, watchProjects, type Project,
 } from './popup';
 
 export type SendDeps = {
   host: HostClient;
-  /** Why this skill can't be sent, or null. */
+  /** Why this skill can't be sent to a project, or null. */
   blockedReason: (id: string) => string | null;
+  /** Why this skill can't be moved between bundles, or null. */
+  bundleBlockedReason?: (id: string) => string | null;
+  /** Move or copy `id` into bundle `to` (or UNBUNDLED). */
+  moveToBundle?: (id: string, to: string, from: string | undefined, copy: boolean) => void;
   /** Discovered skill location (real dir or flat .md file). */
   skillRef: (id: string) => SkillRef | undefined;
   /** Run fn in the panel's write queue; resolves when done. */
@@ -18,6 +25,24 @@ export type SendDeps = {
   markMoved: (id: string, dir: string) => Promise<boolean>;
   toastError: (e: unknown, what: string) => void;
 };
+
+/** Move or duplicate `id` into target bundle `to` (or `UNBUNDLED_ID`), from bundle `from` or from all bundles (`All skills` view). */
+export function moveSkillToBundle(s: State, id: string, to: string, from?: string, copy = false): State {
+  if (from != null) {
+    return core.moveSkill(s, id, from, to, { copy: copy && from !== core.UNBUNDLED_ID && to !== core.UNBUNDLED_ID });
+  }
+  if (to === core.UNBUNDLED_ID) {
+    return s.bundles
+      .filter((b) => b.skills.includes(id))
+      .reduce((acc, b) => core.moveSkill(acc, id, b.id, core.UNBUNDLED_ID, { copy: false }), s);
+  }
+  const mine = s.bundles.filter((b) => b.skills.includes(id) && b.id !== to).map((b) => b.id);
+  if (copy || !mine.length) {
+    return core.moveSkill(s, id, core.UNBUNDLED_ID, to, { copy: true });
+  }
+  const first = core.moveSkill(s, id, mine[0], to, { copy: false });
+  return mine.slice(1).reduce((acc, bId) => core.moveSkill(acc, id, bId, core.UNBUNDLED_ID, { copy: false }), first);
+}
 
 const FILE_MAX = 2_000_000;
 const FILES_MAX = 2000;
@@ -113,8 +138,34 @@ async function copySkill(id: string, project: Project, move: boolean) {
 
 export const closeSendMenu = closePopup;
 
-export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolean, returnFocus?: HTMLElement | null) {
-  const blocked = deps.blockedReason(id);
+type BundleItem = { id: string; name: string; skills: string[]; enabled: boolean; synthetic?: boolean };
+
+function bundleItemsFor(id: string, from: string | undefined, duplicating: boolean): BundleItem[] {
+  const state = S.state;
+  if (!state) return [];
+  const items: BundleItem[] = orderBundles(state.bundles)
+    .filter((b) => !b.skills.includes(id))
+    .map((b) => ({ id: b.id, name: b.name, skills: b.skills, enabled: b.enabled }));
+  const inBundle = from != null ? from !== core.UNBUNDLED_ID : bundlesOf(id).length > 0;
+  if (!duplicating && inBundle) {
+    items.push({ id: core.UNBUNDLED_ID, name: 'Unbundled', skills: [], enabled: false, synthetic: true });
+  }
+  return items;
+}
+
+function defaultBundleBlocked(id: string): string | null {
+  if (!S.loaded || !S.state) return 'Still loading.';
+  const err = fmError(id);
+  return err ? `Manual edit needed (${err}). ${HAND_EDIT}.` : null;
+}
+
+let repaintOpen: (() => void) | null = null;
+/** Called after every render so an open menu reflects newly created or updated bundles. */
+export function refreshSendMenu() {
+  repaintOpen?.();
+}
+
+export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolean, returnFocus?: HTMLElement | null, from?: string) {
   let altDown = altAtOpen;
   let filter = '';
   let busy = false;
@@ -124,14 +175,13 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
 
   let unwatch = () => {};
   const pop = createPopup({
-    itemSelector: 'button.sb-ctx-item',
+    itemSelector: 'button.sb-ctx-item, .sb-ctx-confirm button',
     returnFocus,
     altAtOpen,
-    onAlt: (down) => { altDown = down; paintTitle(); },
-    onClose: () => unwatch(),
+    onAlt: (down) => { altDown = down; paint(); },
+    onClose: () => { unwatch(); if (repaintOpen === paint) repaintOpen = null; },
   });
   const { menu, title, list, foot } = pop;
-  foot.textContent = blocked ?? HINT;
 
   const paintTitle = () => {
     title.textContent = `${dup() ? 'Duplicate' : 'Move'} ${id} to…`;
@@ -140,7 +190,17 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
     for (const b of list.querySelectorAll<HTMLElement>('.sb-ctx-icon')) b.textContent = dup() ? '⧉' : '→';
   };
 
+  const activateBundle = (to: string, alt: boolean) => {
+    const bundleBlocked = (deps.bundleBlockedReason ?? defaultBundleBlocked)(id);
+    if (busy || bundleBlocked) return;
+    const copy = Boolean(alt || dup());
+    pop.close();
+    const run = deps.moveToBundle ?? ((skillId, target, src, cp) => commit((s) => moveSkillToBundle(s, skillId, target, src, cp)));
+    run(id, to, from, copy);
+  };
+
   const activate = async (p: Project, alt: boolean, overwrite = false) => {
+    const blocked = deps.blockedReason(id);
     if (busy || blocked) return;
     const move = !(alt || dup());
     busy = true;
@@ -176,12 +236,59 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
   };
 
   const paint = () => {
-    const keep = document.activeElement instanceof HTMLElement && menu.contains(document.activeElement) ? document.activeElement.dataset.pid : undefined;
+    const blocked = deps.blockedReason(id);
+    const bundleBlocked = (deps.bundleBlockedReason ?? defaultBundleBlocked)(id);
+    const active = document.activeElement instanceof HTMLElement && menu.contains(document.activeElement) ? document.activeElement : undefined;
+    const hadFocus = active != null && active !== pop.filterInput;
+    const keepBid = active?.dataset.bid;
+    const keepPid = active?.dataset.pid;
+    const keepConfirm = active?.dataset.confirm;
     list.textContent = '';
-    pop.ensureFilter(projectList().projects.length, 'Filter projects', (v) => { filter = v; paint(); });
+
+    const allBundles = bundleItemsFor(id, from, dup());
+    const q = filter.trim().toLowerCase();
+    const shownBundles = !q ? allBundles : allBundles.filter((b) => b.name.toLowerCase().includes(q) || b.id.toLowerCase().includes(q));
+    pop.ensureFilter(allBundles.length + projectList().projects.length, allBundles.length ? 'Filter bundles or projects' : 'Filter projects', (v) => { filter = v; paint(); });
+
+    if (shownBundles.length) {
+      const h = document.createElement('div');
+      h.className = 'sb-ctx-title';
+      h.textContent = 'Bundles';
+      list.appendChild(h);
+      for (const b of shownBundles) {
+        const item = button('', 'sb-ctx-item');
+        item.dataset.bid = b.id;
+        item.setAttribute('role', 'menuitem');
+        item.tabIndex = -1;
+        const icon = document.createElement('span');
+        icon.className = 'sb-ctx-icon';
+        icon.setAttribute('aria-hidden', 'true');
+        const name = document.createElement('span');
+        name.className = 'sb-ctx-name';
+        name.textContent = b.name;
+        const meta = document.createElement('span');
+        meta.className = 'sb-ctx-dir';
+        meta.textContent = b.synthetic ? 'remove from bundle' : `${b.skills.length} skill${b.skills.length === 1 ? '' : 's'} · ${b.enabled ? 'on' : 'off'}`;
+        item.append(icon, name, meta);
+        item.title = bundleBlocked ?? (b.synthetic ? 'Remove from bundle' : b.name);
+        if (bundleBlocked || busy) { item.disabled = true; item.setAttribute('aria-disabled', 'true'); }
+        item.addEventListener('click', (e) => activateBundle(b.id, e.altKey));
+        item.addEventListener('dblclick', (e) => activateBundle(b.id, e.altKey));
+        list.appendChild(item);
+      }
+    }
+
     const shown: Project[] = core.filterProjects(projectList().projects, filter);
     const status = projectsNote(shown.length, filter);
-    if (status) list.appendChild(note(status));
+    if (allBundles.length && (shown.length || !q)) {
+      const h = document.createElement('div');
+      h.className = 'sb-ctx-title';
+      h.textContent = 'Projects';
+      list.appendChild(h);
+    }
+    if (status && (!q || !shownBundles.length)) {
+      list.appendChild(note(q && allBundles.length && status === 'No matching projects' ? 'No matching bundles or projects' : status));
+    }
     for (const p of shown) {
       if (confirmFor === p.id) {
         const c = document.createElement('div');
@@ -196,15 +303,17 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
         } else if (staleFiles.length) {
           const s = document.createElement('div');
           s.className = 'sb-ctx-stale';
-          const shown = staleFiles.slice(0, 5).join(', ');
-          s.textContent = `${staleFiles.length} old file${staleFiles.length > 1 ? 's' : ''} will stay: ${shown}${staleFiles.length > 5 ? `, and ${staleFiles.length - 5} more` : ''}`;
+          const shownStale = staleFiles.slice(0, 5).join(', ');
+          s.textContent = `${staleFiles.length} old file${staleFiles.length > 1 ? 's' : ''} will stay: ${shownStale}${staleFiles.length > 5 ? `, and ${staleFiles.length - 5} more` : ''}`;
           s.title = staleFiles.join('\n');
           c.appendChild(s);
         }
         const yes = button('Overwrite', 'sb-ctx-btn danger');
         const no = button('Cancel', 'sb-ctx-btn');
+        yes.dataset.confirm = 'yes';
+        no.dataset.confirm = 'no';
         yes.addEventListener('click', (e) => { confirmFor = null; void activate(p, e.altKey, true); });
-        no.addEventListener('click', () => { confirmFor = null; paint(); focusItem(p.id); });
+        no.addEventListener('click', () => { confirmFor = null; paint(); focusProject(p.id); });
         c.append(yes, no);
         list.appendChild(c);
         continue;
@@ -229,13 +338,22 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
       b.addEventListener('dblclick', (e) => void activate(p, e.altKey)); // guarded by `busy`/close
       list.appendChild(b);
     }
+    foot.textContent = bundleBlocked ?? (allBundles.length ? HINT : (blocked ?? HINT));
     paintTitle();
-    if (keep) focusItem(keep);
+    if (keepBid) focusBundle(keepBid);
+    else if (keepPid) focusProject(keepPid);
+    else if (keepConfirm) list.querySelector<HTMLElement>(`[data-confirm="${CSS.escape(keepConfirm)}"]`)?.focus();
+    if (hadFocus && (!document.activeElement || !menu.contains(document.activeElement))) {
+      (pop.items()[0] ?? pop.filterInput ?? menu).focus();
+    }
+    if (menu.isConnected) replace(menu);
   };
 
-  const focusItem = (pid: string) => list.querySelector<HTMLElement>(`[data-pid="${CSS.escape(pid)}"]`)?.focus();
+  const focusBundle = (bid: string) => list.querySelector<HTMLElement>(`[data-bid="${CSS.escape(bid)}"]`)?.focus();
+  const focusProject = (pid: string) => list.querySelector<HTMLElement>(`[data-pid="${CSS.escape(pid)}"]`)?.focus();
 
   unwatch = watchProjects(paint);
+  repaintOpen = paint;
   paint();
   pop.show(x, y);
 }

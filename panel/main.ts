@@ -13,7 +13,7 @@ import {
 } from '@openchamber/sdk/ui';
 import * as core from '../src/core.js';
 import type { Group, Mode } from '../src/core.js';
-import { closeSendMenu, initSend, openSendMenu } from './send';
+import { closeSendMenu, initSend, openSendMenu, refreshSendMenu } from './send';
 import { initPopup, setHomeSource } from './popup';
 import { openProjectsMenu, refreshProjectsMenu } from './projects';
 import { deferRender, endDrag, initDrag, isDragging, onPillDown } from './drag';
@@ -22,7 +22,7 @@ import { renderCompact, renderCompactBusy } from './compact';
 import { countsFromState, liveLine } from '../status/counts';
 import { $, el, HAND_EDIT, MODE_LABEL, UNBUNDLED, type Disposable } from './dom';
 import {
-  S, applyChange, bundlesOf, commit, enqueue, errText, fmError, hooks, load, meta, mode, pending, seedDefaults, setHost, toastError,
+  S, applyChange, bundlesOf, commit, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, toastError,
 } from './io';
 import { connectHost } from '@openchamber/sdk';
 
@@ -129,18 +129,18 @@ function renderPill(id: string, from: string, parent: HTMLElement) {
   p.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     if (isDragging()) { endDrag(false); return; }
-    openSendMenu(id, e.clientX, e.clientY, e.altKey, p);
+    openSendMenu(id, e.clientX, e.clientY, e.altKey, p, from);
   });
   p.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(id); }
-    else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) { e.preventDefault(); menuAt(p, id, e.altKey); }
+    else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) { e.preventDefault(); menuAt(p, id, e.altKey, from); }
   });
   parent.appendChild(p);
 }
 
-function menuAt(anchor: HTMLElement, id: string, alt: boolean) {
+function menuAt(anchor: HTMLElement, id: string, alt: boolean, from?: string) {
   const r = anchor.getBoundingClientRect();
-  openSendMenu(id, r.left, r.bottom, alt, anchor);
+  openSendMenu(id, r.left, r.bottom, alt, anchor, from);
 }
 
 function sendBlocked(id: string): string | null {
@@ -364,6 +364,7 @@ function render() {
   renderDetail(V.selected);
   renderLight();
   refreshProjectsMenu();
+  refreshSendMenu();
 }
 
 hooks.render = render;
@@ -401,8 +402,13 @@ function mountChrome() {
   const create = () => {
     const n = name.trim();
     if (!n || !S.loaded) return;
-    commit((s) => core.createBundle(s, n), () => {
-      if (name.trim() === n) { name = ''; newField!.update({ value: '' }); }
+    commit((s) => {
+      const next = core.createBundle(s, n);
+      const created = next.bundles.at(-1);
+      if (created) noteCreatedBundle(created.id);
+      return next;
+    }, () => {
+      if (name.trim() === n) { name = ''; newField?.update({ value: '' }); }
     });
   };
   f.addEventListener('keydown', (e) => { if (e.key === 'Enter') create(); });

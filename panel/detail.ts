@@ -4,7 +4,7 @@ import * as core from '../src/core.js';
 import type { Mode } from '../src/core.js';
 import { $, el, HAND_EDIT, UNBUNDLED, type Disposable } from './dom';
 import { shortDir } from './popup';
-import { S, bundlesOf, commit, fmError, homeOpt, meta, mode, saveDescription, skillPath } from './io';
+import { S, bundlesOf, commit, fmError, homeOpt, meta, mode, orderBundles, saveDescription, skillPath } from './io';
 
 let mounts: Disposable[] = [];
 let disposing = false;
@@ -67,7 +67,7 @@ export function renderDetail(selected: string | null) {
     chip.appendChild(x);
     badges.appendChild(chip);
   }
-  const others = state.bundles.filter((b) => !b.skills.includes(id));
+  const others = orderBundles(state.bundles).filter((b) => !b.skills.includes(id));
   if (others.length) {
     const add = el('span', 'sb-add');
     if (broken) add.title = HAND_EDIT;

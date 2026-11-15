@@ -1,7 +1,7 @@
 // Files, the CLI lock, the write queue and the frontmatter cache.
 import { HostRequestError, type HostClient } from '@openchamber/sdk';
 import * as core from '../src/core.js';
-import type { ChangePlan, PlanError, State } from '../src/core.js';
+import type { Bundle, ChangePlan, PlanError, State } from '../src/core.js';
 import type { SkillRef } from '../src/discover.js';
 import seed from '../data/default-bundles.json';
 import { discoverSkills, type Unreachable } from './discover';
@@ -56,7 +56,27 @@ export const S = {
   home: undefined as string | undefined,
   homeDerived: false,
   descDraft: null as { id: string; value: string } | null,
+  /** Bundle ids created in this session (newest first) so pickers surface them first. */
+  createdBundles: [] as string[],
 };
+
+export function noteCreatedBundle(id: string) {
+  S.createdBundles = [id, ...S.createdBundles.filter((x) => x !== id)];
+}
+
+/** Order bundles for "add/move to bundle" pickers: session-created first, then empty bundles, then stored order. */
+export function orderBundles(bundles: readonly Bundle[]): Bundle[] {
+  const rank = (b: Bundle, i: number) => {
+    const c = S.createdBundles.indexOf(b.id);
+    if (c >= 0) return c;
+    if (b.skills.length === 0) return S.createdBundles.length + (bundles.length - i);
+    return S.createdBundles.length + bundles.length + 1 + i;
+  };
+  return bundles
+    .map((b, i) => ({ b, r: rank(b, i) }))
+    .sort((a, b) => a.r - b.r)
+    .map((x) => x.b);
+}
 
 /** Set by main: full and stats-only re-render. */
 export const hooks = { render: () => {}, renderLight: () => {} };

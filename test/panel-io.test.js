@@ -51,6 +51,7 @@ beforeEach(async () => {
   io.setHost(fakeHost());
   io.S.homeDerived = false;
   io.S.home = undefined;
+  io.S.createdBundles = [];
   await io.load();
   fx.writes.length = 0;
 });
@@ -656,4 +657,475 @@ test("home: stock and ~/x sources need no home and stay complete", async () => {
   await io.load();
   expect(io.S.incomplete).toBe(false);
   expect(io.S.allIds).toContain("t1");
+});
+
+// ---------- skill context menu (panel/send.ts) ----------
+
+function installMenuDom() {
+  class NodeEl {
+    constructor(tag) {
+      this.tag = tag.toUpperCase();
+      this.className = "";
+      this._text = "";
+      this.title = "";
+      this.value = "";
+      this.placeholder = "";
+      this.disabled = false;
+      this.tabIndex = 0;
+      this.dataset = {};
+      this.style = {};
+      this.attrs = {};
+      this.children = [];
+      this.parent = null;
+      this.listeners = {};
+      const syncCls = () => new Set(this.className.split(/\s+/).filter(Boolean));
+      this.classList = {
+        add: (c) => { const s = syncCls(); s.add(c); this.className = [...s].join(" "); },
+        remove: (c) => { const s = syncCls(); s.delete(c); this.className = [...s].join(" "); },
+        toggle: (c, on) => { const s = syncCls(); if (on ?? !s.has(c)) s.add(c); else s.delete(c); this.className = [...s].join(" "); },
+        contains: (c) => syncCls().has(c),
+      };
+    }
+    get textContent() { return this._text; }
+    set textContent(v) {
+      this._text = String(v ?? "");
+      for (const c of this.children) c.parent = null;
+      this.children = [];
+    }
+    get isConnected() {
+      for (let n = this; n; n = n.parent) if (n === globalThis.document?.body) return true;
+      return false;
+    }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    getAttribute(k) { return this.attrs[k] ?? null; }
+    append(...nodes) { for (const n of nodes) this.appendChild(n); }
+    appendChild(n) {
+      if (n.parent) n.parent.children = n.parent.children.filter((x) => x !== n);
+      n.parent = this;
+      this.children.push(n);
+      return n;
+    }
+    insertBefore(n, ref) {
+      if (n.parent) n.parent.children = n.parent.children.filter((x) => x !== n);
+      n.parent = this;
+      const i = this.children.indexOf(ref);
+      if (i < 0) this.children.push(n);
+      else this.children.splice(i, 0, n);
+      return n;
+    }
+    remove() {
+      if (this.parent) this.parent.children = this.parent.children.filter((x) => x !== this);
+      this.parent = null;
+    }
+    contains(other) {
+      for (let n = other; n; n = n.parent) if (n === this) return true;
+      return false;
+    }
+    addEventListener(t, fn) { (this.listeners[t] ??= new Set()).add(fn); }
+    removeEventListener(t, fn) { this.listeners[t]?.delete(fn); }
+    dispatch(t, ev = {}) {
+      for (const fn of [...(this.listeners[t] ?? [])]) fn({ type: t, target: this, currentTarget: this, preventDefault() {}, stopPropagation() {}, ...ev });
+    }
+    click(ev = {}) { this.dispatch("click", { altKey: false, ...ev }); }
+    focus() { if (globalThis.document) globalThis.document.activeElement = this; }
+    getBoundingClientRect() { return { left: 10, top: 10, width: 120, height: 80 }; }
+    querySelectorAll(sel) {
+      const out = [];
+      const parts = sel.split(",").map((s) => s.trim()).filter(Boolean);
+      const matchOne = (el, s) => {
+        if (s === "button.sb-ctx-item") return el.tag === "BUTTON" && el.classList.contains("sb-ctx-item");
+        if (s === ".sb-ctx-icon") return el.classList.contains("sb-ctx-icon");
+        if (s === ".sb-ctx-title") return el.classList.contains("sb-ctx-title");
+        if (s === ".sb-ctx-filter") return el.classList.contains("sb-ctx-filter");
+        if (s === ".sb-ctx-note") return el.classList.contains("sb-ctx-note");
+        if (s === ".sb-ctx-confirm button") {
+          if (el.tag !== "BUTTON") return false;
+          for (let p = el.parent; p; p = p.parent) if (p.classList.contains("sb-ctx-confirm")) return true;
+          return false;
+        }
+        const m = /^\[data-(pid|bid|confirm)="(.+)"\]$/.exec(s);
+        if (m) return el.dataset[m[1]] === m[2];
+        return false;
+      };
+      const match = (el) => parts.some((s) => matchOne(el, s));
+      const walk = (n) => {
+        for (const c of n.children) {
+          if (match(c)) out.push(c);
+          walk(c);
+        }
+      };
+      walk(this);
+      return out;
+    }
+    querySelector(sel) { return this.querySelectorAll(sel)[0] ?? null; }
+  }
+  const savedGlobals = new Map();
+  for (const k of ["document", "window", "HTMLElement", "HTMLInputElement", "HTMLButtonElement", "CSS"]) {
+    savedGlobals.set(k, Object.getOwnPropertyDescriptor(globalThis, k));
+  }
+  const docListeners = {};
+  const body = new NodeEl("body");
+  globalThis.HTMLElement = NodeEl;
+  globalThis.HTMLInputElement = class extends NodeEl {};
+  globalThis.HTMLButtonElement = class extends NodeEl {};
+  globalThis.CSS = { escape: (s) => String(s) };
+  globalThis.document = {
+    body,
+    activeElement: null,
+    createElement: (t) => new NodeEl(t),
+    addEventListener: (t, fn) => (docListeners[t] ??= new Set()).add(fn),
+    removeEventListener: (t, fn) => docListeners[t]?.delete(fn),
+    dispatchKey: (t, ev = {}) => {
+      for (const fn of [...(docListeners[t] ?? [])]) {
+        fn({ type: t, preventDefault() {}, stopPropagation() {}, ...ev });
+      }
+    },
+  };
+  globalThis.window = {
+    innerWidth: 800,
+    innerHeight: 600,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+  return () => {
+    for (const [k, desc] of savedGlobals) {
+      if (desc) Object.defineProperty(globalThis, k, desc);
+      else delete globalThis[k];
+    }
+  };
+}
+
+test("send menu lists newly created bundles automatically and moves/duplicates skills into them", async () => {
+  const cleanupDom = installMenuDom();
+  let send;
+  const prevRender = io.hooks.render;
+  try {
+    const popup = await import("../panel/popup.ts");
+    send = await import("../panel/send.ts");
+    io.hooks.render = () => { prevRender(); send.refreshSendMenu(); };
+    popup.initPopup(fx.host);
+    popup.setHomeSource(() => io.S.home);
+    send.initSend({
+      host: fx.host,
+      blockedReason: () => null,
+      bundleBlockedReason: () => io.fmError("alpha"),
+      skillRef: (id) => io.S.skillRefs[id],
+      enqueue: io.enqueue,
+      markMoved: (id, dir) => io.applyChange((s) => core.markMovedToProject(s, id, dir)),
+      moveToBundle: (id, to, from, copy) => io.commit((s) => send.moveSkillToBundle(s, id, to, from, copy)),
+      toastError: io.toastError,
+    });
+
+    // User creates a new bundle "clowbot"
+    io.commit((s) => {
+      const next = core.createBundle(s, "clowbot");
+      io.noteCreatedBundle(next.bundles.at(-1).id);
+      return next;
+    });
+    await settle();
+    expect(io.S.state.bundles.map((b) => b.id)).toEqual(["b", "clowbot"]);
+
+    // User clicks on skill "alpha" (currently in bundle "b") to open the "Move alpha to..." menu
+    send.openSendMenu("alpha", 20, 20, false, null, "b");
+    const menu = globalThis.document.body.children[0];
+    expect(menu).toBeDefined();
+    const bundleItems = menu.querySelectorAll("button.sb-ctx-item").filter((el) => el.dataset.bid);
+    expect(bundleItems.map((el) => el.dataset.bid)).toEqual(["clowbot", core.UNBUNDLED_ID]);
+
+    // Clicking "clowbot" moves "alpha" from "b" to "clowbot"
+    bundleItems[0].click();
+    await settle();
+    expect(io.S.state.bundles.find((b) => b.id === "b").skills).toEqual(["beta"]);
+    expect(io.S.state.bundles.find((b) => b.id === "clowbot").skills).toEqual(["alpha"]);
+    expect(core.parseBundles(read(core.BUNDLES_PATH)).bundles.find((b) => b.id === "clowbot").skills).toEqual(["alpha"]);
+
+    // Alt-clicking "b" duplicates "alpha" back into "b" while keeping it in "clowbot"
+    send.openSendMenu("alpha", 20, 20, false, null, "clowbot");
+    const menu2 = globalThis.document.body.children[0];
+    const bItem = menu2.querySelector('[data-bid="b"]');
+    expect(bItem).toBeDefined();
+    bItem.click({ altKey: true });
+    await settle();
+    expect(io.S.state.bundles.find((b) => b.id === "clowbot").skills).toEqual(["alpha"]);
+    expect(io.S.state.bundles.find((b) => b.id === "b").skills).toEqual(["beta", "alpha"]);
+
+    // If a new bundle is created while the menu is open, io.hooks.render -> refreshSendMenu updates the list automatically
+    send.openSendMenu("beta", 20, 20, false, null, "b");
+    const menu3 = globalThis.document.body.children[0];
+    io.commit((s) => {
+      const next = core.createBundle(s, "fresh");
+      io.noteCreatedBundle(next.bundles.at(-1).id);
+      return next;
+    });
+    await settle();
+    const bids = menu3.querySelectorAll("button.sb-ctx-item").filter((el) => el.dataset.bid).map((el) => el.dataset.bid);
+    expect(bids).toEqual(["fresh", "clowbot", core.UNBUNDLED_ID]);
+  } finally {
+    io.hooks.render = prevRender;
+    send?.closeSendMenu();
+    cleanupDom();
+  }
+});
+
+test("orderBundles: session-created (newest first), then empty bundles, then non-empty in stored order", () => {
+  const bundles = [
+    { id: "n1", name: "N1", enabled: false, skills: ["alpha"] },
+    { id: "e1", name: "E1", enabled: false, skills: [] },
+    { id: "c1", name: "C1", enabled: false, skills: ["beta"] },
+    { id: "n2", name: "N2", enabled: true, skills: ["alpha"] },
+    { id: "e2", name: "E2", enabled: false, skills: [] },
+    { id: "c2", name: "C2", enabled: false, skills: [] },
+  ];
+  io.noteCreatedBundle("c1");
+  io.noteCreatedBundle("c2");
+  const ordered = io.orderBundles(bundles).map((b) => b.id);
+  expect(ordered.slice(0, 2)).toEqual(["c2", "c1"]);
+  expect(new Set(ordered.slice(2, 4))).toEqual(new Set(["e1", "e2"]));
+  expect(ordered.slice(4)).toEqual(["n1", "n2"]);
+});
+
+test("moveSkillToBundle and openSendMenu in All skills view (from === undefined)", async () => {
+  const cleanupDom = installMenuDom();
+  let send;
+  try {
+    const popup = await import("../panel/popup.ts");
+    send = await import("../panel/send.ts");
+    popup.initPopup(fx.host);
+    popup.setHomeSource(() => io.S.home);
+    send.initSend({
+      host: fx.host,
+      blockedReason: () => null,
+      bundleBlockedReason: () => null,
+      skillRef: (id) => io.S.skillRefs[id],
+      enqueue: io.enqueue,
+      markMoved: (id, dir) => io.applyChange((s) => core.markMovedToProject(s, id, dir)),
+      moveToBundle: (id, to, from, copy) => io.commit((s) => send.moveSkillToBundle(s, id, to, from, copy)),
+      toastError: io.toastError,
+    });
+
+    const base = core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [
+        { id: "b1", name: "B1", enabled: false, skills: ["alpha", "beta"] },
+        { id: "b2", name: "B2", enabled: false, skills: ["alpha"] },
+        { id: "b3", name: "B3", enabled: false, skills: [] },
+      ],
+      overrides: {},
+    }));
+
+    // Direct moveSkillToBundle from All skills view: moves from all previous bundles into target
+    const moved = send.moveSkillToBundle(base, "alpha", "b3", undefined, false);
+    expect(moved.bundles.map((b) => [b.id, b.skills])).toEqual([
+      ["b1", ["beta"]],
+      ["b2", []],
+      ["b3", ["alpha"]],
+    ]);
+
+    // Direct moveSkillToBundle with copy=true: adds to target while keeping existing memberships
+    const copied = send.moveSkillToBundle(base, "alpha", "b3", undefined, true);
+    expect(copied.bundles.map((b) => [b.id, b.skills])).toEqual([
+      ["b1", ["alpha", "beta"]],
+      ["b2", ["alpha"]],
+      ["b3", ["alpha"]],
+    ]);
+
+    // Direct moveSkillToBundle to UNBUNDLED_ID: removes from all bundles
+    const unbundled = send.moveSkillToBundle(base, "alpha", core.UNBUNDLED_ID, undefined, false);
+    expect(unbundled.bundles.map((b) => [b.id, b.skills])).toEqual([
+      ["b1", ["beta"]],
+      ["b2", []],
+      ["b3", []],
+    ]);
+
+    // Regression: moving a skill already in ["b", "c"] to "c" (copy=false, from=undefined) keeps it in "c" and removes it from "b"
+    const alreadyInTarget = core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [
+        { id: "b", name: "B", enabled: false, skills: ["alpha", "beta"] },
+        { id: "c", name: "C", enabled: false, skills: ["alpha"] },
+      ],
+      overrides: {},
+    }));
+    const movedToExisting = send.moveSkillToBundle(alreadyInTarget, "alpha", "c", undefined, false);
+    expect(movedToExisting.bundles.map((b) => [b.id, b.skills])).toEqual([
+      ["b", ["beta"]],
+      ["c", ["alpha"]],
+    ]);
+
+    // End-to-end via openSendMenu with from === undefined
+    put(core.BUNDLES_PATH, core.serializeBundles(base));
+    await io.load();
+
+    // Move "alpha" (in b1 and b2) to b3
+    send.openSendMenu("alpha", 20, 20, false);
+    const menu1 = globalThis.document.body.children[0];
+    menu1.querySelector('[data-bid="b3"]').click();
+    await settle();
+    expect(io.S.state.bundles.map((b) => [b.id, b.skills])).toEqual([
+      ["b1", ["beta"]],
+      ["b2", []],
+      ["b3", ["alpha"]],
+    ]);
+
+    // Alt-click "b1" from All skills view duplicates "alpha" into b1 while keeping it in b3
+    send.openSendMenu("alpha", 20, 20, false);
+    const menu2 = globalThis.document.body.children[0];
+    menu2.querySelector('[data-bid="b1"]').click({ altKey: true });
+    await settle();
+    expect(io.S.state.bundles.map((b) => [b.id, b.skills])).toEqual([
+      ["b1", ["beta", "alpha"]],
+      ["b2", []],
+      ["b3", ["alpha"]],
+    ]);
+
+    // Move "alpha" (now in b1 and b3) to UNBUNDLED_ID from All skills view removes it from all bundles
+    send.openSendMenu("alpha", 20, 20, false);
+    const menu3 = globalThis.document.body.children[0];
+    menu3.querySelector(`[data-bid="${core.UNBUNDLED_ID}"]`).click();
+    await settle();
+    expect(io.S.state.bundles.map((b) => [b.id, b.skills])).toEqual([
+      ["b1", ["beta"]],
+      ["b2", []],
+      ["b3", []],
+    ]);
+  } finally {
+    send?.closeSendMenu();
+    cleanupDom();
+  }
+});
+
+test("openSendMenu Unbundled item visibility and click removal", async () => {
+  const cleanupDom = installMenuDom();
+  let send;
+  try {
+    const popup = await import("../panel/popup.ts");
+    send = await import("../panel/send.ts");
+    popup.initPopup(fx.host);
+    popup.setHomeSource(() => io.S.home);
+    send.initSend({
+      host: fx.host,
+      blockedReason: () => null,
+      bundleBlockedReason: () => null,
+      skillRef: (id) => io.S.skillRefs[id],
+      enqueue: io.enqueue,
+      markMoved: (id, dir) => io.applyChange((s) => core.markMovedToProject(s, id, dir)),
+      moveToBundle: (id, to, from, copy) => io.commit((s) => send.moveSkillToBundle(s, id, to, from, copy)),
+      toastError: io.toastError,
+    });
+
+    // Shown when moving from a bundle (from = "b"), and pressing Alt hides Unbundled while keeping focus inside the menu
+    send.openSendMenu("alpha", 20, 20, false, null, "b");
+    const menuEl = globalThis.document.body.children[0];
+    const unbEl = menuEl.querySelector(`[data-bid="${core.UNBUNDLED_ID}"]`);
+    expect(unbEl).not.toBeNull();
+    unbEl.focus();
+    globalThis.document.dispatchKey("keydown", { key: "Alt" });
+    expect(menuEl.querySelector(`[data-bid="${core.UNBUNDLED_ID}"]`)).toBeNull();
+    expect(menuEl.contains(globalThis.document.activeElement)).toBe(true);
+    globalThis.document.dispatchKey("keyup", { key: "Alt" });
+    expect(menuEl.querySelector(`[data-bid="${core.UNBUNDLED_ID}"]`)).not.toBeNull();
+    send.closeSendMenu();
+
+    // Shown in All skills view (from === undefined) when skill is in at least one bundle
+    send.openSendMenu("alpha", 20, 20, false);
+    expect(globalThis.document.body.children[0].querySelector(`[data-bid="${core.UNBUNDLED_ID}"]`)).not.toBeNull();
+    send.closeSendMenu();
+
+    // Hidden when altAtOpen is true (duplicating)
+    send.openSendMenu("alpha", 20, 20, true, null, "b");
+    expect(globalThis.document.body.children[0].querySelector(`[data-bid="${core.UNBUNDLED_ID}"]`)).toBeNull();
+    send.closeSendMenu();
+
+    send.openSendMenu("alpha", 20, 20, true);
+    expect(globalThis.document.body.children[0].querySelector(`[data-bid="${core.UNBUNDLED_ID}"]`)).toBeNull();
+    send.closeSendMenu();
+
+    // Clicking Unbundled removes the skill from the bundle
+    send.openSendMenu("alpha", 20, 20, false, null, "b");
+    globalThis.document.body.children[0].querySelector(`[data-bid="${core.UNBUNDLED_ID}"]`).click();
+    await settle();
+    expect(io.S.state.bundles.find((b) => b.id === "b").skills).toEqual(["beta"]);
+
+    // Hidden when the skill is already unbundled (both from = UNBUNDLED_ID and from === undefined)
+    send.openSendMenu("alpha", 20, 20, false, null, core.UNBUNDLED_ID);
+    expect(globalThis.document.body.children[0].querySelector(`[data-bid="${core.UNBUNDLED_ID}"]`)).toBeNull();
+    send.closeSendMenu();
+
+    send.openSendMenu("alpha", 20, 20, false);
+    expect(globalThis.document.body.children[0].querySelector(`[data-bid="${core.UNBUNDLED_ID}"]`)).toBeNull();
+    send.closeSendMenu();
+  } finally {
+    send?.closeSendMenu();
+    cleanupDom();
+  }
+});
+
+test("openSendMenu filter input filters both bundles and projects", async () => {
+  const cleanupDom = installMenuDom();
+  let send;
+  try {
+    const popup = await import("../panel/popup.ts");
+    send = await import("../panel/send.ts");
+    fx.projects = [
+      { id: "p1", name: "App Frontend", directory: `${home}/work/app-frontend` },
+      { id: "p2", name: "Backend API", directory: `${home}/work/backend-api` },
+      { id: "p3", name: "CLI Tool", directory: `${home}/work/cli-tool` },
+      { id: "p4", name: "Docs Site", directory: `${home}/work/docs-site` },
+      { id: "p5", name: "Alpha Sandbox", directory: `${home}/work/alpha-sandbox` },
+    ];
+    put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [
+        { id: "b", name: "B", enabled: false, skills: ["alpha"] },
+        { id: "frontend", name: "Frontend Kit", enabled: false, skills: [] },
+        { id: "backend", name: "Backend Kit", enabled: false, skills: [] },
+        { id: "infra", name: "Infra", enabled: false, skills: [] },
+        { id: "writing", name: "Writing", enabled: false, skills: [] },
+      ],
+      overrides: {},
+    }))));
+    await io.load();
+
+    popup.initPopup(fx.host);
+    popup.setHomeSource(() => io.S.home);
+    send.initSend({
+      host: fx.host,
+      blockedReason: () => null,
+      bundleBlockedReason: () => null,
+      skillRef: (id) => io.S.skillRefs[id],
+      enqueue: io.enqueue,
+      markMoved: (id, dir) => io.applyChange((s) => core.markMovedToProject(s, id, dir)),
+      moveToBundle: (id, to, from, copy) => io.commit((s) => send.moveSkillToBundle(s, id, to, from, copy)),
+      toastError: io.toastError,
+    });
+
+    send.openSendMenu("alpha", 20, 20, false, null, "b");
+    await Promise.resolve(); // let listProjects() resolve and repaint
+    const menu = globalThis.document.body.children[0];
+    const filterInput = menu.querySelector(".sb-ctx-filter");
+    expect(filterInput).not.toBeNull();
+
+    // Filter matching both a bundle ("Frontend Kit") and a project ("App Frontend")
+    filterInput.value = "frontend";
+    filterInput.dispatch("input");
+    const items = menu.querySelectorAll("button.sb-ctx-item");
+    expect(items.filter((el) => el.dataset.bid).map((el) => el.dataset.bid)).toEqual(["frontend"]);
+    expect(items.filter((el) => el.dataset.pid).map((el) => el.dataset.pid)).toEqual(["p1"]);
+
+    // Filter matching only a bundle ("Writing")
+    filterInput.value = "writing";
+    filterInput.dispatch("input");
+    const items2 = menu.querySelectorAll("button.sb-ctx-item");
+    expect(items2.filter((el) => el.dataset.bid).map((el) => el.dataset.bid)).toEqual(["writing"]);
+    expect(items2.filter((el) => el.dataset.pid)).toEqual([]);
+
+    // Filter matching neither bundles nor projects
+    filterInput.value = "zzzz-no-match";
+    filterInput.dispatch("input");
+    expect(menu.querySelectorAll("button.sb-ctx-item")).toEqual([]);
+    expect(menu.querySelector(".sb-ctx-note")?.textContent).toBe("No matching bundles or projects");
+  } finally {
+    send?.closeSendMenu();
+    cleanupDom();
+  }
 });

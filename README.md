@@ -27,8 +27,10 @@ explicitly so they also work inside the parent Extensions workspace.
 - **Per-skill mode:** Automatically (listed in every prompt), When called (loads only when you type
   `@skill-id`) or Off. Click a skill to edit its description and see its SKILL.md.
 - **All skills list:** one row per skill. Use ↑/↓ to move between rows and A / C / O to set the mode.
-- **Send to project:** right-click a skill (two-finger click on a Mac) and pick a project. A click
-  moves the skill into `<project>/.opencode/skills/`, and Alt/⌥-click copies it there instead.
+- **Move or send:** right-click a skill (two-finger click on a Mac) and pick from **Bundles**
+  (new and empty bundles first, plus **Unbundled** to remove it from a bundle) or **Projects**
+  (`<project>/.opencode/skills/`). Alt/⌥-click duplicates it into the chosen bundle or project
+  instead.
 - **`skills` command:** everything the panel does, from the terminal, with `--dry-run`.
 
 ## How it works
@@ -79,7 +81,8 @@ ln -s "$PWD/openchamber-skill-bundles/bin/skills" ~/.local/bin/skills
 - **Files:** your skills folder, `opencode.json` and its backups, `skill-bundles.json`, the lock
   file, and `.opencode/skills/` folders inside projects. Those project folders can be under your
   home folder or anywhere on disk, so you can send skills to any project.
-- **sessions:** reads your OpenChamber project list for "Send to project".
+- **sessions:** reads your OpenChamber project list for per-project bundles and sending skills to
+  a project.
 
 No network access, no background service, no OpenCode plugin.
 
