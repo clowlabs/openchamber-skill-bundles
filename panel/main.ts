@@ -18,9 +18,10 @@ import { initPopup, setHomeSource } from './popup';
 import { openProjectsMenu, refreshProjectsMenu } from './projects';
 import { deferRender, endDrag, initDrag, isDragging, onPillDown } from './drag';
 import { renderDetail } from './detail';
+import { countsFromState, liveLine } from '../status/counts';
 import { $, el, HAND_EDIT, MODE_LABEL, UNBUNDLED, type Disposable } from './dom';
 import {
-  S, applyChange, bundlesOf, commit, enqueue, errText, fmError, hooks, load, meta, mode, seedDefaults, setHost, toastError,
+  S, applyChange, bundlesOf, commit, enqueue, errText, fmError, hooks, load, meta, mode, pending, seedDefaults, setHost, toastError,
 } from './io';
 import { connectHost } from '@openchamber/sdk';
 
@@ -77,20 +78,17 @@ function renderStats() {
   statMounts = [];
   const root = $('stats');
   root.textContent = '';
-  const state = S.state;
-  if (!state) return;
-  const sum = core.summary(state, S.allIds);
-  const bundlesOn = state.bundles.filter((b) => b.enabled).length;
-  const items: [string, 'success' | 'primary' | 'neutral'][] = [
-    [`${sum.on}/${S.allIds.length} skills on`, 'success'],
-    [`${bundlesOn}/${state.bundles.length} bundles on`, 'primary'],
-    [`~${sum.chars.toLocaleString('en-US')} prompt chars`, 'neutral'],
-  ];
-  if (S.pending) items.push(['Saving…', 'neutral']);
-  for (const [label, tone] of items) {
+  if (!S.loaded) return;
+  const c = countsFromState(S.state, S.allIds, S.opencodeText);
+  const n = c.bundlesOn?.length ?? 0;
+  const tail = S.state ? ` · ${n} bundle${n === 1 ? '' : 's'} on · ~${c.chars.toLocaleString('en-US')} chars` : ' · from opencode.json';
+  const line = el('span', 'sb-stats-line', `${liveLine(c)}${tail}`);
+  line.title = 'Live = skills agents can use (allowed in opencode.json). Installed = skill folders plus built-ins.';
+  root.appendChild(line);
+  if (pending()) {
     const span = el('span');
     root.appendChild(span);
-    statMounts.push(mountBadge(span, { label, tone }));
+    statMounts.push(mountBadge(span, { label: 'Saving…', tone: 'neutral' }));
   }
 }
 
@@ -149,7 +147,7 @@ function renderGroup(g: Group, root: HTMLElement) {
   const head = el('div', 'sb-group-head');
   box.appendChild(head);
   const visible = g.skills.filter(matches);
-  const busy = S.pending > 0;
+  const busy = pending() > 0;
 
   if (V.renaming === g.id) {
     const f = el('div', 'sb-rename');
@@ -340,7 +338,7 @@ function renderGroups() {
 function renderLight() {
   renderStats();
   newField?.update({ disabled: !S.loaded });
-  newButton?.update({ disabled: !S.loaded, loading: S.pending > 0 });
+  newButton?.update({ disabled: !S.loaded, loading: pending() > 0 });
 }
 
 function render() {

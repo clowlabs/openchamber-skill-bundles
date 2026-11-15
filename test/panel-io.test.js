@@ -2,8 +2,6 @@
 //   bun test test/panel-io.test.js
 // Under `node --test test/` it registers one skipped test, so the CLI/core suite stays green.
 import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 
 const isBun = typeof globalThis.Bun !== "undefined";
 if (!isBun) {
@@ -15,63 +13,18 @@ const { HostRequestError } = await import("@openchamber/sdk");
 const core = await import("../src/core.js");
 const io = isBun ? await import("../panel/io.ts") : null;
 
+const { createFakeHost } = await import("../shared/test/fake-host.js");
+
+// Shared fake host (shared/test/fake-host.js); these names keep the tests below unchanged.
+let fx;
 let home;
-let writes; // [path, ...] in write order
-let failOn; // (path) => boolean
-let toasts;
-
-const real = (p) => path.join(home, p.replace(/^~\//, ""));
-
-function fakeHost() {
-  return {
-    async readFile(p) {
-      try {
-        return { content: fs.readFileSync(real(p), "utf8") };
-      } catch (e) {
-        if (e.code === "ENOENT") throw new HostRequestError("NOT_FOUND", p);
-        throw e;
-      }
-    },
-    async writeFile(p, content) {
-      if (failOn(p)) throw new HostRequestError("DENIED", `refused ${p}`);
-      fs.mkdirSync(path.dirname(real(p)), { recursive: true });
-      fs.writeFileSync(real(p), content);
-      writes.push(p);
-      return { written: true };
-    },
-    async listDir(p) {
-      let names;
-      try {
-        names = fs.readdirSync(real(p), { withFileTypes: true });
-      } catch (e) {
-        if (e.code === "ENOENT") throw new HostRequestError("NOT_FOUND", p);
-        throw e;
-      }
-      return { entries: names.map((d) => ({ name: d.name, kind: d.isDirectory() ? "directory" : d.isFile() ? "file" : "other" })) };
-    },
-    async stat(p) {
-      try {
-        const s = fs.statSync(real(p));
-        return { kind: s.isDirectory() ? "directory" : "file", size: s.size, mtime: s.mtimeMs };
-      } catch {
-        return { kind: "missing", size: 0, mtime: 0 };
-      }
-    },
-    async toast(t) {
-      toasts.push(t);
-    },
-    async listProjects() {
-      // OpenChamber's chats dir reveals the home folder.
-      return { kind: "projects", state: "ready", projects: [{ id: "c", name: "chats", directory: `${home}/.config/openchamber/chats/2026-11-14/s1` }] };
-    },
-  };
-}
-
-const put = (p, text) => {
-  fs.mkdirSync(path.dirname(real(p)), { recursive: true });
-  fs.writeFileSync(real(p), text);
-};
-const read = (p) => fs.readFileSync(real(p), "utf8");
+const real = (p) => fx.real(p);
+const put = (p, text) => fx.put(p, text);
+const read = (p) => fx.read(p);
+/** A fresh host object on the same fixture (tests wrap its methods). */
+const fakeHost = () => ({ ...fx.host });
+// writes / toasts / failOn are live views of the fixture
+let writes, toasts, failOn;
 const skillMd = (desc) => `---\nname: x\ndescription: ${desc}\n---\nBody\n`;
 // Let the queue (and its render hooks) settle.
 const settle = async () => {
@@ -79,10 +32,12 @@ const settle = async () => {
 };
 
 beforeEach(async () => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), "sb-panel-"));
-  writes = [];
+  fx = createFakeHost({ makeError: (code, msg) => new HostRequestError(code, msg) });
+  home = fx.home;
+  writes = fx.writes;
+  toasts = fx.toasts;
   failOn = () => false;
-  toasts = [];
+  fx.failOn = (p, op) => op === "write" && failOn(p);
   io.lockTiming.pollMs = 10;
   io.lockTiming.waitMs = 60;
   put("~/.config/opencode/opencode.json", JSON.stringify({ $schema: "x", permissions: [] }, null, 2) + "\n");
@@ -97,11 +52,11 @@ beforeEach(async () => {
   io.S.homeDerived = false;
   io.S.home = undefined;
   await io.load();
-  writes = [];
+  fx.writes.length = 0;
 });
 
 afterEach(() => {
-  fs.rmSync(home, { recursive: true, force: true });
+  fx.cleanup();
 });
 
 test("save writes files in PUBLISH_ORDER and releases the lock", async () => {
@@ -242,7 +197,7 @@ test("removing the project removes its skill rules and keeps other rules", async
   const pj = JSON.parse(read(projFile));
   pj.permissions.unshift({ action: "bash", resource: "*", effect: "allow" });
   put(projFile, JSON.stringify(pj, null, 2) + "\n");
-  writes = [];
+  writes.length = 0;
   await io.enqueue(async () => {
     expect(await io.applyChange((s) => core.removeBundleProject(s, "b", PROJ))).toBe(true);
   });
@@ -382,7 +337,7 @@ test("an absolute path under home and its ~/ alias produce ONE project write wit
     overrides: {},
   }))));
   await io.load();
-  writes = [];
+  writes.length = 0;
   await io.enqueue(async () => {
     expect(await io.applyChange((s) => core.setBundleEnabled(s, "b", false))).toBe(true);
   });
@@ -394,4 +349,56 @@ test("an absolute path under home and its ~/ alias produce ONE project write wit
   const saved = core.parseBundles(read(core.BUNDLES_PATH));
   expect(saved.bundles.map((b) => b.projects)).toEqual([[PROJ], [PROJ]]);
   expect(saved.managedProjects).toEqual([PROJ]);
+});
+
+// ---------- Work Status counts (status/counts.ts) ----------
+
+const counts = isBun ? await import("../status/counts.ts") : null;
+
+/** 210 skill folders (+2 built-ins = 212); 35 of them in the "dev" bundle. */
+function installMany() {
+  fs.rmSync(real("~/.config/opencode/skills"), { recursive: true, force: true });
+  const ids = Array.from({ length: 210 }, (_, i) => `s${String(i).padStart(3, "0")}`);
+  for (const id of ids) put(`~/.config/opencode/skills/${id}/SKILL.md`, skillMd(id));
+  fs.mkdirSync(real("~/.config/opencode/skills/.hidden"), { recursive: true }); // dotfiles don't count
+  return ids;
+}
+
+test("status counts: 35 live / 212 installed from skill-bundles.json", async () => {
+  const ids = installMany();
+  put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [
+      { id: "dev", name: "Dev", enabled: true, skills: ids.slice(0, 34) },
+      { id: "plan", name: "Plan", enabled: true, skills: ["opencode"] },
+      { id: "media", name: "Media", enabled: false, skills: ids.slice(100, 150), projects: ["~/work/a", "~/work/b"] },
+    ],
+    overrides: {},
+  }))));
+  const c = await counts.readCounts(fx.host);
+  expect([c.live, c.installed]).toEqual([35, 212]);
+  expect(c.fromOpencode).toBe(false);
+  expect(counts.liveLine(c)).toBe("35 live / 212 installed");
+  expect(counts.bundlesLine(c)).toBe("dev, plan on · +2 projects");
+  expect(c.chars).toBe(35 * core.CHARS_PER_SKILL);
+  expect(fx.writes).toEqual([]); // read-only
+});
+
+test("status counts: falls back to opencode.json skill rules when skill-bundles.json is missing", async () => {
+  const ids = installMany();
+  fs.rmSync(real(core.BUNDLES_PATH));
+  const rules = [
+    { action: "bash", resource: "*", effect: "allow" },
+    { action: "skill", resource: "*", effect: "deny" },
+    ...ids.slice(0, 34).map((id) => ({ action: "skill", resource: id, effect: "allow" })),
+    { action: "skill", resource: "report", effect: "allow" },
+  ];
+  put(core.OPENCODE_PATH, JSON.stringify({ $schema: "x", permissions: rules }, null, 2) + "\n");
+  const c = await counts.readCounts(fx.host);
+  expect([c.live, c.installed]).toEqual([35, 212]);
+  expect(c.fromOpencode).toBe(true);
+  expect(counts.bundlesLine(c)).toBe("from opencode.json · no bundles yet");
+  // no skill rules at all: everything is live
+  put(core.OPENCODE_PATH, JSON.stringify({ permissions: [] }) + "\n");
+  expect((await counts.readCounts(fx.host)).live).toBe(212);
 });

@@ -1,3 +1,7 @@
+import { replaceTopLevelValue, spliceTopLevelArray } from "../shared/core/json-splice.js";
+import { createLockProtocol } from "../shared/core/lock.js";
+import { splitDoc, stripComment, yamlQuote, parseFrontmatter, requireSupported, readKey, setKey, removeKey } from "../shared/core/frontmatter.js";
+
 export const BUNDLES_PATH = "~/.config/opencode/skill-bundles.json";
 export const OPENCODE_PATH = "~/.config/opencode/opencode.json";
 export const SKILLS_DIR = "~/.config/opencode/skills";
@@ -310,352 +314,58 @@ export function applyPermissions(opencodeText, state, allIds) {
     .filter((id) => effectiveMode(state, id) !== "off")
     .map((id) => ({ action: "skill", resource: id, effect: "allow" }));
   const permissions = [...kept, { action: "skill", resource: "*", effect: "deny" }, ...allows];
-  return replaceTopLevelValue(opencodeText, "permissions", permissions);
+  return replaceTopLevelValue(opencodeText, "permissions", permissions, { label: "opencode.json" });
 }
 
-// Textual edit: replace (or append) one top-level key's value, leaving every other byte intact.
-function replaceTopLevelValue(text, key, value, renderOld) {
-  const eol = text.includes("\r\n") ? "\r\n" : "\n";
-  let i = 0;
-  const ws = () => { while (i < text.length && /\s/.test(text[i])) i++; };
-  const skipString = () => {
-    i++;
-    while (i < text.length && text[i] !== '"') i += text[i] === "\\" ? 2 : 1;
-    i++;
-  };
-  const skipValue = () => {
-    ws();
-    const c = text[i];
-    if (c === '"') return skipString();
-    if (c === "{" || c === "[") {
-      let depth = 0;
-      while (i < text.length) {
-        const ch = text[i];
-        if (ch === '"') { skipString(); continue; }
-        if (ch === "{" || ch === "[") depth++;
-        else if (ch === "}" || ch === "]") { depth--; if (depth === 0) { i++; return; } }
-        i++;
-      }
-      return;
-    }
-    while (i < text.length && !/[,}\]\s]/.test(text[i])) i++;
-  };
-  const lineIndent = (pos) => {
-    const start = text.lastIndexOf("\n", pos - 1) + 1;
-    return /^[ \t]*/.exec(text.slice(start))[0];
-  };
-  const render = (indent) => JSON.stringify(value, null, 2).split("\n").join(eol + indent);
+// ---------- SKILL.md frontmatter (built on shared/core/frontmatter) ----------
 
-  ws();
-  i++; // {
-  let lastValueEnd = -1;
-  let keyIndent = null;
-  let hit = null;
-  const seen = new Set();
-  for (;;) {
-    ws();
-    if (text[i] === "}") break;
-    const keyStart = i;
-    skipString();
-    const k = JSON.parse(text.slice(keyStart, i));
-    if (seen.has(k)) throw new Error(`opencode.json: duplicate top-level key ${JSON.stringify(k)}; fix it by hand`);
-    seen.add(k);
-    if (keyIndent === null) keyIndent = lineIndent(keyStart);
-    ws();
-    i++; // :
-    ws();
-    const vStart = i;
-    skipValue();
-    if (k === key) hit = { keyStart, vStart, vEnd: i };
-    lastValueEnd = i;
-    ws();
-    if (text[i] === ",") i++;
-  }
-  if (hit) {
-    const indent = lineIndent(hit.keyStart);
-    const raw = renderOld?.(text.slice(hit.vStart, hit.vEnd), indent, eol);
-    return text.slice(0, hit.vStart) + (raw ?? render(indent)) + text.slice(hit.vEnd);
-  }
-  const close = i;
-  const indent = keyIndent ?? "  ";
-  const entry = `${JSON.stringify(key)}: ${render(indent)}`;
-  if (lastValueEnd < 0) {
-    const out = `${text.slice(0, close).replace(/\s*$/, "")}${eol}${indent}${entry}${eol}${text.slice(close)}`;
-    return out.endsWith("\n") ? out : out + eol;
-  }
-  return `${text.slice(0, lastValueEnd)},${eol}${indent}${entry}${text.slice(lastValueEnd)}`;
-}
-
-// ---------- SKILL.md frontmatter ----------
-
-function splitDoc(md) {
-  const eol = md.includes("\r\n") ? "\r\n" : "\n";
-  const lines = md.split(/\r?\n/);
-  if (lines[0]?.replace(/^\uFEFF/, "").trimEnd() !== "---") return { eol, lines, end: -1 };
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i].trimEnd() === "---") return { eol, lines, end: i };
-  }
-  return { eol, lines, end: -1 };
-}
-
-const DMI_RE = /^disable-model-invocation\s*:\s*(.*?)\s*$/;
-const AUTO_KEY_RE = /^opencode\/autoinvoke\s*:\s*(.*?)\s*$/;
-
-function stripComment(v) {
-  return v.replace(/\s+#.*$/, "");
-}
-
-function yamlScalar(v) {
-  v = v.trim();
-  if (v.startsWith('"')) {
-    const q = /^"((?:[^"\\]|\\.)*)"/.exec(v);
-    const body = q ? q[1] : v.slice(1);
-    try { return JSON.parse(`"${body}"`); } catch { return body.replace(/\\(.)/g, "$1"); }
-  }
-  if (v.startsWith("'")) {
-    const q = /^'((?:[^']|'')*)'/.exec(v);
-    return (q ? q[1] : v.slice(1)).replace(/''/g, "'");
-  }
-  return stripComment(v).trim();
-}
+const FM = { reserved: ["metadata", "description", "opencode/autoinvoke", "disable-model-invocation"], maps: ["metadata"], label: "SKILL.md" };
+const AUTO = { parent: "metadata" };
 
 const isFalse = (v) => /^(false|no|off)$/i.test(stripComment(v).replace(/^["']|["']$/g, "").trim());
 const isTrue = (v) => /^(true|yes|on)$/i.test(stripComment(v).replace(/^["']|["']$/g, "").trim());
 
-const indentOf = (l) => /^[ \t]*/.exec(l)[0];
-const isBlank = (l) => l.trim() === "";
-const isComment = (l) => /^\s*#/.test(l);
-const isContent = (l) => !isBlank(l) && !isComment(l);
-
-// Indentation-aware view of the frontmatter between lines[1] and lines[end-1].
-// `error` is set for layouts we refuse to edit (writers throw it; readers stay lenient).
-function analyze(lines, end) {
-  const info = { error: null, desc: null, meta: null, flowMeta: null, dmi: null };
-  const fail = (msg) => { if (!info.error) info.error = msg; };
-  const rootKeys = new Map();
-  const RESERVED = ["metadata", "description", "opencode/autoinvoke", "disable-model-invocation"];
-  // Conservative: any quoted key with a backslash, or one that spells a reserved name, is refused.
-  const checkQuoted = (key, i) => {
-    if (!/^["']/.test(key)) return;
-    const q = /^(["'])(.*)\1$/.exec(key);
-    if (!q || key.includes("\\")) { fail(`quoted key ${key} on line ${i + 1}`); return; }
-    const plain = q[1] === "'" ? q[2].replace(/''/g, "'") : q[2];
-    if (RESERVED.includes(plain)) fail(`quoted key ${key} on line ${i + 1}`);
-  };
-  checkScalars(lines, end, fail);
-  // Compact sequence items ("- x" at column 0) are valid only under a valueless root key.
-  const compact = new Set();
-  let seqOk = false;
-  for (let i = 1; i < end; i++) {
-    const l = lines[i];
-    if (!isContent(l)) continue;
-    const ind = indentOf(l);
-    if (ind.includes("\t")) { fail(`tab indentation on line ${i + 1}`); continue; }
-    if (ind.length > 0) continue; // belongs to the preceding root key
-    if (/^-(\s|$)/.test(l)) {
-      if (seqOk) compact.add(i);
-      else fail(`top-level list on line ${i + 1}`);
-      continue;
-    }
-    const m = /^([^\s:#][^:]*?)\s*:(\s|$)/.exec(l);
-    if (!m) { fail(`unrecognised line ${i + 1}`); seqOk = false; continue; }
-    seqOk = /^\s*(#.*)?$/.test(l.slice(m[0].length));
-    const key = m[1];
-    checkQuoted(key, i);
-    if (rootKeys.has(key)) fail(`duplicate top-level key "${key}"`);
-    rootKeys.set(key, i);
-  }
-  // first content line must be at column 0, otherwise root keys are uniformly indented
-  const first = lines.slice(1, end).find(isContent);
-  if (first && indentOf(first).length > 0) fail("frontmatter keys are indented");
-
-  const blockEnd = (start) => {
-    let stop = start + 1;
-    while (stop < end && (!isContent(lines[stop]) || indentOf(lines[stop]).length > 0 || compact.has(stop))) stop++;
-    while (stop > start + 1 && !isContent(lines[stop - 1])) stop--;
-    return stop;
-  };
-
-  if (rootKeys.has("description")) {
-    const i = rootKeys.get("description");
-    info.desc = { start: i, stop: blockEnd(i) };
-  }
-  if (rootKeys.has("disable-model-invocation")) info.dmi = rootKeys.get("disable-model-invocation");
-  if (rootKeys.has("metadata")) {
-    const start = rootKeys.get("metadata");
-    const rest = /^metadata\s*:(.*)$/.exec(lines[start])[1].trim();
-    if (rest && !rest.startsWith("#")) {
-      info.flowMeta = { start, text: rest };
-      fail(rest.startsWith("{") ? "flow-style `metadata: {...}` is not supported" : "`metadata:` is not a mapping");
-    } else {
-      const stop = blockEnd(start);
-      const children = [];
-      let childIndent = null;
-      const seen = new Set();
-      for (let j = start + 1; j < stop; j++) {
-        const l = lines[j];
-        if (!isContent(l)) continue;
-        if (compact.has(j)) { fail("`metadata:` is a list, not a mapping"); continue; }
-        const ind = indentOf(l).length;
-        if (childIndent === null) childIndent = ind;
-        if (ind < childIndent) { fail(`inconsistent indentation under metadata on line ${j + 1}`); continue; }
-        if (ind > childIndent) continue;
-        const key = /^\s*([^\s:#][^:]*?)\s*:(\s|$)/.exec(l)?.[1];
-        if (!key) { fail(`unrecognised metadata line ${j + 1}`); continue; }
-        checkQuoted(key, j);
-        if (seen.has(key)) fail(`duplicate metadata key "${key}"`);
-        seen.add(key);
-        children.push({ line: j, key });
-      }
-      info.meta = { start, stop, childIndent: childIndent ?? 2, children };
-    }
-  }
-  return info;
-}
-
-// Value part of a frontmatter line: after indentation, "- " markers and an optional `key:`.
-function valueOf(line) {
-  let v = line.replace(/^\s*/, "");
-  while (/^-(\s|$)/.test(v)) v = v.slice(1).replace(/^\s*/, "");
-  if (/^["']/.test(v)) {
-    // quoted key followed by ":"?
-    const k = /^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:(\s|$)/.exec(v);
-    if (k) return v.slice(k[0].length).trim();
-    return v;
-  }
-  const k = /^[^\s#][^:]*?:(\s|$)/.exec(v);
-  return k ? v.slice(k[0].length).trim() : v;
-}
-
-function quoteClosed(v) {
-  if (v.startsWith('"')) return /^"(?:[^"\\]|\\.)*"\s*(#.*)?$/.test(v);
-  if (v.startsWith("'")) return /^'(?:[^']|'')*'\s*(#.*)?$/.test(v);
-  return true;
-}
-
-// Multi-line quoted scalars and backslash line endings are refused outright.
-// Block-scalar (| / >) bodies are opaque text and are skipped.
-function checkScalars(lines, end, fail) {
-  let blockIndent = -1;
-  for (let i = 1; i < end; i++) {
-    const l = lines[i];
-    if (!isContent(l) && !(blockIndent >= 0 && isComment(l))) {
-      if (blockIndent < 0 && /\\\s*$/.test(l)) fail(`line ${i + 1} ends with a backslash`);
-      continue;
-    }
-    const ind = indentOf(l).length;
-    if (blockIndent >= 0) {
-      if (ind > blockIndent || l.trim() === "") continue;
-      blockIndent = -1;
-    }
-    if (/\\\s*$/.test(l)) { fail(`line ${i + 1} ends with a backslash`); continue; }
-    const v = valueOf(l);
-    if (/^[|>][-+0-9]*\s*(#.*)?$/.test(v)) { blockIndent = ind; continue; }
-    if (/^["']/.test(v) && !quoteClosed(v)) fail(`multi-line quoted scalar on line ${i + 1}`);
-    const key = l.replace(/^\s*(-\s+)*/, "");
-    if (/^["']/.test(key) && !/^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:(\s|$)/.test(key) && !quoteClosed(key)) {
-      fail(`unterminated quoted key on line ${i + 1}`);
-    }
-  }
-}
-
-function autoLine(lines, info) {
-  const c = info.meta?.children.find((x) => x.key === "opencode/autoinvoke");
-  return c ? c.line : -1;
-}
-
-function requireSupported(info) {
-  if (info.error) throw new Error(`SKILL.md frontmatter layout not supported (${info.error}); edit it by hand`);
+function parseSkill(md) {
+  const fm = parseFrontmatter(md, FM);
+  if (fm.info) requireSupported(fm.info, FM.label);
+  return fm;
 }
 
 // opencode/autoinvoke wins; otherwise disable-model-invocation: true means false.
-function readAutoinvoke(lines, info) {
-  const al = autoLine(lines, info);
-  if (al >= 0) return !isFalse(AUTO_KEY_RE.exec(lines[al].trim())[1]);
-  const dmi = info.dmi !== null ? DMI_RE.exec(lines[info.dmi])?.[1] ?? null : null;
-  return !(dmi !== null && isTrue(dmi));
+function readAutoinvoke(fm) {
+  const a = readKey(fm, "opencode/autoinvoke", AUTO);
+  if (a) return !isFalse(a.raw);
+  const d = readKey(fm, "disable-model-invocation");
+  return !(d && isTrue(d.raw));
 }
 
 export function readFrontmatter(skillMd) {
-  const { lines, end } = splitDoc(skillMd);
-  if (end < 0) return { description: "", autoinvoke: true, hasFrontmatter: false };
-  const info = analyze(lines, end);
-  requireSupported(info);
-  let description = "";
-  if (info.desc) {
-    const { start, stop } = info.desc;
-    const v = /^description\s*:(.*)$/.exec(lines[start])[1].trim();
-    const cont = lines.slice(start + 1, stop).filter((l) => !isComment(l));
-    if (/^[>|][-+0-9]*$/.test(v)) {
-      const parts = cont.map((l) => l.trim());
-      description = v.startsWith(">") ? parts.join(" ").replace(/\s+/g, " ").trim() : parts.join("\n").trim();
-    } else if (cont.some(isContent)) {
-      const joined = [v, ...cont.map((l) => l.trim())].filter(Boolean).join(" ");
-      description = yamlScalar(joined);
-    } else description = yamlScalar(v);
-  }
-  return { description, autoinvoke: readAutoinvoke(lines, info), hasFrontmatter: true };
+  const fm = parseSkill(skillMd);
+  if (!fm.info) return { description: "", autoinvoke: true, hasFrontmatter: false };
+  return { description: readKey(fm, "description")?.value ?? "", autoinvoke: readAutoinvoke(fm), hasFrontmatter: true };
 }
 
 export function setAutoinvoke(skillMd, on) {
-  const { eol, lines, end } = splitDoc(skillMd);
-  if (end < 0) {
-    if (on) return skillMd;
-    const body = skillMd.replace(/^\uFEFF/, "");
-    return ["---", "metadata:", "  opencode/autoinvoke: false", "---", ""].join(eol) + body;
-  }
-  const info = analyze(lines, end);
-  requireSupported(info);
-  const al = autoLine(lines, info);
+  const fm = parseSkill(skillMd);
+  if (!fm.info) return on ? skillMd : setKey(skillMd, "opencode/autoinvoke", "false", { ...FM, ...AUTO });
   if (on) {
-    const out = lines.map((l, i) => {
-      // disable-model-invocation: true would still block auto-invocation; flip it in place.
-      if (i === info.dmi && isTrue(DMI_RE.exec(l)[1])) return l.replace(/:\s*.*$/, ": false");
-      return l;
-    });
-    if (al >= 0) out.splice(al, 1);
-    return out.join(eol);
+    // disable-model-invocation: true would still block auto-invocation; flip it in place.
+    const d = readKey(fm, "disable-model-invocation");
+    let text = skillMd;
+    if (d && isTrue(d.raw)) {
+      const out = [...fm.lines];
+      out[d.line] = out[d.line].replace(/:\s*.*$/, ": false");
+      text = out.join(fm.eol);
+    }
+    return removeKey(text, "opencode/autoinvoke", { ...FM, ...AUTO });
   }
-  if (!readAutoinvoke(lines, info)) return skillMd;
-  const out = [...lines];
-  if (al >= 0) {
-    out[al] = out[al].replace(/:\s*.*$/, ": false");
-  } else if (info.meta) {
-    out.splice(info.meta.start + 1, 0, `${" ".repeat(info.meta.childIndent)}opencode/autoinvoke: false`);
-  } else {
-    out.splice(end, 0, "metadata:", "  opencode/autoinvoke: false");
-  }
-  return out.join(eol);
-}
-
-function yamlQuote(text) {
-  const needs =
-    text === "" ||
-    /: /.test(text) || /:$/.test(text) || /#/.test(text) || /["']/.test(text) ||
-    /^[-?:,[\]{}&*!|>%@`\s]/.test(text) || /\s$/.test(text) ||
-    /^(true|false|yes|no|on|off|null|~|[-+]?\d[\d._]*(e[-+]?\d+)?)$/i.test(text);
-  return needs ? JSON.stringify(text) : text;
+  if (!readAutoinvoke(fm)) return skillMd;
+  return setKey(skillMd, "opencode/autoinvoke", "false", { ...FM, ...AUTO });
 }
 
 export function setDescription(skillMd, text) {
   const single = String(text ?? "").replace(/\s*[\r\n]+\s*/g, " ").trim();
-  const line = `description: ${yamlQuote(single)}`;
-  const { eol, lines, end } = splitDoc(skillMd);
-  if (end < 0) {
-    return ["---", line, "---", ""].join(eol) + skillMd.replace(/^\uFEFF/, "");
-  }
-  const info = analyze(lines, end);
-  requireSupported(info);
-  const out = [...lines];
-  if (!info.desc) {
-    const nameIdx = lines.findIndex((l, i) => i > 0 && i < end && /^name\s*:/.test(l));
-    out.splice(nameIdx >= 0 ? nameIdx + 1 : end, 0, line);
-    return out.join(eol);
-  }
-  // replaces the key line plus every continuation line (block scalar, quoted or plain multi-line)
-  const { start, stop } = info.desc;
-  out.splice(start, stop - start, line);
-  return out.join(eol);
+  return setKey(skillMd, "description", yamlQuote(single), { ...FM, after: "name" });
 }
 
 // ---------- sync ----------
@@ -770,32 +480,24 @@ export const LOCK_PATH = "~/.config/opencode/.skill-bundles.lock";
 export const PANEL_LOCK_TTL_MS = 60_000;
 /** An unparseable lock, or one from another host, is reclaimable once its mtime is this old. */
 export const LOCK_UNPARSEABLE_STALE_MS = 10 * 60_000;
+const LOCK = createLockProtocol({ ownerName: "panel", ttlMs: PANEL_LOCK_TTL_MS, unparseableStaleMs: LOCK_UNPARSEABLE_STALE_MS });
+const KIND = { process: "cli", holder: "panel" };
+
 /** What the panel writes to release (it cannot delete). Counts as free. */
-export const RELEASED_MARKER = '{"owner":"panel","released":true,"time":0}';
+export const RELEASED_MARKER = LOCK.releasedMarker;
 
 /** The exact text the panel writes to take the lock. */
 export function panelLockRecord(token, now) {
-  return JSON.stringify({ owner: "panel", host: "panel", pid: 0, token, time: now });
+  return LOCK.makeHolderRecord(token, now);
 }
 
 /** Lock file text → { kind: "cli" | "panel" | "released" | "invalid", ... }. */
 export function parseLock(text) {
-  let v;
-  try {
-    v = JSON.parse(text);
-  } catch {
-    return { kind: "invalid" };
-  }
-  if (!v || typeof v !== "object" || Array.isArray(v)) return { kind: "invalid" };
-  const time = Number.isFinite(v.time) ? v.time : null;
-  const token = typeof v.token === "string" ? v.token : null;
-  if (v.owner === "panel" && v.released === true) return { kind: "released" };
-  if (v.owner === "panel") return { kind: "panel", token, time, host: typeof v.host === "string" ? v.host : null };
-  if (Number.isInteger(v.pid) && v.pid > 0 && typeof v.host === "string" && v.host) {
-    return { kind: "cli", pid: v.pid, host: v.host, token, time };
-  }
-  return { kind: "invalid" };
+  const info = LOCK.parseLock(text);
+  return KIND[info.kind] ? { ...info, kind: KIND[info.kind] } : info;
 }
+
+const UNKIND = { cli: "process", panel: "holder" };
 
 /**
  * parsed lock (null = no lock file) → "free" | "held" | "stale". "stale" may be reclaimed.
@@ -803,17 +505,8 @@ export function parseLock(text) {
  * A CLI lock is judged by its pid only when it is from `host` and pidAlive is given; otherwise
  * by the 10-minute mtime rule, like an unparseable lock.
  */
-export function classifyLock(info, { now, mtimeMs, pidAlive, host } = {}) {
-  if (!info || info.kind === "released") return "free";
-  const age = (t) => (Number.isFinite(t) ? now - t : Infinity);
-  if (info.kind === "panel") {
-    const t = info.time !== null && Number.isFinite(info.time) ? Math.max(info.time, mtimeMs ?? -Infinity) : mtimeMs;
-    return age(t) > PANEL_LOCK_TTL_MS ? "stale" : "held";
-  }
-  if (info.kind === "cli" && host && info.host === host && typeof pidAlive === "function") {
-    return pidAlive(info.pid) ? "held" : "stale";
-  }
-  return age(mtimeMs) > LOCK_UNPARSEABLE_STALE_MS ? "stale" : "held";
+export function classifyLock(info, opts = {}) {
+  return LOCK.classifyLock(info && UNKIND[info.kind] ? { ...info, kind: UNKIND[info.kind] } : info, opts);
 }
 
 // ---------- per-project bundles (v0.2) ----------
@@ -935,50 +628,7 @@ export function applyProjectPermissions(text, skillIds) {
   const existing = cfg.permissions ?? [];
   const hadSkill = existing.some((r) => r && r.action === "skill");
   if (!allows.length && !hadSkill) return text; // nothing of ours to remove
-  const kept = existing.filter((r) => !(r && r.action === "skill"));
   // Keep non-skill entries byte-for-byte; only our allows are freshly rendered.
-  const keepRaw = (arrText, indent, eol) => {
-    const spans = arrayElementSpans(arrText);
-    if (!spans || spans.length !== existing.length) return null;
-    const items = spans.filter((_, i) => !(existing[i] && existing[i].action === "skill"));
-    const inner = indent + "  ";
-    const ours = allows.map((r) => JSON.stringify(r, null, 2).split("\n").join(eol + inner));
-    const all = [...items, ...ours];
-    return all.length ? `[${eol}${all.map((x) => inner + x).join("," + eol)}${eol}${indent}]` : "[]";
-  };
-  return replaceTopLevelValue(text, "permissions", [...kept, ...allows], keepRaw);
+  return spliceTopLevelArray(text, "permissions", { keep: (r) => !(r && r.action === "skill"), add: allows, label: "opencode.json" });
 }
 
-// Raw source text of each element of a JSON array literal; null if it cannot be split safely.
-function arrayElementSpans(arr) {
-  let i = 0;
-  const out = [];
-  const ws = () => { while (i < arr.length && /\s/.test(arr[i])) i++; };
-  ws();
-  if (arr[i] !== "[") return null;
-  i++;
-  for (;;) {
-    ws();
-    if (arr[i] === "]") return out;
-    const start = i;
-    let depth = 0;
-    while (i < arr.length) {
-      const c = arr[i];
-      if (c === '"') {
-        i++;
-        while (i < arr.length && arr[i] !== '"') i += arr[i] === "\\" ? 2 : 1;
-        i++;
-        continue;
-      }
-      if (c === "{" || c === "[") depth++;
-      else if (c === "}" || c === "]") {
-        if (depth === 0) break;
-        depth--;
-      } else if (c === "," && depth === 0) break;
-      i++;
-    }
-    if (i >= arr.length) return null;
-    out.push(arr.slice(start, i).trimEnd());
-    if (arr[i] === ",") i++;
-  }
-}

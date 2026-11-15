@@ -1,6 +1,6 @@
 // Bundle "Projects" checklist: which project folders a bundle is turned on in.
 import * as core from '../src/core.js';
-import { button, createPopup, note, projects, projectsNote, replace, shortDir, watchProjects, type Project } from './popup';
+import { button, createPopup, note, projectList, projectsNote, replace, shortDir, watchProjects, type Project } from './popup';
 import { S, commit, errText, homeOpt, host } from './io';
 
 const sameDir = (a: string, b: string) => {
@@ -110,16 +110,16 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
     menu.setAttribute('aria-label', title.textContent);
     list.textContent = '';
     const mine = b.projects ?? [];
-    pop.ensureFilter(projects.length + mine.length, 'Filter projects', (v) => { filter = v; paint(); });
+    pop.ensureFilter(projectList().projects.length + mine.length, 'Filter projects', (v) => { filter = v; paint(); });
 
-    const known: Project[] = core.filterProjects(projects, filter);
+    const known: Project[] = core.filterProjects(projectList().projects, filter);
     const status = projectsNote(known.length, filter);
     if (status) list.appendChild(note(status));
     for (const p of known) list.appendChild(row(p.name, p.directory, mine.some((d) => sameDir(d, p.directory))));
 
     // Folders in the bundle that OpenChamber doesn't list, so they can be unchecked.
     const q = filter.trim().toLowerCase();
-    const extra = mine.filter((d) => !projects.some((p) => sameDir(p.directory, d)) && (!q || d.toLowerCase().includes(q)));
+    const extra = mine.filter((d) => !projectList().projects.some((p) => sameDir(p.directory, d)) && (!q || d.toLowerCase().includes(q)));
     if (extra.length) {
       const h = document.createElement('div');
       h.className = 'sb-ctx-title';

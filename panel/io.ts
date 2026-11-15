@@ -3,12 +3,35 @@ import { HostRequestError, type HostClient } from '@openchamber/sdk';
 import * as core from '../src/core.js';
 import type { ChangePlan, PlanError, State } from '../src/core.js';
 import seed from '../data/default-bundles.json';
+import { errText as hostErrText, isNotFound, pool, readOptional as readOpt } from '../shared/panel/host';
+import { createQueue } from '../shared/panel/queue';
+import { createPanelLock, LockedError, type PanelLock } from '../shared/panel/panel-lock';
+import { backupOnce, runTxn, type TxnWrite } from '../shared/panel/txn';
+import { capText, fitList } from '../shared/panel/toast';
+import { homeFromDirs as sharedHomeFromDirs } from '../shared/panel/projects';
 
 /** The host client; main sets it at boot, tests pass a fake. */
 export let host: HostClient;
 export function setHost(h: HostClient) {
   host = h;
+  lock = createPanelLock({
+    host: h,
+    path: core.LOCK_PATH,
+    parse: core.parseLock,
+    classify: (info, opts) => core.classifyLock(info, opts),
+    isOwn: (info, token) => info.kind === 'panel' && info.token === token,
+    needsMtime: (info) => info.kind !== 'released',
+    record: core.panelLockRecord,
+    releasedMarker: core.RELEASED_MARKER,
+    timing: lockTiming,
+    timeoutMessage: (mtimeMs, now) =>
+      mtimeMs > 0 && now - mtimeMs >= core.LOCK_UNPARSEABLE_STALE_MS
+        ? `A CLI lock from ${new Date(mtimeMs).toLocaleString()} is blocking saves. If no \`skills\` command is running, run \`skills sync\` to clear the stale lock.`
+        : 'CLI is writing — try again',
+    onReleaseError: (e) => toastError(e, 'Could not release the lock'),
+  });
 }
+let lock: PanelLock;
 
 /** Data loaded from disk plus write-queue bookkeeping. */
 export const S = {
@@ -21,7 +44,6 @@ export const S = {
   /** User's home dir, derived once at load (undefined = unknown: textual collapsing only). */
   home: undefined as string | undefined,
   homeDerived: false,
-  pending: 0,
   descDraft: null as { id: string; value: string } | null,
 };
 
@@ -31,20 +53,8 @@ export const hooks = { render: () => {}, renderLight: () => {} };
 /** `{ home }` for every core call that takes it. */
 export const homeOpt = () => (S.home ? { home: S.home } : {});
 
-const CHATS_SUFFIX = '/.config/openchamber/chats';
-/**
- * The SDK doesn't expose the home dir. Derive it from OpenChamber's project dirs: (1) the chats
- * dir is `<home>/.config/openchamber/chats[/…]`; (2) else a shared `/home/<u>` or `/Users/<u>`
- * prefix. Undefined when neither works. Pure; exported for tests.
- */
-export function homeFromDirs(dirs: string[]): string | undefined {
-  for (const d of dirs) {
-    const i = d.indexOf(CHATS_SUFFIX);
-    if (i > 0 && (d.length === i + CHATS_SUFFIX.length || d[i + CHATS_SUFFIX.length] === '/')) return d.slice(0, i);
-  }
-  const homes = new Set(dirs.map((d) => /^(\/home\/[^/]+|\/Users\/[^/]+)(?=\/|$)/.exec(d)?.[1]).filter(Boolean));
-  return homes.size === 1 ? [...homes][0] : undefined;
-}
+/** Home dir from OpenChamber's project dirs (see shared/panel/projects). */
+export const homeFromDirs = (dirs: string[]) => sharedHomeFromDirs(dirs);
 
 async function deriveHome() {
   if (S.homeDerived) return;
@@ -63,12 +73,11 @@ export const bundlesOf = (id: string) => (S.state ? S.state.bundles.filter((b) =
 
 export function errText(e: unknown) {
   if (e instanceof HostRequestError) return `${e.code}: ${e.message}`;
-  return e instanceof Error ? e.message : String(e);
+  return hostErrText(e);
 }
 export function toastError(e: unknown, what: string) {
   void host.toast({ kind: 'error', message: `${what}: ${errText(e)}`, copy: true, dismiss: true });
 }
-const isNotFound = (e: unknown) => e instanceof HostRequestError && e.code === 'NOT_FOUND';
 
 // ---------- frontmatter cache ----------
 
@@ -100,113 +109,29 @@ function setMd(id: string, text: string) {
 
 // ---------- write queue: every write runs here, one at a time, none dropped ----------
 
-let chain: Promise<void> = Promise.resolve();
-export function enqueue(task: () => Promise<void>): Promise<boolean> {
-  S.pending++;
-  hooks.renderLight();
-  const run = chain.then(task).then(
-    () => true,
-    (e) => { toastError(e, 'Saving failed'); return false; },
-  );
-  chain = run.then(() => {
-    S.pending--;
-    hooks.render();
-  });
-  return run;
-}
+const queue = createQueue({
+  onQueued: () => hooks.renderLight(),
+  onSettled: () => hooks.render(),
+  onError: (e) => toastError(e, 'Saving failed'),
+});
+export const enqueue = queue.enqueue;
+/** Writes queued or running. */
+export const pending = () => queue.pending;
 
 class StaleError extends Error {}
-class LockedError extends Error {}
 class RefusedError extends Error {}
 
 // ---------- lock ----------
 
-// Protocol shared with the CLI (core.LOCK_PATH etc.). The SDK has no delete, so the panel
-// releases by writing core.RELEASED_MARKER, and never touches a lock that isn't its own.
+// Protocol shared with the CLI (core.LOCK_PATH etc.), run by shared/panel/panel-lock.
 /** How long to wait for a held lock. Tests shorten it. */
 export const lockTiming = { pollMs: 250, waitMs: 3000 };
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-function randomToken() {
-  const b = new Uint8Array(16);
-  crypto.getRandomValues(b);
-  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-}
-const lockInfo = (text: string | null) => (text == null ? null : core.parseLock(text));
-const isOurs = (text: string | null, token: string) => {
-  const info = lockInfo(text);
-  return info?.kind === 'panel' && info.token === token;
-};
-async function lockMtimeMs() {
-  const st = await host.stat(core.LOCK_PATH);
-  if (st.kind === 'missing') return 0;
-  return st.mtime < 1e12 ? st.mtime * 1000 : st.mtime;
-}
+export const readOptional = (path: string) => readOpt(host, path);
 
-export async function readOptional(path: string): Promise<string | null> {
-  try {
-    return (await host.readFile(path)).content;
-  } catch (e) {
-    if (isNotFound(e)) return null;
-    throw e;
-  }
-}
-
-/**
- * Acquire the lock (polling up to lockTiming.waitMs), returning our token. Only a free lock
- * (missing, or a panel-owned released marker) is taken. The panel can't probe pids, so it never
- * reclaims a held or stale lock itself; for an old one it suggests `skills sync`.
- */
-async function acquireLock(): Promise<string> {
-  const deadline = Date.now() + lockTiming.waitMs;
-  for (;;) {
-    const info = lockInfo(await readOptional(core.LOCK_PATH));
-    const now = Date.now();
-    const mtimeMs = info == null || info.kind === 'released' ? 0 : await lockMtimeMs();
-    const verdict = core.classifyLock(info, { now, mtimeMs });
-    if (verdict === 'free') {
-      const token = randomToken();
-      await host.writeFile(core.LOCK_PATH, core.panelLockRecord(token, Date.now()));
-      if (isOurs(await readOptional(core.LOCK_PATH), token)) return token;
-      // Someone else won the race; fall through and wait.
-    }
-    if (Date.now() >= deadline) {
-      if (mtimeMs > 0 && now - mtimeMs >= core.LOCK_UNPARSEABLE_STALE_MS) {
-        throw new LockedError(`A CLI lock from ${new Date(mtimeMs).toLocaleString()} is blocking saves. If no \`skills\` command is running, run \`skills sync\` to clear the stale lock.`);
-      }
-      throw new LockedError('CLI is writing — try again');
-    }
-    await sleep(lockTiming.pollMs);
-  }
-}
-
-async function releaseLock(token: string) {
-  try {
-    if (isOurs(await readOptional(core.LOCK_PATH), token)) await host.writeFile(core.LOCK_PATH, core.RELEASED_MARKER);
-  } catch (e) {
-    toastError(e, 'Could not release the lock');
-  }
-}
-
-async function withLock<T>(fn: () => Promise<T>): Promise<T> {
-  const token = await acquireLock();
-  try {
-    return await fn();
-  } finally {
-    await releaseLock(token);
-  }
-}
+const withLock = <T>(fn: () => Promise<T>) => lock.withLock(fn);
 
 // ---------- load ----------
-
-/** Run fn over items, at most `size` at a time. */
-async function pool<T>(items: T[], size: number, fn: (item: T) => Promise<void>) {
-  const queue = [...items];
-  const worker = async () => {
-    while (queue.length) await fn(queue.shift()!);
-  };
-  await Promise.all(Array.from({ length: size }, worker));
-}
 
 export async function load() {
   await deriveHome();
@@ -298,31 +223,29 @@ async function saveLocked(next: State, first: ChangePlan, firstTexts: ProjectTex
   let plan = sameTexts(firstTexts, projectTexts) ? first : planFor(next, projectTexts);
   for (let i = 0; i < 5 && (await refreshSkillMds(skillIds(plan))); i++) plan = planFor(next, projectTexts);
 
-  // Undo what was written on failure. Project files are shared with the user, so each is
-  // re-read right before its write and merged, and only restored if still exactly what we wrote.
-  const written: Written[] = [];
-  try {
-    for (const w of plan.writes) {
-      if (w.kind === 'opencode') {
-        const bak = core.OPENCODE_PATH.replace(/[^/]+$/, core.backupName());
-        if ((await host.stat(bak)).kind === 'missing') await host.writeFile(bak, S.opencodeText);
-      }
-      if (w.kind === 'project') {
-        const fresh = await readOptional(w.path);
-        const after = fresh === w.before ? w.after : core.applyProjectPermissions(fresh, projectSkillIds(w.after));
-        if (after == null || after === fresh) continue; // nothing of ours to write
-        await host.writeFile(w.path, after);
-        written.push({ kind: 'project', path: w.path, before: fresh, wrote: after });
-        continue;
-      }
-      await host.writeFile(w.path, w.after);
-      // A bundles file that didn't exist (seeding) has nothing to restore; it is written last anyway.
-      if (w.before != null) written.push({ kind: w.kind, path: w.path, before: w.before, wrote: w.after });
-    }
-  } catch (e) {
-    await rollback(written);
-    throw e;
-  }
+  // plan.writes is in core.PUBLISH_ORDER. Project files are shared with the user: re-read and
+  // merged right before writing, restored on failure only if still exactly what we wrote.
+  const writes: TxnWrite[] = plan.writes.map((w) => ({
+    path: w.path,
+    before: w.before,
+    after: w.after,
+    ...(w.kind === 'opencode' ? {
+      beforeWrite: () => backupOnce(host, core.OPENCODE_PATH.replace(/[^/]+$/, core.backupName()), S.opencodeText),
+    } : {}),
+    ...(w.kind === 'project' ? {
+      shared: true,
+      merge: (fresh: string | null) => core.applyProjectPermissions(fresh, projectSkillIds(w.after)),
+      neutralize: (wrote: string) => core.applyProjectPermissions(wrote, []),
+    } : {}),
+  }));
+  await runTxn(host, writes, {
+    tag: 'skill-bundles',
+    onConflict: (path, rescued) => void host.toast({
+      kind: 'error', dismiss: true, persistent: true, copy: { text: rescued || path },
+      message: `Save failed and ${path} was edited meanwhile, so it was left as is (it may still hold this save's skill rules).${rescued ? ` Its earlier version is in ${rescued}.` : ''}`,
+    }),
+    onRestoreError: (path, r) => toastError(r, `Could not restore ${path}`),
+  });
   for (const w of plan.writes) {
     if (w.kind === 'skill' && w.id) setMd(w.id, w.after);
     else if (w.kind === 'opencode') S.opencodeText = w.after;
@@ -331,8 +254,6 @@ async function saveLocked(next: State, first: ChangePlan, firstTexts: ProjectTex
   S.state = plan.state ?? next;
   toastSkipped(plan.skipped);
 }
-
-type Written = { kind: string; path: string; before: string | null; wrote: string };
 
 /** Skill ids allowed by a project file text we generated. */
 function projectSkillIds(text: string): string[] {
@@ -344,56 +265,13 @@ function projectSkillIds(text: string): string[] {
   }
 }
 
-const rescueName = (path: string) =>
-  `${path}.skill-bundles-rescue-${new Date().toISOString().replace(/[-:.]/g, '').replace('T', '-').slice(0, 15)}-${Math.random().toString(36).slice(2, 8)}`;
-
-async function rollback(written: Written[]) {
-  for (const w of [...written].reverse()) {
-    try {
-      if (w.kind !== 'project') {
-        if (w.before != null) await host.writeFile(w.path, w.before);
-        continue;
-      }
-      const current = await readOptional(w.path);
-      if (current === w.wrote) {
-        // Untouched since our write: undo. A file we created can't be deleted, so empty its skill rules.
-        const restore = w.before ?? core.applyProjectPermissions(w.wrote, []);
-        if (restore != null) await host.writeFile(w.path, restore);
-        continue;
-      }
-      // Someone edited it after our write: leave their version, keep the pre-save text aside.
-      let rescued = '';
-      if (w.before != null) {
-        rescued = rescueName(w.path);
-        await host.writeFile(rescued, w.before);
-      }
-      void host.toast({
-        kind: 'error', dismiss: true, persistent: true, copy: { text: rescued || w.path },
-        message: `Save failed and ${w.path} was edited meanwhile, so it was left as is (it may still hold this save's skill rules).${rescued ? ` Its earlier version is in ${rescued}.` : ''}`,
-      });
-    } catch (r) {
-      toastError(r, `Could not restore ${w.path}`);
-    }
-  }
-}
-
 function toastSkipped(skipped: ChangePlan['skipped']) {
   if (!skipped.length) return;
-  // Toast text is capped at 500 chars by the host; Copy allows 32,000.
-  const head = `Skipped ${skipped.length} skill(s) needing manual edit: `;
-  const shown: string[] = [];
-  for (const s of skipped) {
-    const rest = skipped.length - shown.length - 1;
-    const candidate = [...shown, s.id].join(', ') + (rest ? ` and ${rest} more` : '');
-    if ((head + candidate).length > 480) break;
-    shown.push(s.id);
-  }
-  const more = skipped.length - shown.length;
   const full = skipped.map((s) => `${s.id}: ${s.reason}`).join('\n');
   void host.toast({
     kind: 'info', dismiss: true,
-    message: head + shown.join(', ') + (more ? `${shown.length ? ' and ' : ''}${more} more` : ''),
-    copy: { text: full.length > 32000 ? `${full.slice(0, 31980)}\n…` : full },
+    message: fitList(`Skipped ${skipped.length} skill(s) needing manual edit: `, skipped.map((s) => s.id)),
+    copy: { text: capText(full) },
   });
 }
 

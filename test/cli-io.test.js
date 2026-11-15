@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runCli, createNodeIO } from "../src/cli.js";
+import { faultyIO, boom, isTemp, isTarget } from "../shared/test/fault-io.js";
 import * as core from "../src/core.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -45,29 +46,6 @@ const noTmp = (h) => {
 };
 const withoutBackups = (snap) => Object.fromEntries(Object.entries(snap).filter(([k]) => !/\.skill-bundles-\d{8}$/.test(k)));
 
-/**
- * Wraps the real io. `on` maps an io method name to a hook (args, nth, real) called before the
- * real method; nth counts calls of that method that match `match` (default: all). A hook may
- * throw to inject a fault or mutate the disk to simulate a concurrent writer.
- */
-function faultyIO(on = {}, match = {}) {
-  const real = createNodeIO();
-  const counts = {};
-  const io = { ...real };
-  for (const [name, hook] of Object.entries(on)) {
-    io[name] = (...args) => {
-      if (!match[name] || match[name](...args)) {
-        counts[name] = (counts[name] ?? 0) + 1;
-        hook(args, counts[name] - 1, real);
-      }
-      return real[name](...args);
-    };
-  }
-  return io;
-}
-const boom = (msg) => { throw Object.assign(new Error(msg), { code: "EIO" }); };
-const isTemp = (p) => p.endsWith(".tmp");
-const isTarget = (_a, b) => !b.includes(".reclaim-") && !isTemp(b);
 
 function cli(home, argv, io) {
   let out = "", err = "";

@@ -2,7 +2,7 @@
 import { type HostClient } from '@openchamber/sdk';
 import * as core from '../src/core.js';
 import {
-  button, closePopup, codeOf, createPopup, note, projects, projectsNote, shortDir, watchProjects, type Project,
+  button, closePopup, codeOf, createPopup, note, projectList, projectsNote, shortDir, watchProjects, type Project,
 } from './popup';
 
 export type SendDeps = {
@@ -118,7 +118,8 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
   const pop = createPopup({
     itemSelector: 'button.sb-ctx-item',
     returnFocus,
-    onKey: (e) => { if (e.key === 'Alt') { altDown = e.type === 'keydown'; paintTitle(); } },
+    altAtOpen,
+    onAlt: (down) => { altDown = down; paintTitle(); },
     onClose: () => unwatch(),
   });
   const { menu, title, list, foot } = pop;
@@ -165,8 +166,8 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
   const paint = () => {
     const keep = document.activeElement instanceof HTMLElement && menu.contains(document.activeElement) ? document.activeElement.dataset.pid : undefined;
     list.textContent = '';
-    pop.ensureFilter(projects.length, 'Filter projects', (v) => { filter = v; paint(); });
-    const shown: Project[] = core.filterProjects(projects, filter);
+    pop.ensureFilter(projectList().projects.length, 'Filter projects', (v) => { filter = v; paint(); });
+    const shown: Project[] = core.filterProjects(projectList().projects, filter);
     const status = projectsNote(shown.length, filter);
     if (status) list.appendChild(note(status));
     for (const p of shown) {

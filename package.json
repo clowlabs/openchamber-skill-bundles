@@ -1,6 +1,6 @@
 {
   "name": "skill-bundles",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "Turn OpenCode skills on and off in named bundles.",
@@ -8,9 +8,10 @@
     "skills": "bin/skills"
   },
   "scripts": {
-    "build": "openchamber-guest-bundle panel/main.ts panel/main.js",
+    "build": "openchamber-guest-bundle panel/main.ts panel/main.js && openchamber-guest-bundle status/main.ts status/main.js",
     "test": "node --test test/ && bun test test/panel-io.test.js",
-    "test:panel": "bun test test/panel-io.test.js"
+    "test:panel": "bun test test/panel-io.test.js",
+    "typecheck": "tsc --noEmit --strict --target es2022 --moduleResolution bundler --module esnext --resolveJsonModule --lib es2022,dom panel/main.ts status/main.ts shared/panel/*.ts"
   },
   "devDependencies": {
     "@openchamber/sdk": "2.7.1"
@@ -40,7 +41,12 @@
         "/**/.opencode/opencode.json",
         "~/**/.opencode/opencode.json.skill-bundles-rescue-*",
         "/**/.opencode/opencode.json.skill-bundles-rescue-*"
-      ]
+      ],
+      "statusSection": {
+        "entry": "status/index.html",
+        "title": "Skills",
+        "height": 72
+      }
     }
   },
   "license": "MIT",
