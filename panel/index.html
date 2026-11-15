@@ -20,15 +20,18 @@
       <section class="sb-left">
         <div class="sb-toolbar">
           <div id="tabs"></div>
+          <div class="sb-legend" title="Drag to move · Alt-drop to copy">
+            <span title="Automatically: agents load and use this skill when relevant"><i class="sb-dot auto"></i>Auto</span>
+            <span title="When called: agents only see this skill when you invoke it"><i class="sb-dot called"></i>Called</span>
+            <span title="Off: disabled for agents"><i class="sb-dot off"></i>Off</span>
+          </div>
+          <div id="undo-wrap" class="sb-undo-wrap"></div>
+        </div>
+        <div class="sb-controls-row">
           <div id="search" class="sb-search"></div>
+          <div class="sb-new" id="new-bundle"></div>
         </div>
-        <div class="sb-legend">
-          <span><i class="sb-dot auto"></i>Automatically</span>
-          <span><i class="sb-dot called"></i>When called</span>
-          <span><i class="sb-dot off"></i>Off</span>
-          <span class="sb-hint">Drag to move · Alt-drop to copy</span>
-        </div>
-        <div class="sb-new" id="new-bundle"></div>
+        <div id="undo-confirm" class="sb-undo-confirm" hidden></div>
         <div id="groups" class="sb-groups"></div>
       </section>
       <aside class="sb-right" id="detail"></aside>

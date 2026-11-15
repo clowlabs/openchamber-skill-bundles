@@ -36,6 +36,10 @@ export function closePopup() {
   open?.close();
 }
 
+export function isPopupOpen(): boolean {
+  return open !== null;
+}
+
 /** Create an empty menu shell; call `show` after filling it. Only one is open at a time. */
 export function createPopup(opts: PopupOptions): Popup & { show: (x: number, y: number) => void; items: () => HTMLElement[]; ensureFilter: (count: number, placeholder: string, onInput: (v: string) => void) => void } {
   closePopup();

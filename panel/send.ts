@@ -195,7 +195,7 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
     if (busy || bundleBlocked) return;
     const copy = Boolean(alt || dup());
     pop.close();
-    const run = deps.moveToBundle ?? ((skillId, target, src, cp) => commit((s) => moveSkillToBundle(s, skillId, target, src, cp)));
+    const run = deps.moveToBundle ?? ((skillId, target, src, cp) => commit((s) => moveSkillToBundle(s, skillId, target, src, cp), undefined, { label: cp ? 'duplicate skill' : 'move skill' }));
     run(id, to, from, copy);
   };
 

@@ -23,7 +23,7 @@ function modeTabs(root: HTMLElement, id: string) {
     root.title = `Manual edit needed: ${broken}`;
   }
   // The active tab follows the saved state; the render after the write moves it.
-  return mountTabs(root, { items, activeId: mode(id), onChange: (m) => { if (!broken) commit((s) => core.setOverride(s, id, m as Mode)); } });
+  return mountTabs(root, { items, activeId: mode(id), onChange: (m) => { if (!broken) commit((s) => core.setOverride(s, id, m as Mode), undefined, { label: 'set mode' }); } });
 }
 
 export function renderDetail(selected: string | null) {
@@ -63,7 +63,7 @@ export function renderDetail(selected: string | null) {
     const x = el('button', '', '×');
     x.title = broken ? HAND_EDIT : `Remove from ${b.name}`;
     x.disabled = !!broken;
-    if (!broken) x.addEventListener('click', () => commit((s) => core.moveSkill(s, id, b.id, UNBUNDLED, { copy: false })));
+    if (!broken) x.addEventListener('click', () => commit((s) => core.moveSkill(s, id, b.id, UNBUNDLED, { copy: false }), undefined, { label: 'remove from bundle' }));
     chip.appendChild(x);
     badges.appendChild(chip);
   }
@@ -75,7 +75,7 @@ export function renderDetail(selected: string | null) {
     mounts.push(mountSelect(add, {
       value: null, placeholder: '+ bundle', searchable: others.length > 6, disabled: !!broken,
       options: others.map((b) => ({ id: b.id, label: b.name, hint: b.enabled ? 'on' : 'off' })),
-      onChange: (to) => commit((s) => core.moveSkill(s, id, mine.length ? mine[0].id : UNBUNDLED, to, { copy: mine.length > 0 })),
+      onChange: (to) => commit((s) => core.moveSkill(s, id, mine.length ? mine[0].id : UNBUNDLED, to, { copy: mine.length > 0 }), undefined, { label: 'add to bundle' }),
     }));
   }
 
@@ -115,7 +115,7 @@ export function renderDetail(selected: string | null) {
   if (state.overrides[id] != null) {
     const c = el('span');
     row.appendChild(c);
-    mounts.push(mountButton(c, { label: 'Clear override', variant: 'ghost', size: 'xs', disabled: !!broken, onClick: () => commit((s) => core.setOverride(s, id, null)) }));
+    mounts.push(mountButton(c, { label: 'Clear override', variant: 'ghost', size: 'xs', disabled: !!broken, onClick: () => commit((s) => core.setOverride(s, id, null), undefined, { label: 'clear override' }) }));
     const bundleMode: Mode = mine.some((b) => b.enabled) ? 'auto' : 'off';
     if (bundleMode !== mode(id)) {
       const label = mine.length ? `its bundle${mine.length > 1 ? 's' : ''} (${mine.map((b) => b.name).join(', ')})` : 'being unbundled';

@@ -164,7 +164,17 @@ const withLock = <T>(fn: () => Promise<T>) => lock.withLock(fn);
 
 // ---------- load ----------
 
+const MAX_UNDO = 30;
+let undoStack: { state: State; label: string }[] = [];
+
+export const canUndo = () => S.loaded && undoStack.length > 0;
+export const undoDepth = () => undoStack.length;
+export const undoLabel = () => undoStack.at(-1)?.label ?? null;
+
+export type ChangeOpts = { label?: string; undoable?: boolean | 'clear' };
+
 export async function load() {
+  undoStack = [];
   await deriveHome();
   const [opencodeText, bundlesText] = await Promise.all([
     host.readFile(core.OPENCODE_PATH).then((r) => r.content),
@@ -340,16 +350,16 @@ async function reloadAfter(e: unknown) {
 }
 
 /** Queue a state change. `onAccepted` runs only once the change is on disk. */
-export function commit(fn: (s: State) => State, onAccepted?: () => void) {
+export function commit(fn: (s: State) => State, onAccepted?: () => void, opts?: ChangeOpts) {
   if (!S.loaded) return;
   void enqueue(async () => {
-    if (await applyChange(fn)) onAccepted?.();
+    if (await applyChange(fn, opts)) onAccepted?.();
   });
 }
 
 /** Turn a bundle on or off (flip when `on` is omitted) through the normal save path. */
 export function toggleBundle(bundleId: string, on?: boolean, onAccepted?: () => void) {
-  commit((s) => flip(bundleId, on)(s), onAccepted);
+  commit((s) => flip(bundleId, on)(s), onAccepted, { label: 'toggle bundle' });
 }
 
 const flip = (bundleId: string, on?: boolean) => (s: State) => {
@@ -359,8 +369,9 @@ const flip = (bundleId: string, on?: boolean) => (s: State) => {
 };
 
 /** Body of a commit; call only from inside the queue. True once on disk. */
-export async function applyChange(fn: (s: State) => State): Promise<boolean> {
+export async function applyChange(fn: (s: State) => State, opts?: ChangeOpts): Promise<boolean> {
   if (!S.state) return false;
+  const prev = S.state;
   let next: State;
   try {
     next = fn(S.state);
@@ -374,7 +385,35 @@ export async function applyChange(fn: (s: State) => State): Promise<boolean> {
     await reloadAfter(e);
     return false;
   }
+  if (opts?.undoable === 'clear') {
+    undoStack = [];
+  } else if (opts?.undoable !== false && prev && next !== prev && JSON.stringify(prev) !== JSON.stringify(next)) {
+    undoStack.push({ state: prev, label: opts?.label ?? 'change' });
+    if (undoStack.length > MAX_UNDO) undoStack.splice(0, undoStack.length - MAX_UNDO);
+  }
   return true;
+}
+
+/** Revert the most recent undoable state change. */
+export async function undo(): Promise<boolean> {
+  if (!canUndo() || pending() > 0) return false;
+  const entry = undoStack.at(-1);
+  if (!entry) return false;
+  const prev = entry.state;
+  let ok = false;
+  const ran = await enqueue(async () => {
+    ok = await applyChange((cur) => {
+      const managedProjects = [...new Set([...(prev.managedProjects ?? []), ...(cur.managedProjects ?? [])])];
+      return managedProjects.length ? { ...prev, managedProjects } : { ...prev };
+    }, { undoable: false });
+    if (ok && undoStack.at(-1)?.state === prev) {
+      undoStack.pop();
+      const liveIds = new Set((S.state?.bundles ?? []).map((b) => b.id));
+      S.createdBundles = S.createdBundles.filter((id) => liveIds.has(id));
+      hooks.renderLight();
+    }
+  });
+  return ran && ok;
 }
 
 export function saveDescription(id: string, text: string) {

@@ -14,15 +14,15 @@ import {
 import * as core from '../src/core.js';
 import type { Group, Mode } from '../src/core.js';
 import { closeSendMenu, initSend, openSendMenu, refreshSendMenu } from './send';
-import { initPopup, setHomeSource } from './popup';
+import { initPopup, isPopupOpen, setHomeSource } from './popup';
 import { openProjectsMenu, refreshProjectsMenu } from './projects';
 import { deferRender, endDrag, initDrag, isDragging, onPillDown } from './drag';
 import { renderDetail } from './detail';
 import { renderCompact, renderCompactBusy } from './compact';
-import { countsFromState, liveLine } from '../status/counts';
+import { countsFromState, formatTokens, liveLine, livePct, TOKENS_TITLE, tokensOf } from '../status/counts';
 import { $, el, HAND_EDIT, MODE_LABEL, UNBUNDLED, type Disposable } from './dom';
 import {
-  S, applyChange, bundlesOf, commit, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, toastError,
+  S, applyChange, bundlesOf, canUndo, commit, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, toastError, undo, undoDepth, undoLabel,
 } from './io';
 import { connectHost } from '@openchamber/sdk';
 
@@ -82,9 +82,11 @@ function renderStats() {
   if (!S.loaded) return;
   const c = countsFromState(S.state, S.allIds, S.opencodeText);
   const n = c.bundlesOn?.length ?? 0;
-  const tail = S.state ? ` · ${n} bundle${n === 1 ? '' : 's'} on · ~${c.chars.toLocaleString('en-US')} chars` : ' · from opencode.json';
-  const line = el('span', 'sb-stats-line', `${liveLine(c)}${tail}`);
-  line.title = 'Live = skills agents can use (allowed in opencode.json). Installed = skill folders plus built-ins.';
+  const text = S.state
+    ? `${c.live} live / ${c.installed} installed (${livePct(c)}%) · ${n} ${n === 1 ? 'bundle' : 'bundles'} on · ~${formatTokens(tokensOf(c.chars))} tokens`
+    : `${liveLine(c)} · from opencode.json`;
+  const line = el('span', 'sb-stats-line', text);
+  line.title = `Live = skills agents can use (allowed in opencode.json). Installed = skill folders plus built-ins.\n${TOKENS_TITLE}`;
   root.appendChild(line);
   if (pending()) {
     const span = el('span');
@@ -168,7 +170,7 @@ function renderGroup(g: Group, root: HTMLElement) {
     groupMounts.push(field);
     const done = () => {
       const n = name.trim();
-      if (n && n !== g.name) commit((s) => core.renameBundle(s, g.id, n), () => { V.renaming = null; });
+      if (n && n !== g.name) commit((s) => core.renameBundle(s, g.id, n), () => { V.renaming = null; }, { label: 'rename bundle' });
       else { V.renaming = null; render(); }
     };
     f.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(); if (e.key === 'Escape') { V.renaming = null; render(); } });
@@ -199,7 +201,7 @@ function renderGroup(g: Group, root: HTMLElement) {
         openProjectsMenu(g.id, e.clientX, e.clientY, pb);
       });
       const sw = el('span'); head.appendChild(sw);
-      groupMounts.push(mountSwitch(sw, { label: '', checked: g.enabled, onChange: (on) => commit((s) => core.setBundleEnabled(s, g.id, on)) }));
+      groupMounts.push(mountSwitch(sw, { label: '', checked: g.enabled, onChange: (on) => commit((s) => core.setBundleEnabled(s, g.id, on), undefined, { label: 'toggle bundle' }) }));
       const m = el('span'); head.appendChild(m);
       groupMounts.push(mountMenu(m, {
         label: '⋯', variant: 'ghost', size: 'xs',
@@ -213,7 +215,7 @@ function renderGroup(g: Group, root: HTMLElement) {
     const c = el('div', 'sb-confirm', `Delete "${g.name}"? Its skills stay installed.`);
     const a = el('span'), b = el('span');
     c.append(a, b);
-    groupMounts.push(mountButton(a, { label: 'Delete', variant: 'destructive', size: 'xs', loading: busy, onClick: () => commit((s) => core.deleteBundle(s, g.id), () => { V.confirmDelete = null; }) }));
+    groupMounts.push(mountButton(a, { label: 'Delete', variant: 'destructive', size: 'xs', loading: busy, onClick: () => commit((s) => core.deleteBundle(s, g.id), () => { V.confirmDelete = null; }, { label: 'delete bundle' }) }));
     groupMounts.push(mountButton(b, { label: 'Cancel', variant: 'ghost', size: 'xs', onClick: () => { V.confirmDelete = null; render(); } }));
     box.appendChild(c);
   }
@@ -284,7 +286,7 @@ const MODE_KEYS: Record<string, Mode> = { a: 'auto', c: 'called', o: 'off' };
 
 function setModeQuick(id: string, m: Mode) {
   if (fmError(id) || (m === 'called' && core.isBuiltin(id)) || mode(id) === m) return;
-  commit((s) => core.setOverride(s, id, m));
+  commit((s) => core.setOverride(s, id, m), undefined, { label: 'set mode' });
 }
 
 function onRowKey(e: KeyboardEvent, id: string, rows: HTMLElement[]) {
@@ -351,6 +353,22 @@ function renderLight() {
   renderStats();
   newField?.update({ disabled: !S.loaded });
   newButton?.update({ disabled: !S.loaded, loading: pending() > 0 });
+  const undoable = canUndo();
+  undoButton?.update({ disabled: !undoable || pending() > 0 });
+  const undoText = undoable ? `Undo ${undoLabel() ?? 'last change'} (Ctrl/Cmd+Z)` : 'Nothing to undo';
+  if (undoSpan) {
+    undoSpan.title = undoText;
+    undoSpan.querySelector('button')?.setAttribute('aria-label', undoText);
+  }
+  if (resetConfirmWrap) resetConfirmWrap.hidden = !skipUndoConfirm;
+  resetConfirmBtn?.update({ disabled: pending() > 0 });
+  if (undoConfirmSnapshot) {
+    if (!undoable || undoDepth() !== undoConfirmSnapshot.depth || undoLabel() !== undoConfirmSnapshot.label) {
+      closeUndoConfirm();
+    } else {
+      undoConfirmBtn?.update({ disabled: pending() > 0 });
+    }
+  }
 }
 
 /** Rail panel = compact hot-swap list; page and everything else = full editor. */
@@ -359,6 +377,9 @@ let compact = false;
 function render() {
   if (compact) { renderCompact($('compact')); return; }
   if (isDragging()) { deferRender(); renderLight(); return; }
+  const bundles = S.state?.bundles;
+  if (V.renaming && !bundles?.some((b) => b.id === V.renaming)) V.renaming = null;
+  if (V.confirmDelete && !bundles?.some((b) => b.id === V.confirmDelete)) V.confirmDelete = null;
   renderBanner();
   renderGroups();
   renderDetail(V.selected);
@@ -372,16 +393,108 @@ hooks.renderLight = renderLight;
 
 initDrag({
   canDrag: (id) => !fmError(id),
-  onDrop: (id, from, to, altKey) => commit((s) => core.moveSkill(s, id, from, to, { copy: altKey && to !== UNBUNDLED })),
+  onDrop: (id, from, to, altKey) => {
+    const copy = altKey && to !== UNBUNDLED;
+    commit((s) => core.moveSkill(s, id, from, to, { copy }), undefined, { label: copy ? 'duplicate skill' : 'move skill' });
+  },
   onClick: select,
   onEnd: render,
 });
+
+// ---------- undo ----------
+
+const SKIP_UNDO_CONFIRM_KEY = 'skill-bundles.skipUndoConfirm';
+let skipUndoConfirm = false;
+let storageOpts: { scope: 'device' } | undefined;
+
+function setSkipUndoConfirm(v: boolean) {
+  skipUndoConfirm = v;
+  if (v) {
+    void host.storage.set(SKIP_UNDO_CONFIRM_KEY, true, storageOpts).catch(() => {});
+  } else {
+    void host.storage.delete(SKIP_UNDO_CONFIRM_KEY, storageOpts).catch(() => {});
+  }
+}
+
+let undoConfirmMounts: Disposable[] = [];
+let undoConfirmBtn: ReturnType<typeof mountButton> | null = null;
+let undoConfirmSnapshot: { depth: number; label: string | null } | null = null;
+
+function closeUndoConfirm(restoreFocus = false) {
+  const bar = $('undo-confirm');
+  const hadFocus = bar.contains(document.activeElement);
+  undoConfirmMounts.forEach((m) => m.dispose());
+  undoConfirmMounts = [];
+  undoConfirmBtn = null;
+  undoConfirmSnapshot = null;
+  bar.textContent = '';
+  bar.hidden = true;
+  if (restoreFocus && hadFocus) {
+    const btn = undoSpan?.querySelector('button') as HTMLButtonElement | null;
+    if (btn && !btn.disabled) btn.focus();
+  }
+}
+
+function requestUndo() {
+  if (!canUndo() || pending() > 0) return;
+  if (skipUndoConfirm) {
+    closeUndoConfirm();
+    void undo();
+    return;
+  }
+  closeUndoConfirm();
+  const label = undoLabel();
+  undoConfirmSnapshot = { depth: undoDepth(), label };
+  const bar = $('undo-confirm');
+  bar.setAttribute('role', 'alertdialog');
+  bar.setAttribute('aria-label', 'Confirm undo');
+  bar.hidden = false;
+  bar.appendChild(el('span', 'sb-undo-msg', `Undo ${label ?? 'last change'}?`));
+
+  const remember = el('label', 'sb-undo-remember');
+  const chk = document.createElement('input');
+  chk.type = 'checkbox';
+  remember.append(chk, document.createTextNode("Don't ask again"));
+  bar.appendChild(remember);
+
+  const actions = el('span', 'sb-undo-actions');
+  const yes = el('span');
+  const no = el('span');
+  actions.append(yes, no);
+  bar.appendChild(actions);
+
+  undoConfirmBtn = mountButton(yes, {
+    label: 'Undo',
+    variant: 'default',
+    size: 'xs',
+    disabled: pending() > 0,
+    onClick: () => {
+      if (chk.checked) setSkipUndoConfirm(true);
+      closeUndoConfirm(true);
+      void undo();
+    },
+  });
+  undoConfirmMounts.push(
+    undoConfirmBtn,
+    mountButton(no, {
+      label: 'Cancel',
+      variant: 'ghost',
+      size: 'xs',
+      onClick: () => closeUndoConfirm(true),
+    }),
+  );
+  (yes.querySelector('button') as HTMLButtonElement | null)?.focus();
+}
 
 // ---------- boot ----------
 
 let tabsHandle: ReturnType<typeof mountTabs> | null = null;
 let newField: ReturnType<typeof mountTextField> | null = null;
 let newButton: ReturnType<typeof mountButton> | null = null;
+let undoButton: ReturnType<typeof mountButton> | null = null;
+let resetConfirmBtn: ReturnType<typeof mountButton> | null = null;
+let undoSpan: HTMLElement | null = null;
+let resetConfirmWrap: HTMLElement | null = null;
 let mounted = false;
 
 function mountChrome() {
@@ -390,6 +503,34 @@ function mountChrome() {
     activeId: V.tab,
     onChange: (id) => { closeSendMenu(); V.tab = id as typeof V.tab; tabsHandle!.update({ activeId: id }); render(); },
   });
+  const undoWrap = $('undo-wrap');
+  undoSpan = el('span');
+  resetConfirmWrap = el('span');
+  const resetLabel = 'Undo confirmation is off. Click to ask before undoing.';
+  resetConfirmWrap.title = resetLabel;
+  resetConfirmWrap.hidden = !skipUndoConfirm;
+  undoWrap.append(undoSpan, resetConfirmWrap);
+  undoButton = mountButton(undoSpan, { label: 'Undo', variant: 'secondary', size: 'xs', disabled: true, onClick: requestUndo });
+  undoSpan.querySelector('button')?.setAttribute('aria-keyshortcuts', 'Control+Z Meta+Z');
+  const undoConfirmBar = $('undo-confirm');
+  undoConfirmBar.addEventListener('keydown', (e) => {
+    if (!undoConfirmBar.hidden && e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeUndoConfirm(true);
+    }
+  });
+  resetConfirmBtn = mountButton(resetConfirmWrap, {
+    label: 'Ask',
+    variant: 'ghost',
+    size: 'xs',
+    onClick: () => {
+      setSkipUndoConfirm(false);
+      renderLight();
+    },
+  });
+  resetConfirmWrap.querySelector('button')?.setAttribute('aria-label', resetLabel);
+
   const search = mountSearchField($('search'), {
     value: '', placeholder: 'Search skills',
     onChange: (v) => { V.query = v.trim(); search.update({ value: v }); renderGroups(); },
@@ -409,10 +550,21 @@ function mountChrome() {
       return next;
     }, () => {
       if (name.trim() === n) { name = ''; newField?.update({ value: '' }); }
-    });
+    }, { label: 'create bundle' });
   };
   f.addEventListener('keydown', (e) => { if (e.key === 'Enter') create(); });
   newButton = mountButton(b, { label: 'New bundle', variant: 'secondary', disabled: true, onClick: create });
+
+  document.addEventListener('keydown', (e) => {
+    if (compact) return;
+    if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+    if (e.key.toLowerCase() !== 'z') return;
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable || target.closest('[contenteditable]'))) return;
+    if (isPopupOpen() || isDragging() || !canUndo() || pending() > 0) return;
+    e.preventDefault();
+    requestUndo();
+  });
 }
 
 async function boot() {
@@ -439,16 +591,25 @@ initSend({
   skillRef: (id) => S.skillRefs[id],
   enqueue,
   // Already inside the queue (copySkill runs there), so apply directly instead of commit().
-  markMoved: (id, dir) => applyChange((s) => core.markMovedToProject(s, id, dir)),
+  markMoved: (id, dir) => applyChange((s) => core.markMovedToProject(s, id, dir), { undoable: 'clear' }),
   toastError,
 });
 
 host.onReady((ctx) => {
   applyHostReady(ctx, document.documentElement);
+  storageOpts = ctx.features?.deviceStorage ? { scope: 'device' as const } : undefined;
   if (mounted) return;
   mounted = true;
   compact = ctx.surface === 'panel';
   document.body.classList.toggle('sb-compact', compact);
-  if (!compact) mountChrome();
+  if (!compact) {
+    mountChrome();
+    void host.storage.get(SKIP_UNDO_CONFIRM_KEY, storageOpts)
+      .then((val) => {
+        skipUndoConfirm = val === true;
+        renderLight();
+      })
+      .catch(() => {});
+  }
   void boot();
 });

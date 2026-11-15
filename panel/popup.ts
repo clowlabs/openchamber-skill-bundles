@@ -4,7 +4,7 @@ import { createProjectList, type ProjectList } from '../shared/panel/projects';
 
 import { createPopup as sharedCreatePopup, note as sharedNote, type PopupOptions } from '../shared/panel/popup';
 
-export { button, closePopup, place, replace } from '../shared/panel/popup';
+export { button, closePopup, isPopupOpen, place, replace } from '../shared/panel/popup';
 /** Skill Bundles' menus use the "sb-ctx" class names from styles.css. */
 export const createPopup = (opts: PopupOptions) => sharedCreatePopup({ classPrefix: 'sb-ctx', ...opts });
 export const note = (text: string) => sharedNote(text, 'sb-ctx');

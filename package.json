@@ -1,6 +1,6 @@
 {
   "name": "skill-bundles",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "private": true,
   "type": "module",
   "description": "Turn OpenCode skills on and off in named bundles.",

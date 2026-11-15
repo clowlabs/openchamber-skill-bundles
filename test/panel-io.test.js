@@ -1129,3 +1129,159 @@ test("openSendMenu filter input filters both bundles and projects", async () => 
     cleanupDom();
   }
 });
+
+// ---------- undo stack (panel/io.ts) ----------
+
+test("undo: tracks undoable commits with labels, reverts disk & state, and clears on load", async () => {
+  expect(io.canUndo()).toBe(false);
+  expect(io.undoLabel()).toBe(null);
+  expect(await io.undo()).toBe(false);
+
+  // First undoable change: enable bundle "b"
+  io.commit((s) => core.setBundleEnabled(s, "b", true), undefined, { label: "toggle bundle" });
+  await settle();
+  expect(io.canUndo()).toBe(true);
+  expect(io.undoLabel()).toBe("toggle bundle");
+  expect(io.S.state.bundles[0].enabled).toBe(true);
+
+  // Second undoable change: set override for alpha to "called"
+  io.commit((s) => core.setOverride(s, "alpha", "called"), undefined, { label: "set mode" });
+  await settle();
+  expect(io.canUndo()).toBe(true);
+  expect(io.undoLabel()).toBe("set mode");
+  expect(io.S.state.overrides.alpha).toBe("called");
+  expect(read("~/.config/opencode/skills/alpha/SKILL.md")).toContain("opencode/autoinvoke: false");
+
+  // Undo second change -> back to enabled=true, no override
+  expect(await io.undo()).toBe(true);
+  expect(io.S.state.overrides.alpha).toBeUndefined();
+  expect(io.S.state.bundles[0].enabled).toBe(true);
+  expect(core.parseBundles(read(core.BUNDLES_PATH)).overrides.alpha).toBeUndefined();
+  expect(read("~/.config/opencode/skills/alpha/SKILL.md")).not.toContain("autoinvoke: false");
+  expect(io.canUndo()).toBe(true);
+  expect(io.undoLabel()).toBe("toggle bundle");
+
+  // Undo first change -> back to enabled=false
+  expect(await io.undo()).toBe(true);
+  expect(io.S.state.bundles[0].enabled).toBe(false);
+  expect(core.parseBundles(read(core.BUNDLES_PATH)).bundles[0].enabled).toBe(false);
+  expect(io.canUndo()).toBe(false);
+  expect(io.undoLabel()).toBe(null);
+
+  // load() clears undoStack
+  io.commit((s) => core.setBundleEnabled(s, "b", true), undefined, { label: "toggle bundle" });
+  await settle();
+  expect(io.canUndo()).toBe(true);
+  await io.load();
+  expect(io.canUndo()).toBe(false);
+  expect(io.undoLabel()).toBe(null);
+});
+
+test("undo: { undoable: 'clear' } clears prior undoStack (e.g. markMovedToProject) while preserving projectCopies and overrides", async () => {
+  io.commit((s) => core.setBundleEnabled(s, "b", true), undefined, { label: "toggle bundle" });
+  await settle();
+  expect(io.canUndo()).toBe(true);
+  expect(io.undoLabel()).toBe("toggle bundle");
+
+  await io.enqueue(async () => {
+    expect(await io.applyChange((s) => core.markMovedToProject(s, "alpha", "~/work/app"), { undoable: "clear" })).toBe(true);
+  });
+  await settle();
+  expect(io.S.state.overrides.alpha).toBe("off");
+  expect(io.S.state.projectCopies).toEqual({ alpha: ["~/work/app"] });
+  expect(io.canUndo()).toBe(false);
+  expect(io.undoLabel()).toBe(null);
+});
+
+test("undo: undoing addBundleProject cleans up <proj>/.opencode/opencode.json and managedProjects", async () => {
+  fs.mkdirSync(real(PROJ), { recursive: true });
+  io.commit((s) => core.addBundleProject(s, "b", PROJ), undefined, { label: "add project" });
+  await settle();
+  expect(io.S.state.managedProjects).toEqual([PROJ]);
+  expect(JSON.parse(read(projFile)).permissions.filter((r) => r.action === "skill").map((r) => r.resource)).toEqual(["alpha", "beta"]);
+
+  expect(await io.undo()).toBe(true);
+  expect(io.S.state.managedProjects).toBeUndefined();
+  expect(core.parseBundles(read(core.BUNDLES_PATH)).managedProjects).toBeUndefined();
+  expect(JSON.parse(read(projFile)).permissions.filter((r) => r.action === "skill")).toEqual([]);
+  expect(io.canUndo()).toBe(false);
+});
+
+test("undo: caps stack at 30 entries, drops oldest 5, and returns false when pending() > 0", async () => {
+  for (let i = 0; i < 35; i++) {
+    const on = i % 2 === 0;
+    io.commit((s) => core.setBundleEnabled(s, "b", on), undefined, { label: `step ${i}` });
+  }
+  await settle();
+  expect(io.canUndo()).toBe(true);
+  expect(io.undoDepth()).toBe(30);
+  expect(io.undoLabel()).toBe("step 34");
+
+  // While a task is pending in the queue, undo() returns false immediately
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const blocker = io.enqueue(async () => { await gate; });
+  expect(await io.undo()).toBe(false);
+  release();
+  await blocker;
+
+  // Pop all 30 entries (step 34 down to step 5; steps 0..4 were dropped)
+  let count = 0;
+  while (io.canUndo()) {
+    expect(await io.undo()).toBe(true);
+    count++;
+  }
+  expect(count).toBe(30);
+  expect(io.canUndo()).toBe(false);
+  // step 4 set enabled=true, so step 5's prev had enabled=true (whereas initial state before step 0 was false)
+  expect(io.S.state.bundles[0].enabled).toBe(true);
+});
+
+test("undo: failed commit (RefusedError / LockedError) pushes nothing; failed undo() keeps entry", async () => {
+  io.commit((s) => core.setBundleEnabled(s, "b", true), undefined, { label: "toggle bundle" });
+  await settle();
+  expect(io.undoDepth()).toBe(1);
+
+  // RefusedError (incomplete discovery blocks 'called')
+  io.S.incomplete = true;
+  await io.enqueue(async () => {
+    expect(await io.applyChange((s) => core.setOverride(s, "alpha", "called"), { label: "refused" })).toBe(false);
+  });
+  await settle();
+  io.S.incomplete = false;
+  expect(io.undoDepth()).toBe(1);
+  expect(io.undoLabel()).toBe("toggle bundle");
+
+  // LockedError (CLI lock held) on commit and on undo()
+  const lock = JSON.stringify({ pid: 4242, host: "box", token: "t", time: Date.now() });
+  put(core.LOCK_PATH, lock);
+  await io.enqueue(async () => {
+    expect(await io.applyChange((s) => core.setBundleEnabled(s, "b", false), { label: "locked" })).toBe(false);
+  });
+  await settle();
+  expect(io.undoDepth()).toBe(1);
+  expect(io.undoLabel()).toBe("toggle bundle");
+
+  // Failed undo() keeps the entry on undoStack
+  expect(await io.undo()).toBe(false);
+  expect(io.canUndo()).toBe(true);
+  expect(io.undoDepth()).toBe(1);
+  expect(io.undoLabel()).toBe("toggle bundle");
+
+  // Release lock and undo succeeds
+  put(core.LOCK_PATH, core.RELEASED_MARKER);
+  expect(await io.undo()).toBe(true);
+  expect(io.canUndo()).toBe(false);
+  expect(io.S.state.bundles[0].enabled).toBe(false);
+});
+
+test("undo: no-op state change does not push an undo entry", async () => {
+  expect(io.canUndo()).toBe(false);
+  await io.enqueue(async () => {
+    expect(await io.applyChange((s) => core.parseBundles(core.serializeBundles(s)), { label: "noop" })).toBe(true);
+  });
+  await settle();
+  expect(io.canUndo()).toBe(false);
+  expect(io.undoDepth()).toBe(0);
+  expect(io.undoLabel()).toBe(null);
+});

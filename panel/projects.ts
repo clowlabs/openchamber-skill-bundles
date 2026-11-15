@@ -74,12 +74,12 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
       }
       if (bundle()?.projects?.some((d) => sameDir(d, dir))) { showErr('Already in this bundle'); return; }
       showErr('');
-      commit((s) => core.addBundleProject(s, bundleId, dir, homeOpt()), () => { input.value = ''; });
+      commit((s) => core.addBundleProject(s, bundleId, dir, homeOpt()), () => { input.value = ''; }, { label: 'add project' });
     })();
   });
 
   const toggle = (dir: string, on: boolean) => {
-    commit((s) => (on ? core.addBundleProject(s, bundleId, dir, homeOpt()) : core.removeBundleProject(s, bundleId, dir, homeOpt())));
+    commit((s) => (on ? core.addBundleProject(s, bundleId, dir, homeOpt()) : core.removeBundleProject(s, bundleId, dir, homeOpt())), undefined, { label: on ? 'add project' : 'remove project' });
   };
 
   const row = (label: string, dir: string, checked: boolean, extra?: string) => {
