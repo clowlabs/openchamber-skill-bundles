@@ -81,6 +81,40 @@ export async function readCounts(host: FileHost): Promise<SkillCounts> {
   return countsFromState(state, allIds, opencodeText);
 }
 
+/** Coalesce overlapping status refreshes so a ping mid-read triggers an immediate follow-up pass. */
+export function createStatusRefresher(
+  read: () => Promise<SkillCounts>,
+  paint: (c: SkillCounts) => void,
+  onError: (e: unknown) => void,
+) {
+  let reading = false;
+  let dirty = false;
+  let active: Promise<void> | null = null;
+  return function refresh(): Promise<void> {
+    if (reading) {
+      dirty = true;
+      return active ?? Promise.resolve();
+    }
+    reading = true;
+    active = (async () => {
+      try {
+        do {
+          dirty = false;
+          try {
+            paint(await read());
+          } catch (e) {
+            onError(e);
+          }
+        } while (dirty);
+      } finally {
+        reading = false;
+        active = null;
+      }
+    })();
+    return active;
+  };
+}
+
 /** "35 live / 212 installed" */
 export const liveLine = (c: SkillCounts) => `${c.live} live / ${c.installed} installed`;
 

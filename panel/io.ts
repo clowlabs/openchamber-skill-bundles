@@ -3,8 +3,10 @@ import { HostRequestError, type HostClient } from '@openchamber/sdk';
 import * as core from '../src/core.js';
 import type { Bundle, ChangePlan, PlanError, State } from '../src/core.js';
 import type { SkillRef } from '../src/discover.js';
+import { skillRoots } from '../src/discover.js';
 import seed from '../data/default-bundles.json';
 import { discoverSkills, type Unreachable } from './discover';
+import { broadcastChange, listenChanges } from './sync';
 import { errorCode, errText as hostErrText, pool, readOptional as readOpt } from '../shared/panel/host';
 import { createQueue } from '../shared/panel/queue';
 import { createPanelLock, LockedError, type PanelLock } from '../shared/panel/panel-lock';
@@ -15,6 +17,14 @@ import { homeFromDirs as sharedHomeFromDirs } from '../shared/panel/projects';
 /** The host client; main sets it at boot, tests pass a fake. */
 export let host: HostClient;
 export function setHost(h: HostClient) {
+  gen++;
+  lastDiskStamp = null;
+  configStamps = Object.create(null);
+  skillFileStamps = Object.create(null);
+  syncInFlight = null;
+  queuedSync = null;
+  deferredSync = null;
+  clearLockRetry();
   host = h;
   lock = createPanelLock({
     host: h,
@@ -78,8 +88,12 @@ export function orderBundles(bundles: readonly Bundle[]): Bundle[] {
     .map((x) => x.b);
 }
 
-/** Set by main: full and stats-only re-render. */
-export const hooks = { render: () => {}, renderLight: () => {} };
+/** Set by main: full, stats-only, and external-sync re-render. */
+export const hooks = {
+  render: () => {},
+  renderLight: () => {},
+  onExternalSync: () => hooks.render(),
+};
 
 /** `{ home }` for every core call that takes it. */
 export const homeOpt = () => (S.home ? { home: S.home } : {});
@@ -140,12 +154,30 @@ function setMd(id: string, text: string) {
 
 // ---------- write queue: every write runs here, one at a time, none dropped ----------
 
+let activeWrites = 0;
+
 const queue = createQueue({
   onQueued: () => hooks.renderLight(),
-  onSettled: () => hooks.render(),
+  onSettled: () => {
+    hooks.render();
+    if (deferredSync && queue.pending === 0) {
+      const next = deferredSync;
+      deferredSync = null;
+      void syncFromDisk(next).catch(() => {});
+    }
+  },
   onError: (e) => toastError(e, 'Saving failed'),
 });
-export const enqueue = queue.enqueue;
+export const enqueue: typeof queue.enqueue = (task) =>
+  queue.enqueue(async () => {
+    if (syncInFlight) await syncInFlight.catch(() => false);
+    activeWrites++;
+    try {
+      await task();
+    } finally {
+      activeWrites--;
+    }
+  });
 /** Writes queued or running. */
 export const pending = () => queue.pending;
 
@@ -162,6 +194,85 @@ export const readOptional = (path: string) => readOpt(host, path);
 
 const withLock = <T>(fn: () => Promise<T>) => lock.withLock(fn);
 
+// ---------- disk stamp & cross-surface sync ----------
+
+type SyncOpts = { full?: boolean };
+
+let gen = 0;
+let lastDiskStamp: string | null = null;
+let configStamps: Record<string, string> = Object.create(null);
+let skillFileStamps: Record<string, string> = Object.create(null);
+let syncInFlight: Promise<boolean> | null = null;
+let queuedSync: SyncOpts | null = null;
+let deferredSync: SyncOpts | null = null;
+let lockRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let lockRetryDeadline = 0;
+let lockRetryOpts: SyncOpts | null = null;
+
+function clearLockRetry() {
+  if (lockRetryTimer != null) {
+    clearTimeout(lockRetryTimer);
+    lockRetryTimer = null;
+  }
+  lockRetryDeadline = 0;
+  lockRetryOpts = null;
+}
+
+function mergeSyncOpts(a: SyncOpts | null, b?: SyncOpts): SyncOpts {
+  return a?.full || b?.full ? { full: true } : {};
+}
+
+const statStamp = (p: string): Promise<string> =>
+  host.stat(p).then(
+    (st) => `${st.kind}:${st.size}:${st.mtime}`,
+    (e) => `err:${errorCode(e) || 'ERR'}`,
+  );
+
+function configStampPaths(opencodeText: string | null): string[] {
+  return [core.BUNDLES_PATH, core.OPENCODE_PATH, core.LOCK_PATH, ...skillRoots(opencodeText)];
+}
+
+async function readStampsMap(paths: readonly string[]): Promise<Record<string, string>> {
+  const unique = [...new Set(paths)];
+  const out: Record<string, string> = Object.create(null);
+  await pool(unique, 16, async (p) => {
+    out[p] = await statStamp(p);
+  });
+  return out;
+}
+
+function computeConfigStamp(opencodeText: string | null, stamps: Record<string, string>): string {
+  return configStampPaths(opencodeText).map((p) => `${p}=${stamps[p] ?? ''}`).join('|');
+}
+
+function computeSkillsStamp(skillPaths: Record<string, string>, stamps: Record<string, string>): string {
+  const sorted = Object.values(skillPaths).sort();
+  return sorted.map((p) => `${p}=${stamps[p] ?? ''}`).join('|');
+}
+
+function combineStamp(
+  opencodeText: string | null,
+  cfgStamps: Record<string, string>,
+  skillPaths: Record<string, string>,
+  skStamps: Record<string, string>,
+): string {
+  return `${computeConfigStamp(opencodeText, cfgStamps)}||${computeSkillsStamp(skillPaths, skStamps)}`;
+}
+
+async function readDiskStamp(): Promise<string> {
+  const [cfgStamps, freshSkillStamps] = await Promise.all([
+    readStampsMap(configStampPaths(S.opencodeText)),
+    readStampsMap(Object.values(S.skillPaths).sort()),
+  ]);
+  return combineStamp(S.opencodeText, cfgStamps, S.skillPaths, freshSkillStamps);
+}
+
+async function readReleasedLockStamp(): Promise<string> {
+  const lockText = await readOptional(core.LOCK_PATH);
+  if (lockText !== core.RELEASED_MARKER) return '';
+  return statStamp(core.LOCK_PATH);
+}
+
 // ---------- load ----------
 
 const MAX_UNDO = 30;
@@ -174,17 +285,26 @@ export const undoLabel = () => undoStack.at(-1)?.label ?? null;
 export type ChangeOpts = { label?: string; undoable?: boolean | 'clear' };
 
 export async function load() {
+  const myGen = ++gen;
+  queuedSync = null;
+  deferredSync = null;
+  clearLockRetry();
   undoStack = [];
   await deriveHome();
+  const preConfigStamps = await readStampsMap([core.BUNDLES_PATH, core.OPENCODE_PATH, core.LOCK_PATH]);
   const [opencodeText, bundlesText] = await Promise.all([
     host.readFile(core.OPENCODE_PATH).then((r) => r.content),
     readOptional(core.BUNDLES_PATH),
   ]);
+  const roots = skillRoots(opencodeText);
+  const preRootStamps = await readStampsMap(roots);
   const { skills, unreachable } = await discoverSkills(host, opencodeText);
   const discoveredIds = Object.keys(skills);
   const allIds = [...new Set([...discoveredIds, ...core.BUILTIN_SKILLS])].sort();
   const skillPaths: Record<string, string> = Object.create(null);
   for (const id of discoveredIds) skillPaths[id] = skills[id].path;
+  const sortedSkillPaths = Object.values(skillPaths).sort();
+  const preSkillStamps = await readStampsMap(sortedSkillPaths);
 
   const incomplete = unreachable.length > 0;
   const unreadable: string[] = [];
@@ -213,6 +333,42 @@ export async function load() {
   S.bundlesText = bundlesText;
   S.state = bundlesText == null ? null : core.parseBundles(bundlesText, homeOpt());
   S.loaded = true;
+  if (myGen === gen) {
+    try {
+      const [held, postConfigStamps, postSkillStamps] = await Promise.all([
+        isLockHeld(),
+        readStampsMap(configStampPaths(opencodeText)),
+        readStampsMap(sortedSkillPaths),
+      ]);
+      if (myGen === gen) {
+        const nextSkillStamps: Record<string, string> = Object.create(null);
+        let skillsStable = true;
+        for (const p of sortedSkillPaths) {
+          if (preSkillStamps[p] === postSkillStamps[p]) {
+            nextSkillStamps[p] = postSkillStamps[p];
+          } else {
+            skillsStable = false;
+          }
+        }
+        skillFileStamps = nextSkillStamps;
+        const cfgStable =
+          !held &&
+          [core.BUNDLES_PATH, core.OPENCODE_PATH, core.LOCK_PATH].every((p) => preConfigStamps[p] === postConfigStamps[p]) &&
+          roots.every((r) => preRootStamps[r] === postConfigStamps[r]);
+        if (cfgStable && skillsStable) {
+          configStamps = postConfigStamps;
+          lastDiskStamp = combineStamp(opencodeText, postConfigStamps, skillPaths, nextSkillStamps);
+        } else {
+          configStamps = Object.create(null);
+          lastDiskStamp = null;
+        }
+      }
+    } catch {
+      lastDiskStamp = null;
+      configStamps = Object.create(null);
+      skillFileStamps = Object.create(null);
+    }
+  }
 }
 
 // ---------- save ----------
@@ -266,7 +422,16 @@ async function save(next: State) {
   // Refuse early, before taking the lock (project files read now; re-read under the lock).
   const projectTexts = await readProjectTexts(next);
   const first = planFor(next, projectTexts);
-  await withLock(() => saveLocked(next, first, projectTexts));
+  const { writtenSkillIds, lockedCfgStamps, lockedSkillStamps } = await withLock(() => saveLocked(next, first, projectTexts));
+  try {
+    const lockStamp = await readReleasedLockStamp();
+    configStamps = { ...lockedCfgStamps, [core.LOCK_PATH]: lockStamp };
+    for (const [p, st] of Object.entries(lockedSkillStamps)) skillFileStamps[p] = st;
+    lastDiskStamp = combineStamp(S.opencodeText, configStamps, S.skillPaths, skillFileStamps);
+  } catch {
+    // Best effort: checkDisk will resync if stat failed.
+  }
+  broadcastChange(writtenSkillIds.length > 0 ? { full: true } : undefined);
 }
 
 // Order: core.PUBLISH_ORDER (SKILL.md, project files, opencode.json, skill-bundles.json last).
@@ -313,6 +478,13 @@ async function saveLocked(next: State, first: ChangePlan, firstTexts: ProjectTex
   }
   S.state = plan.state ?? next;
   toastSkipped(plan.skipped);
+  const writtenSkillIds = skillIds(plan);
+  const writtenPaths = [...new Set(writtenSkillIds.map((id) => skillPath(id)))];
+  const [lockedCfgStamps, lockedSkillStamps] = await Promise.all([
+    readStampsMap([core.BUNDLES_PATH, core.OPENCODE_PATH, ...skillRoots(S.opencodeText)]),
+    readStampsMap(writtenPaths),
+  ]);
+  return { writtenSkillIds, lockedCfgStamps, lockedSkillStamps };
 }
 
 /** Skill ids allowed by a project file text we generated. */
@@ -402,11 +574,12 @@ export async function undo(): Promise<boolean> {
   const prev = entry.state;
   let ok = false;
   const ran = await enqueue(async () => {
+    if (!canUndo() || undoStack.at(-1) !== entry) return;
     ok = await applyChange((cur) => {
       const managedProjects = [...new Set([...(prev.managedProjects ?? []), ...(cur.managedProjects ?? [])])];
       return managedProjects.length ? { ...prev, managedProjects } : { ...prev };
     }, { undoable: false });
-    if (ok && undoStack.at(-1)?.state === prev) {
+    if (ok && undoStack.at(-1) === entry) {
       undoStack.pop();
       const liveIds = new Set((S.state?.bundles ?? []).map((b) => b.id));
       S.createdBundles = S.createdBundles.filter((id) => liveIds.has(id));
@@ -425,16 +598,27 @@ export function saveDescription(id: string, text: string) {
     try {
       if (S.incomplete) throw new RefusedError(`some skill folders could not be read, so it is unclear which SKILL.md ${id} uses`);
       apply(S.skillMds[id]); // refuse early, before taking the lock
+      const p = skillPath(id);
+      let lockedSkillStamp = '';
       await withLock(async () => {
         // Apply to the file as it is now, so a CLI mode change since load survives.
-        const p = skillPath(id);
         const fresh = await readOptional(p);
         if (fresh == null) throw new StaleError(`${p} disappeared`);
         if (fresh !== S.skillMds[id]) setMd(id, fresh);
         const next = apply(fresh);
         if (next !== fresh) await host.writeFile(p, next);
         setMd(id, next);
+        lockedSkillStamp = await statStamp(p);
       });
+      try {
+        const lockStamp = await readReleasedLockStamp();
+        skillFileStamps[p] = lockedSkillStamp;
+        configStamps[core.LOCK_PATH] = lockStamp;
+        lastDiskStamp = combineStamp(S.opencodeText, configStamps, S.skillPaths, skillFileStamps);
+      } catch {
+        // Best effort.
+      }
+      broadcastChange({ full: true });
     } catch (e) {
       if (e instanceof RefusedError && S.descDraft?.id === id) S.descDraft = null;
       await reloadAfter(e);
@@ -454,4 +638,319 @@ export function seedDefaults() {
       await reloadAfter(e);
     }
   });
+}
+
+// ---------- background sync ----------
+
+const sameArr = (a: readonly string[], b: readonly string[]) =>
+  a.length === b.length && a.every((v, i) => v === b[i]);
+
+const sameRec = (a: Record<string, string>, b: Record<string, string>) => {
+  const ak = Object.keys(a);
+  const bk = Object.keys(b);
+  return ak.length === bk.length && ak.every((k) => Object.hasOwn(b, k) && a[k] === b[k]);
+};
+
+const sameUnreach = (a: readonly Unreachable[], b: readonly Unreachable[]) =>
+  a.length === b.length && a.every((u, i) => u.path === b[i].path && u.code === b[i].code);
+
+function hasUnknownSkill(st: State | null, allIds: readonly string[]): boolean {
+  if (!st) return false;
+  const known = new Set(allIds);
+  for (const b of st.bundles) {
+    for (const id of b.skills) {
+      if (!core.isBuiltin(id) && !known.has(id)) return true;
+    }
+  }
+  for (const id of Object.keys(st.overrides)) {
+    if (!core.isBuiltin(id) && !known.has(id)) return true;
+  }
+  return false;
+}
+
+async function isLockHeld(): Promise<boolean> {
+  const lockText = await readOptional(core.LOCK_PATH);
+  if (lockText == null) return false;
+  const info = core.parseLock(lockText);
+  if (info.kind === 'released') return false;
+  const st = await host.stat(core.LOCK_PATH).catch(() => ({ kind: 'missing' as const, size: 0, mtime: 0 }));
+  const mtimeMs = st.kind === 'missing' ? 0 : st.mtime < 1e12 ? st.mtime * 1000 : st.mtime;
+  return core.classifyLock(info, { now: Date.now(), mtimeMs }) === 'held';
+}
+
+function scheduleLockRetry(opts?: SyncOpts) {
+  lockRetryOpts = mergeSyncOpts(lockRetryOpts, opts);
+  const now = Date.now();
+  if (lockRetryDeadline === 0) lockRetryDeadline = now + lockTiming.waitMs;
+  if (now >= lockRetryDeadline) {
+    clearLockRetry();
+    return;
+  }
+  if (lockRetryTimer != null) return;
+  lockRetryTimer = setTimeout(() => {
+    lockRetryTimer = null;
+    if (!S.loaded) {
+      clearLockRetry();
+      return;
+    }
+    // Keep lockRetryOpts until runSync finishes a stable snapshot.
+    void syncFromDisk().catch(() => {});
+  }, lockTiming.pollMs);
+}
+
+async function runSync(opts?: SyncOpts): Promise<boolean> {
+  const myGen = gen;
+  if (!S.loaded || activeWrites > 0) return false;
+
+  const effectiveOpts = mergeSyncOpts(lockRetryOpts, opts);
+  if (lockRetryTimer != null) {
+    clearTimeout(lockRetryTimer);
+    lockRetryTimer = null;
+  }
+
+  if (await isLockHeld()) {
+    scheduleLockRetry(effectiveOpts);
+    return false;
+  }
+  if (myGen !== gen || !S.loaded || activeWrites > 0) return false;
+
+  const oldCfgPaths = configStampPaths(S.opencodeText);
+  const preConfigStamps = await readStampsMap(oldCfgPaths);
+  if (myGen !== gen || !S.loaded || activeWrites > 0) return false;
+
+  const [opencodeText, bundlesText] = await Promise.all([
+    host.readFile(core.OPENCODE_PATH).then((r) => r.content),
+    readOptional(core.BUNDLES_PATH),
+  ]);
+  if (myGen !== gen || !S.loaded) return false;
+  if (activeWrites > 0) {
+    deferredSync = mergeSyncOpts(deferredSync, effectiveOpts);
+    return false;
+  }
+
+  const newCfgPaths = configStampPaths(opencodeText);
+  const addedCfgPaths = newCfgPaths.filter((p) => !oldCfgPaths.includes(p));
+  const preNewRootStamps = addedCfgPaths.length ? await readStampsMap(addedCfgPaths) : (Object.create(null) as Record<string, string>);
+  if (myGen !== gen || !S.loaded) return false;
+  if (activeWrites > 0) {
+    deferredSync = mergeSyncOpts(deferredSync, effectiveOpts);
+    return false;
+  }
+
+  const nextState = bundlesText == null ? null : core.parseBundles(bundlesText, homeOpt());
+  const needsFull =
+    Boolean(effectiveOpts.full) ||
+    JSON.stringify(skillRoots(opencodeText)) !== JSON.stringify(skillRoots(S.opencodeText)) ||
+    hasUnknownSkill(nextState, S.allIds);
+
+  let nextAllIds = S.allIds;
+  let nextSkillRefs = S.skillRefs;
+  let nextSkillPaths = S.skillPaths;
+  let nextIncomplete = S.incomplete;
+  let nextUnreachable = S.unreachable;
+  let nextUnreadable = S.unreadable;
+  let nextMds = S.skillMds;
+  let nextSkillStamps: Record<string, string> | null = null;
+
+  if (needsFull) {
+    const { skills, unreachable } = await discoverSkills(host, opencodeText);
+    if (myGen !== gen || !S.loaded) return false;
+    const discoveredIds = Object.keys(skills);
+    nextAllIds = [...new Set([...discoveredIds, ...core.BUILTIN_SKILLS])].sort();
+    nextSkillRefs = skills;
+    nextSkillPaths = Object.create(null) as Record<string, string>;
+    for (const id of discoveredIds) nextSkillPaths[id] = skills[id].path;
+    nextIncomplete = unreachable.length > 0;
+    nextUnreachable = unreachable;
+    nextSkillStamps = await readStampsMap(Object.values(nextSkillPaths).sort());
+    if (myGen !== gen || !S.loaded) return false;
+
+    const unreadable: string[] = [];
+    const mds: Record<string, string> = {};
+    const unreadablePrev = new Set(S.unreadable);
+    await pool(discoveredIds, 8, async (id) => {
+      const p = nextSkillPaths[id];
+      const st = nextSkillStamps?.[p];
+      if (
+        S.skillPaths[id] === p &&
+        !unreadablePrev.has(id) &&
+        Object.hasOwn(S.skillMds, id) &&
+        st != null &&
+        skillFileStamps[p] === st
+      ) {
+        mds[id] = S.skillMds[id];
+        return;
+      }
+      try {
+        const text = await readOptional(p);
+        if (text != null) mds[id] = text;
+      } catch (e) {
+        const code = errorCode(e);
+        if (code !== 'DENIED' && code !== 'BAD_PATH' && code !== 'FILE_TOO_LARGE') throw e;
+        unreachable.push({ path: p, code });
+        unreadable.push(id);
+      }
+    });
+    nextUnreadable = unreadable.sort();
+    nextMds = mds;
+  }
+
+  if (myGen !== gen || !S.loaded) return false;
+  if (activeWrites > 0) {
+    deferredSync = mergeSyncOpts(deferredSync, mergeSyncOpts(effectiveOpts, { full: needsFull }));
+    return false;
+  }
+
+  // Double-read snapshot stability validation: re-check lock and stamps after all reads.
+  if (await isLockHeld()) {
+    scheduleLockRetry(mergeSyncOpts(effectiveOpts, { full: needsFull }));
+    return false;
+  }
+  if (myGen !== gen || !S.loaded) return false;
+
+  const allCfgPaths = [...new Set([...oldCfgPaths, ...newCfgPaths])];
+  const [postConfigStamps, postSkillStamps] = await Promise.all([
+    readStampsMap(allCfgPaths),
+    needsFull ? readStampsMap(Object.values(nextSkillPaths).sort()) : Promise.resolve(null),
+  ]);
+  if (myGen !== gen || !S.loaded) return false;
+  if (activeWrites > 0) {
+    deferredSync = mergeSyncOpts(deferredSync, mergeSyncOpts(effectiveOpts, { full: needsFull }));
+    return false;
+  }
+
+  const cfgStable =
+    oldCfgPaths.every((p) => postConfigStamps[p] === preConfigStamps[p]) &&
+    addedCfgPaths.every((p) => postConfigStamps[p] === preNewRootStamps[p]);
+  const skillsStable =
+    !needsFull ||
+    (nextSkillStamps != null &&
+      postSkillStamps != null &&
+      computeSkillsStamp(nextSkillPaths, postSkillStamps) === computeSkillsStamp(nextSkillPaths, nextSkillStamps));
+
+  if (!cfgStable || !skillsStable) {
+    scheduleLockRetry(mergeSyncOpts(effectiveOpts, { full: needsFull }));
+    return false;
+  }
+
+  clearLockRetry();
+  const nextCfgStamps: Record<string, string> = Object.create(null);
+  for (const p of newCfgPaths) nextCfgStamps[p] = postConfigStamps[p];
+  configStamps = nextCfgStamps;
+  if (needsFull && postSkillStamps) {
+    skillFileStamps = postSkillStamps;
+  }
+  lastDiskStamp = combineStamp(opencodeText, configStamps, nextSkillPaths, skillFileStamps);
+
+  const configChanged = opencodeText !== S.opencodeText || bundlesText !== S.bundlesText;
+  const changed =
+    configChanged ||
+    !sameArr(nextAllIds, S.allIds) ||
+    !sameRec(nextSkillPaths, S.skillPaths) ||
+    nextIncomplete !== S.incomplete ||
+    !sameArr(nextUnreadable, S.unreadable) ||
+    !sameUnreach(nextUnreachable, S.unreachable) ||
+    !sameRec(nextMds, S.skillMds);
+
+  if (!changed) return false;
+
+  if (configChanged) {
+    undoStack = [];
+    const liveIds = new Set((nextState?.bundles ?? []).map((b) => b.id));
+    S.createdBundles = S.createdBundles.filter((id) => liveIds.has(id));
+  }
+
+  const prevMds = S.skillMds;
+  S.allIds = nextAllIds;
+  S.skillRefs = nextSkillRefs;
+  S.skillPaths = nextSkillPaths;
+  S.unreachable = nextUnreachable;
+  S.incomplete = nextIncomplete;
+  S.unreadable = nextUnreadable;
+  S.skillMds = nextMds;
+  if (needsFull) fm.clear();
+  S.opencodeText = opencodeText;
+  S.bundlesText = bundlesText;
+  S.state = nextState;
+
+  if (S.descDraft && prevMds[S.descDraft.id] !== S.skillMds[S.descDraft.id]) {
+    if (S.skillMds[S.descDraft.id] != null && meta(S.descDraft.id).description === S.descDraft.value) {
+      S.descDraft = null;
+    }
+  }
+
+  hooks.onExternalSync();
+  return true;
+}
+
+/** Refresh panel state from disk without flashing the loading spinner or queuing a write. */
+export async function syncFromDisk(opts?: SyncOpts): Promise<boolean> {
+  if (!S.loaded) return false;
+  if (activeWrites > 0) {
+    deferredSync = mergeSyncOpts(deferredSync, opts);
+    return false;
+  }
+  if (syncInFlight) {
+    queuedSync = mergeSyncOpts(queuedSync, opts);
+    return syncInFlight;
+  }
+  let active!: Promise<boolean>;
+  active = (async () => {
+    let changed = false;
+    let cur: SyncOpts | undefined = opts;
+    try {
+      while (true) {
+        if (activeWrites > 0) {
+          deferredSync = mergeSyncOpts(deferredSync, cur);
+          if (queuedSync) {
+            deferredSync = mergeSyncOpts(deferredSync, queuedSync);
+            queuedSync = null;
+          }
+          break;
+        }
+        if (await runSync(cur)) changed = true;
+        if (!queuedSync || !S.loaded) break;
+        cur = queuedSync;
+        queuedSync = null;
+      }
+      return changed;
+    } finally {
+      if (syncInFlight === active) syncInFlight = null;
+    }
+  })();
+  syncInFlight = active;
+  return active;
+}
+
+/** Stat key files and sync from disk if anything changed externally. */
+export async function checkDisk(): Promise<boolean> {
+  if (!S.loaded || activeWrites > 0) return false;
+  const stamp = await readDiskStamp();
+  if (!S.loaded || activeWrites > 0 || stamp === lastDiskStamp) return false;
+  return syncFromDisk({ full: true });
+}
+
+/** Subscribe to cross-frame sync pings, visibility/focus checks, and background polling. */
+export function startSync(pollMs = 1500): () => void {
+  const stopListen = listenChanges(({ full }) => {
+    void syncFromDisk({ full }).catch(() => {});
+  });
+  const onCheck = () => {
+    void checkDisk().catch(() => {});
+  };
+  const onVis = () => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') onCheck();
+  };
+  const timer = setInterval(() => {
+    if (typeof document === 'undefined' || document.visibilityState !== 'hidden') onCheck();
+  }, pollMs);
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis);
+  if (typeof window !== 'undefined') window.addEventListener('focus', onCheck);
+  return () => {
+    stopListen();
+    clearInterval(timer);
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis);
+    if (typeof window !== 'undefined') window.removeEventListener('focus', onCheck);
+    clearLockRetry();
+  };
 }

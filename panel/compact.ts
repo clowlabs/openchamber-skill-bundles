@@ -18,8 +18,9 @@ let escOff: (() => void) | null = null;
 const skillCount = (n: number) => `${n} skill${n === 1 ? '' : 's'}`;
 
 export function renderCompact(root: HTMLElement) {
-  const hadFocus = root.contains(document.activeElement) || moveFocus;
-  const onSwitch = !moveFocus && !!document.activeElement?.closest('.sb-c-title .sb-c-switch');
+  const docFocused = typeof document.hasFocus === 'function' ? document.hasFocus() : true;
+  const hadFocus = (docFocused && root.contains(document.activeElement)) || moveFocus;
+  const onSwitch = !moveFocus && docFocused && !!document.activeElement?.closest('.sb-c-title .sb-c-switch');
   moveFocus = false;
   mounts.forEach((m) => m.dispose());
   mounts = [];

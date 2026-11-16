@@ -698,6 +698,7 @@ function installMenuDom() {
     }
     setAttribute(k, v) { this.attrs[k] = String(v); }
     getAttribute(k) { return this.attrs[k] ?? null; }
+    hasAttribute(k) { return k in this.attrs; }
     append(...nodes) { for (const n of nodes) this.appendChild(n); }
     appendChild(n) {
       if (n.parent) n.parent.children = n.parent.children.filter((x) => x !== n);
@@ -1130,6 +1131,301 @@ test("openSendMenu filter input filters both bundles and projects", async () => 
   }
 });
 
+// ---------- cross-surface sync (panel/sync.ts + panel/io.ts + panel/compact.ts) ----------
+
+test("syncFromDisk fast path updates S.state and fires render with zero SKILL.md reads", async () => {
+  const skillReads = [];
+  const h = fakeHost();
+  const origRead = h.readFile;
+  h.readFile = async (p) => {
+    if (p.endsWith(".md")) skillReads.push(p);
+    return origRead(p);
+  };
+  io.setHost(h);
+  await io.load();
+  skillReads.length = 0;
+
+  let renders = 0;
+  const prevRender = io.hooks.render;
+  io.hooks.render = () => { renders++; prevRender(); };
+  try {
+    // External write duplicates "alpha" into a second bundle on disk
+    const nextState = core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [
+        { id: "b", name: "B", enabled: false, skills: ["alpha", "beta"] },
+        { id: "b2", name: "B2", enabled: true, skills: ["alpha"] },
+      ],
+      overrides: {},
+    }));
+    put(core.BUNDLES_PATH, core.serializeBundles(nextState));
+
+    expect(await io.syncFromDisk()).toBe(true);
+    expect(renders).toBe(1);
+    expect(skillReads).toEqual([]);
+    expect(io.S.state.bundles.find((b) => b.id === "b2").skills).toEqual(["alpha"]);
+  } finally {
+    io.hooks.render = prevRender;
+  }
+});
+
+test("syncFromDisk({ full: true }) refreshes beta's SKILL.md description", async () => {
+  let renders = 0;
+  const prevRender = io.hooks.render;
+  io.hooks.render = () => { renders++; prevRender(); };
+  try {
+    put("~/.config/opencode/skills/beta/SKILL.md", skillMd("Beta updated on disk"));
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(real("~/.config/opencode/skills/beta/SKILL.md"), future, future);
+    expect(await io.syncFromDisk({ full: true })).toBe(true);
+    expect(renders).toBe(1);
+    expect(io.meta("beta").description).toBe("Beta updated on disk");
+  } finally {
+    io.hooks.render = prevRender;
+  }
+});
+
+test("broadcastChange + listenChanges sends no skill IDs, coalesces bursts, and ignores self and malformed payloads", async () => {
+  const sync = await import("../panel/sync.ts");
+  const makeWin = () => {
+    const listeners = new Set();
+    const posted = [];
+    return {
+      parent: null,
+      posted,
+      addEventListener(t, fn) { if (t === "message") listeners.add(fn); },
+      removeEventListener(t, fn) { if (t === "message") listeners.delete(fn); },
+      postMessage(data) {
+        posted.push(data);
+        for (const fn of [...listeners]) fn({ data });
+      },
+    };
+  };
+  const winA = makeWin();
+  const winB = makeWin();
+  const parent = { frames: [winA, winB] };
+  winA.parent = parent;
+  winB.parent = parent;
+
+  const receivedA = [];
+  const receivedB = [];
+  const offA = sync.listenChanges((opts) => receivedA.push(opts), winA);
+  const offB = sync.listenChanges((opts) => receivedB.push(opts), winB);
+  try {
+    // Broadcast from winA posts to sibling winB (not winA), with zero skill names
+    sync.broadcastChange({ full: true }, winA);
+    expect(winA.posted).toEqual([]);
+    expect(winB.posted.length).toBe(1);
+    const msg = winB.posted[0];
+    expect(msg.channel).toBe("skill-bundles.sync");
+    expect(msg.v).toBe(1);
+    expect(typeof msg.sender).toBe("string");
+    expect(msg.full).toBe(true);
+    expect("skills" in msg).toBe(false);
+
+    // Self-messages (same sender as this module) are ignored by listenChanges
+    winA.postMessage(msg);
+    await Promise.resolve();
+    expect(receivedA).toEqual([]);
+    expect(receivedB).toEqual([]);
+
+    // Burst of messages in the same microtask coalesces into one callback with full = OR
+    winB.postMessage({ channel: "skill-bundles.sync", v: 1, sender: `${msg.sender}-other` });
+    winB.postMessage({ channel: "skill-bundles.sync", v: 1, sender: `${msg.sender}-other`, full: true });
+    winB.postMessage({ channel: "skill-bundles.sync", v: 1, sender: `${msg.sender}-other` });
+    await Promise.resolve();
+    expect(receivedB).toEqual([{ full: true }]);
+
+    // Malformed / wrong-channel / wrong-version messages are ignored
+    winB.postMessage(null);
+    winB.postMessage("bad");
+    winB.postMessage({ channel: "other", v: 1, sender: "x" });
+    winB.postMessage({ channel: "skill-bundles.sync", v: 2, sender: "x" });
+    winB.postMessage({ channel: "skill-bundles.sync", v: 1, sender: 123 });
+    await Promise.resolve();
+    expect(receivedB.length).toBe(1);
+
+    // A non-full message delivers { full: false }
+    winB.postMessage({ channel: "skill-bundles.sync", v: 1, sender: "other-frame" });
+    await Promise.resolve();
+    expect(receivedB[1]).toEqual({ full: false });
+  } finally {
+    offA();
+    offB();
+  }
+});
+
+test("checkDisk detects external edits, clears stale undoStack, and is a no-op when unchanged or after own commit", async () => {
+  let reads = 0;
+  let renders = 0;
+  const h = fakeHost();
+  const origRead = h.readFile;
+  h.readFile = async (p) => { reads++; return origRead(p); };
+  io.setHost(h);
+  await io.load();
+
+  const prevRender = io.hooks.render;
+  io.hooks.render = () => { renders++; prevRender(); };
+  try {
+    // Perform an undoable commit in this frame
+    io.commit((s) => core.setBundleEnabled(s, "b", true), undefined, { label: "enable b" });
+    await settle();
+    expect(io.canUndo()).toBe(true);
+    reads = 0;
+    renders = 0;
+
+    // Immediately checking disk after own commit is a complete no-op
+    expect(await io.checkDisk()).toBe(false);
+    expect(reads).toBe(0);
+    expect(renders).toBe(0);
+    expect(io.canUndo()).toBe(true);
+
+    // External CLI-style edit on disk (bump mtime & change content)
+    const nextState = core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B", enabled: false, skills: ["alpha"] }],
+      overrides: {},
+    }));
+    put(core.BUNDLES_PATH, core.serializeBundles(nextState));
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(real(core.BUNDLES_PATH), future, future);
+
+    expect(await io.checkDisk()).toBe(true);
+    expect(renders).toBe(1);
+    expect(io.canUndo()).toBe(false);
+    expect(io.S.state.bundles[0].skills).toEqual(["alpha"]);
+
+    // Second checkDisk with no changes is again a 0-read, 0-render no-op
+    reads = 0;
+    renders = 0;
+    expect(await io.checkDisk()).toBe(false);
+    expect(reads).toBe(0);
+    expect(renders).toBe(0);
+  } finally {
+    io.hooks.render = prevRender;
+  }
+});
+
+test("syncFromDisk defers reading while lock is held and retries once released", async () => {
+  const cliLock = JSON.stringify({ pid: 4242, host: "box", token: "cli-1", time: Date.now() });
+  put(core.LOCK_PATH, cliLock);
+  // Write a mid-transaction bundles change that shouldn't be read until lock releases
+  const updated = core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [{ id: "b", name: "B", enabled: true, skills: ["alpha", "beta"] }],
+    overrides: {},
+  }));
+  put(core.BUNDLES_PATH, core.serializeBundles(updated));
+
+  let renders = 0;
+  const prevRender = io.hooks.render;
+  io.hooks.render = () => { renders++; prevRender(); };
+  try {
+    expect(await io.syncFromDisk()).toBe(false);
+    expect(io.S.state.bundles[0].enabled).toBe(false);
+    expect(renders).toBe(0);
+
+    // Release the lock; bounded retry timer should pick up the new state
+    put(core.LOCK_PATH, core.RELEASED_MARKER);
+    await new Promise((r) => setTimeout(r, 40));
+    expect(io.S.state.bundles[0].enabled).toBe(true);
+    expect(renders).toBe(1);
+  } finally {
+    io.hooks.render = prevRender;
+  }
+});
+
+test("compact renderCompact updates skill counts and open bundle list without stealing focus when unfocused", async () => {
+  const cleanupDom = installMenuDom();
+  const prevRender = io.hooks.render;
+  const prevStyle = Object.getOwnPropertyDescriptor(globalThis, "HTMLStyleElement");
+  try {
+    // Start with 1 skill in bundle "b"
+    put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B", enabled: false, skills: ["alpha"] }],
+      overrides: {},
+    }))));
+    await io.load();
+
+    // Add querySelectorAll support for compact selectors on NodeEl
+    const NodeProto = globalThis.HTMLElement.prototype;
+    const origQsa = NodeProto.querySelectorAll;
+    NodeProto.querySelectorAll = function (sel) {
+      const out = origQsa.call(this, sel);
+      if (out.length) return out;
+      const walk = (n, pred) => {
+        for (const c of n.children) {
+          if (pred(c)) out.push(c);
+          walk(c, pred);
+        }
+      };
+      if (sel === ".sb-c-row") walk(this, (el) => el.classList.contains("sb-c-row"));
+      else if (sel === ".sb-c-meta") walk(this, (el) => el.classList.contains("sb-c-meta"));
+      else if (sel === ".sb-c-skill-id") walk(this, (el) => el.classList.contains("sb-c-skill-id"));
+      else if (sel === ".sb-c-skill-desc") walk(this, (el) => el.classList.contains("sb-c-skill-desc"));
+      else if (sel === "button, input, [tabindex]") walk(this, (el) => el.tag === "BUTTON" || el.tag === "INPUT" || "tabindex" in el.attrs);
+      return out;
+    };
+
+    let focused = true;
+    globalThis.HTMLStyleElement = class extends globalThis.HTMLElement {};
+    globalThis.document.hasFocus = () => focused;
+    globalThis.document.getElementById = () => null;
+    globalThis.document.head = globalThis.document.createElement("head");
+    globalThis.document.documentElement = globalThis.document.createElement("html");
+
+    const compactMod = await import("../panel/compact.ts");
+    const root = globalThis.document.createElement("div");
+    globalThis.document.body.appendChild(root);
+
+    io.hooks.render = () => compactMod.renderCompact(root);
+    compactMod.renderCompact(root);
+
+    const row = root.querySelectorAll(".sb-c-row")[0];
+    expect(root.querySelectorAll(".sb-c-meta")[0].textContent).toBe("1 skill");
+
+    // Drill into bundle "b"
+    row.click();
+    expect(root.querySelectorAll(".sb-c-skill-id").map((e) => e.textContent)).toEqual(["alpha"]);
+    expect(root.querySelectorAll(".sb-c-skill-desc").map((e) => e.textContent)).toEqual(["Alpha"]);
+
+    // Simulate user working in another iframe (document.hasFocus() === false, activeElement elsewhere)
+    const externalFocus = globalThis.document.createElement("button");
+    let focusCalls = 0;
+    const origFocus = NodeProto.focus;
+    NodeProto.focus = function () {
+      if (root.contains(this)) focusCalls++;
+      return origFocus.call(this);
+    };
+    focused = false;
+    externalFocus.focus();
+
+    // Sync a second skill + updated description from disk
+    put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B", enabled: false, skills: ["alpha", "beta"] }],
+      overrides: {},
+    }))));
+    put("~/.config/opencode/skills/beta/SKILL.md", skillMd("Beta fresh"));
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(real("~/.config/opencode/skills/beta/SKILL.md"), future, future);
+    expect(await io.syncFromDisk({ full: true })).toBe(true);
+
+    // Open bundle preserved with updated count, skills, descriptions, and zero focus steals
+    expect(root.querySelectorAll(".sb-c-meta")[0].textContent).toBe("2 skills · off");
+    expect(root.querySelectorAll(".sb-c-skill-id").map((e) => e.textContent)).toEqual(["alpha", "beta"]);
+    expect(root.querySelectorAll(".sb-c-skill-desc").map((e) => e.textContent)).toEqual(["Alpha", "Beta fresh"]);
+    expect(focusCalls).toBe(0);
+    expect(globalThis.document.activeElement).toBe(externalFocus);
+  } finally {
+    if (prevStyle) Object.defineProperty(globalThis, "HTMLStyleElement", prevStyle);
+    else delete globalThis.HTMLStyleElement;
+    io.hooks.render = prevRender;
+    cleanupDom();
+  }
+});
+
 // ---------- undo stack (panel/io.ts) ----------
 
 test("undo: tracks undoable commits with labels, reverts disk & state, and clears on load", async () => {
@@ -1284,4 +1580,590 @@ test("undo: no-op state change does not push an undo entry", async () => {
   expect(io.canUndo()).toBe(false);
   expect(io.undoDepth()).toBe(0);
   expect(io.undoLabel()).toBe(null);
+});
+
+// ---------- review-astra regression tests ----------
+
+test("1. torn snapshot between runSync reads and post-read stamp check does not poison lastDiskStamp", async () => {
+  let armed = false;
+  let injected = false;
+  const h = fakeHost();
+  const origRead = h.readFile;
+  h.readFile = async (p) => {
+    const res = await origRead(p);
+    // Simulate a concurrent external write finishing right after bundlesText is read
+    if (armed && !injected && p === core.BUNDLES_PATH) {
+      injected = true;
+      const next = core.parseBundles(JSON.stringify({
+        version: 1,
+        bundles: [{ id: "b", name: "B", enabled: true, skills: ["alpha", "beta"] }],
+        overrides: {},
+      }));
+      put(core.BUNDLES_PATH, core.serializeBundles(next));
+      const future = new Date(Date.now() + 5000);
+      fs.utimesSync(real(core.BUNDLES_PATH), future, future);
+    }
+    return res;
+  };
+  io.setHost(h);
+  await io.load();
+  armed = true;
+
+  // The torn read must abort without mutating S.state or advancing lastDiskStamp
+  expect(await io.syncFromDisk()).toBe(false);
+  expect(injected).toBe(true);
+  expect(io.S.state.bundles[0].enabled).toBe(false);
+
+  // Subsequent checkDisk sees the un-poisoned stamp mismatch and converges to enabled: true
+  expect(await io.checkDisk()).toBe(true);
+  expect(io.S.state.bundles[0].enabled).toBe(true);
+});
+
+test("2. queued write waits for syncInFlight to commit fresh S.state and survives syncInFlight failure", async () => {
+  // Part A: write queued while syncInFlight is mid-read waits and succeeds without StaleError
+  let releaseRead;
+  const readGate = new Promise((r) => { releaseRead = r; });
+  const h = fakeHost();
+  const origRead = h.readFile;
+  let blockOnce = false;
+  h.readFile = async (p) => {
+    if (blockOnce && p === core.BUNDLES_PATH) {
+      blockOnce = false;
+      await readGate;
+    }
+    return origRead(p);
+  };
+  io.setHost(h);
+  await io.load();
+  blockOnce = true;
+
+  // External write creates a second bundle b2 on disk
+  const ext = core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [
+      { id: "b", name: "B", enabled: false, skills: ["alpha", "beta"] },
+      { id: "b2", name: "B2", enabled: true, skills: ["alpha"] },
+    ],
+    overrides: {},
+  }));
+  put(core.BUNDLES_PATH, core.serializeBundles(ext));
+
+  const syncP = io.syncFromDisk();
+  // Queue a write on bundle "b" while syncInFlight is paused mid-read
+  io.commit((s) => core.setBundleEnabled(s, "b", true), undefined, { label: "enable b" });
+  releaseRead();
+  await syncP;
+  await settle();
+
+  expect(toasts.some((t) => t.kind === "error")).toBe(false);
+  expect(io.S.state.bundles.find((b) => b.id === "b").enabled).toBe(true);
+  expect(io.S.state.bundles.find((b) => b.id === "b2").enabled).toBe(true);
+
+  // Part B: a failing syncInFlight does not cause a queued write to fail
+  let failSyncRead = true;
+  h.readFile = async (p) => {
+    if (failSyncRead && p === core.OPENCODE_PATH) {
+      failSyncRead = false;
+      throw new HostRequestError("DENIED", "transient read error");
+    }
+    return origRead(p);
+  };
+  const failingSync = io.syncFromDisk();
+  let writeRan = false;
+  io.commit((s) => { writeRan = true; return core.setBundleEnabled(s, "b", false); });
+  await expect(failingSync).rejects.toThrow("transient read error");
+  await settle();
+  expect(writeRan).toBe(true);
+  expect(io.S.state.bundles.find((b) => b.id === "b").enabled).toBe(false);
+});
+
+test("3. full:true hitting a held lock preserves full:true across a later full:false ping", async () => {
+  const cliLock = JSON.stringify({ pid: 4242, host: "box", token: "cli-1", time: Date.now() });
+  put(core.LOCK_PATH, cliLock);
+  put("~/.config/opencode/skills/beta/SKILL.md", skillMd("Beta updated under lock"));
+  const future = new Date(Date.now() + 5000);
+  fs.utimesSync(real("~/.config/opencode/skills/beta/SKILL.md"), future, future);
+
+  expect(await io.syncFromDisk({ full: true })).toBe(false);
+  expect(io.meta("beta").description).toBe("Beta");
+
+  // Release lock and immediately send a non-full ping before retry timer fires
+  put(core.LOCK_PATH, core.RELEASED_MARKER);
+  expect(await io.syncFromDisk({ full: false })).toBe(true);
+  expect(io.meta("beta").description).toBe("Beta updated under lock");
+});
+
+test("4. >256 skills modified on disk: full sync refreshes all 260 descriptions without truncation", async () => {
+  const ids = Array.from({ length: 260 }, (_, i) => `sk${String(i).padStart(3, "0")}`);
+  for (const id of ids) put(`~/.config/opencode/skills/${id}/SKILL.md`, skillMd(`v1-${id}`));
+  await io.load();
+  expect(io.S.allIds.length).toBeGreaterThanOrEqual(260);
+
+  const future = new Date(Date.now() + 5000);
+  for (const id of ids) {
+    const p = `~/.config/opencode/skills/${id}/SKILL.md`;
+    put(p, skillMd(`v2-${id}`));
+    fs.utimesSync(real(p), future, future);
+  }
+  expect(await io.syncFromDisk({ full: true })).toBe(true);
+  for (const id of ids) {
+    expect(io.meta(id).description).toBe(`v2-${id}`);
+  }
+});
+
+test("5. Work Status refresher coalesces mid-flight sync ping into an immediate follow-up readCounts", async () => {
+  let calls = 0;
+  let releaseFirst;
+  const firstGate = new Promise((r) => { releaseFirst = r; });
+  const painted = [];
+  const refresh = counts.createStatusRefresher(
+    async () => {
+      calls++;
+      if (calls === 1) {
+        await firstGate;
+        return { live: 1, installed: 4, chars: 180, bundlesOn: ["b"], fromOpencode: false };
+      }
+      return { live: 3, installed: 4, chars: 540, bundlesOn: ["b"], fromOpencode: false };
+    },
+    (c) => painted.push(c.live),
+    () => {},
+  );
+
+  const p1 = refresh();
+  // Ping arrives while first readCounts is still in flight
+  const p2 = refresh();
+  releaseFirst();
+  await Promise.all([p1, p2]);
+  expect(calls).toBe(2);
+  expect(painted).toEqual([1, 3]);
+});
+
+test("6. active Page editing (detail textarea / rename) preserves draft on external sync and broadcastChange leaks no skill names", async () => {
+  const sync = await import("../panel/sync.ts");
+  const cleanupDom = installMenuDom();
+  const prevExternal = io.hooks.onExternalSync;
+  const prevStyle = Object.getOwnPropertyDescriptor(globalThis, "HTMLStyleElement");
+  try {
+    globalThis.HTMLStyleElement = class extends globalThis.HTMLElement {};
+    globalThis.document.hasFocus = () => true;
+    globalThis.document.getElementById = (id) => (id === "detail" ? detailEl : null);
+    globalThis.document.head = globalThis.document.createElement("head");
+    globalThis.document.documentElement = globalThis.document.createElement("html");
+    const detailEl = globalThis.document.createElement("div");
+    detailEl.id = "detail";
+    globalThis.document.body.appendChild(detailEl);
+
+    // Verify broadcastChange never includes skill names
+    const posted = [];
+    const winA = { parent: null };
+    const winB = { postMessage: (d) => posted.push(d) };
+    winA.parent = { frames: [winA, winB] };
+    sync.broadcastChange({ full: true }, winA);
+    expect(posted).toEqual([{ channel: "skill-bundles.sync", v: 1, sender: posted[0].sender, full: true }]);
+    expect(JSON.stringify(posted)).not.toContain("alpha");
+
+    // Simulate active textarea editing in #detail with S.descDraft set
+    const ta = globalThis.document.createElement("textarea");
+    detailEl.appendChild(ta);
+    ta.focus();
+    io.S.descDraft = { id: "alpha", value: "User typing draft" };
+
+    // External sync updates bundle state; onExternalSync defers DOM rebuild while textarea is focused,
+    // and flushes once focus leaves
+    let deferredRenders = 0;
+    let blurAttached = false;
+    io.hooks.onExternalSync = () => {
+      if (globalThis.document.activeElement === ta) {
+        if (!blurAttached) {
+          blurAttached = true;
+          globalThis.document.addEventListener("focusout", () => {
+            blurAttached = false;
+            deferredRenders++;
+          });
+        }
+        return;
+      }
+      deferredRenders++;
+    };
+
+    const next = core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B", enabled: true, skills: ["alpha", "beta"] }],
+      overrides: {},
+    }));
+    put(core.BUNDLES_PATH, core.serializeBundles(next));
+    expect(await io.syncFromDisk()).toBe(true);
+    expect(deferredRenders).toBe(0);
+    expect(io.S.descDraft).toEqual({ id: "alpha", value: "User typing draft" });
+    expect(globalThis.document.activeElement).toBe(ta);
+
+    // Blur flushes the deferred render
+    globalThis.document.dispatchKey("focusout");
+    expect(deferredRenders).toBe(1);
+  } finally {
+    if (prevStyle) Object.defineProperty(globalThis, "HTMLStyleElement", prevStyle);
+    else delete globalThis.HTMLStyleElement;
+    io.hooks.onExternalSync = prevExternal;
+    cleanupDom();
+  }
+});
+
+test("7. checkDisk detects direct SKILL.md edits and custom opencode.json skill roots without config/lock changes", async () => {
+  // Direct edit to existing SKILL.md without touching bundles/opencode/lock
+  put("~/.config/opencode/skills/alpha/SKILL.md", skillMd("Alpha direct edit"));
+  const future = new Date(Date.now() + 5000);
+  fs.utimesSync(real("~/.config/opencode/skills/alpha/SKILL.md"), future, future);
+  expect(await io.checkDisk()).toBe(true);
+  expect(io.meta("alpha").description).toBe("Alpha direct edit");
+
+  // Even after an unrelated fast-path bundle sync, a direct SKILL.md edit is NOT masked
+  const next = core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [{ id: "b", name: "B", enabled: true, skills: ["alpha", "beta"] }],
+    overrides: {},
+  }));
+  put(core.BUNDLES_PATH, core.serializeBundles(next));
+  fs.utimesSync(real(core.BUNDLES_PATH), future, future);
+  expect(await io.syncFromDisk({ full: false })).toBe(true);
+
+  put("~/.config/opencode/skills/beta/SKILL.md", skillMd("Beta direct edit after fast sync"));
+  const future2 = new Date(Date.now() + 10000);
+  fs.utimesSync(real("~/.config/opencode/skills/beta/SKILL.md"), future2, future2);
+  expect(await io.checkDisk()).toBe(true);
+  expect(io.meta("beta").description).toBe("Beta direct edit after fast sync");
+
+  // Custom root in opencode.json skills array
+  put(core.OPENCODE_PATH, JSON.stringify({ $schema: "x", skills: ["~/extra-root"], permissions: [] }, null, 2) + "\n");
+  fs.utimesSync(real(core.OPENCODE_PATH), future2, future2);
+  await io.load();
+  put("~/extra-root/custom-one/SKILL.md", skillMd("From extra root"));
+  fs.utimesSync(real("~/extra-root"), future2, future2);
+  expect(await io.checkDisk()).toBe(true);
+  expect(io.S.allIds).toContain("custom-one");
+  expect(io.meta("custom-one").description).toBe("From extra root");
+});
+
+test("8. undo() revalidates undoStack after syncInFlight and aborts when external bundle edit cleared it", async () => {
+  // Pause syncFromDisk mid-read while an external bundle is added on disk
+  let releaseRead;
+  const readGate = new Promise((r) => { releaseRead = r; });
+  const h = fakeHost();
+  const origRead = h.readFile;
+  let blockOnce = false;
+  h.readFile = async (p) => {
+    if (blockOnce && p === core.BUNDLES_PATH) {
+      blockOnce = false;
+      await readGate;
+    }
+    return origRead(p);
+  };
+  io.setHost(h);
+  await io.load();
+  // Create an undoable commit
+  io.commit((s) => core.setBundleEnabled(s, "b", true), undefined, { label: "enable b" });
+  await settle();
+  expect(io.canUndo()).toBe(true);
+
+  const ext = core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [
+      { id: "b", name: "B", enabled: true, skills: ["alpha", "beta"] },
+      { id: "ext", name: "Ext", enabled: false, skills: ["alpha"] },
+    ],
+    overrides: {},
+  }));
+  put(core.BUNDLES_PATH, core.serializeBundles(ext));
+  const future = new Date(Date.now() + 5000);
+  fs.utimesSync(real(core.BUNDLES_PATH), future, future);
+
+  blockOnce = true;
+  const syncP = io.syncFromDisk();
+  // Queue undo() while syncInFlight is active
+  const undoP = io.undo();
+  releaseRead();
+  await syncP;
+  expect(await undoP).toBe(false);
+  expect(io.S.state.bundles.map((b) => b.id)).toEqual(["b", "ext"]);
+  expect(core.parseBundles(read(core.BUNDLES_PATH)).bundles.map((b) => b.id)).toEqual(["b", "ext"]);
+});
+
+test("9. saveDescription does not mask external BUNDLES_PATH edits and root-changing sync does not swallow concurrent bundle edits", async () => {
+  // (a) External BUNDLES_PATH edit while saveDescription runs
+  const ext = core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [
+      { id: "b", name: "B", enabled: false, skills: ["alpha", "beta"] },
+      { id: "ext2", name: "Ext2", enabled: true, skills: ["beta"] },
+    ],
+    overrides: {},
+  }));
+  put(core.BUNDLES_PATH, core.serializeBundles(ext));
+  const future = new Date(Date.now() + 5000);
+  fs.utimesSync(real(core.BUNDLES_PATH), future, future);
+
+  io.saveDescription("alpha", "Alpha desc while bundles edited");
+  await settle();
+  await settle();
+  expect(read("~/.config/opencode/skills/alpha/SKILL.md")).toContain("description: Alpha desc while bundles edited");
+  // checkDisk must still see the external BUNDLES_PATH change
+  expect(await io.checkDisk()).toBe(true);
+  expect(io.S.state.bundles.map((b) => b.id)).toEqual(["b", "ext2"]);
+
+  // (b) Full sync where opencode.json changed AND a concurrent write modifies BUNDLES_PATH during root discovery
+  let injected = false;
+  const h = fakeHost();
+  const origListDir = h.listDir;
+  h.listDir = async (p) => {
+    const res = await origListDir(p);
+    if (!injected && p === "~/new-root") {
+      injected = true;
+      const newer = core.parseBundles(JSON.stringify({
+        version: 1,
+        bundles: [
+          { id: "b", name: "B", enabled: false, skills: ["alpha", "beta"] },
+          { id: "ext3", name: "Ext3", enabled: true, skills: ["alpha"] },
+        ],
+        overrides: {},
+      }));
+      put(core.BUNDLES_PATH, core.serializeBundles(newer));
+      const future2 = new Date(Date.now() + 10000);
+      fs.utimesSync(real(core.BUNDLES_PATH), future2, future2);
+    }
+    return res;
+  };
+  io.setHost(h);
+  await io.load();
+
+  put("~/new-root/n1/SKILL.md", skillMd("New root skill"));
+  put(core.OPENCODE_PATH, JSON.stringify({ $schema: "x", skills: ["~/new-root"], permissions: [] }, null, 2) + "\n");
+  fs.utimesSync(real(core.OPENCODE_PATH), future, future);
+
+  // Sync detects the torn snapshot and returns false without poisoning lastDiskStamp
+  expect(await io.syncFromDisk({ full: true })).toBe(false);
+  expect(injected).toBe(true);
+  // Subsequent checkDisk sees both the new root and ext3
+  expect(await io.checkDisk()).toBe(true);
+  expect(io.S.state.bundles.map((b) => b.id)).toEqual(["b", "ext3"]);
+  expect(io.S.allIds).toContain("n1");
+});
+
+test("10. createEditGuard stays armed across rename->textarea focus transitions and flushes when leaving all editing controls", async () => {
+  const { createEditGuard } = await import("../panel/edit-guard.ts");
+  const cleanupDom = installMenuDom();
+  try {
+    const renameInput = globalThis.document.createElement("input");
+    const detailTextarea = globalThis.document.createElement("textarea");
+    const outsideButton = globalThis.document.createElement("button");
+    globalThis.document.body.append(renameInput, detailTextarea, outsideButton);
+
+    let defers = 0;
+    let renders = 0;
+    const guard = createEditGuard({
+      isEditing: () => globalThis.document.activeElement === renameInput || globalThis.document.activeElement === detailTextarea,
+      isTargetDeleted: () => false,
+      onDefer: () => { defers++; },
+      onRender: () => { renders++; },
+    });
+
+    // Focus rename input and trigger external sync -> deferred
+    renameInput.focus();
+    guard.onExternalSync();
+    expect(defers).toBe(1);
+    expect(renders).toBe(0);
+    expect(guard.isPending()).toBe(true);
+
+    // Move focus directly from rename input into detail textarea -> still editing, so no render yet
+    detailTextarea.focus();
+    globalThis.document.dispatchKey("focusout");
+    await Promise.resolve();
+    expect(renders).toBe(0);
+    expect(guard.isPending()).toBe(true);
+
+    // Move focus outside all editing controls -> flushes render once
+    outsideButton.focus();
+    globalThis.document.dispatchKey("focusout");
+    await Promise.resolve();
+    expect(renders).toBe(1);
+    expect(guard.isPending()).toBe(false);
+    guard.dispose();
+  } finally {
+    cleanupDom();
+  }
+});
+
+test("11. createStatusRefresher recovers on dirty retry when first read rejects", async () => {
+  let calls = 0;
+  let rejectFirst;
+  const firstGate = new Promise((_r, rej) => { rejectFirst = rej; });
+  const painted = [];
+  const errors = [];
+  const refresh = counts.createStatusRefresher(
+    async () => {
+      calls++;
+      if (calls === 1) return firstGate;
+      return { live: 2, installed: 4, chars: 360, bundlesOn: ["b"], fromOpencode: false };
+    },
+    (c) => painted.push(c.live),
+    (e) => errors.push(e.message),
+  );
+
+  const p1 = refresh();
+  // Concurrent ping marks dirty while first read is pending
+  const p2 = refresh();
+  rejectFirst(new Error("transient read failure"));
+  await Promise.all([p1, p2]);
+  expect(calls).toBe(2);
+  expect(errors).toEqual(["transient read failure"]);
+  expect(painted).toEqual([2]);
+});
+
+test("12. load() validates before/after stamps so mid-load SKILL.md edits are caught by checkDisk", async () => {
+  let editedMidLoad = false;
+  const h = fakeHost();
+  const origRead = h.readFile;
+  h.readFile = async (p) => {
+    const res = await origRead(p);
+    if (!editedMidLoad && p === "~/.config/opencode/skills/alpha/SKILL.md") {
+      editedMidLoad = true;
+      put(p, skillMd("Alpha edited mid-load"));
+      const future = new Date(Date.now() + 5000);
+      fs.utimesSync(real(p), future, future);
+    }
+    return res;
+  };
+  io.setHost(h);
+  await io.load();
+  expect(editedMidLoad).toBe(true);
+  expect(io.meta("alpha").description).toBe("Alpha");
+
+  // Because load() detected the mid-load stamp change, checkDisk() must return true and reconcile
+  expect(await io.checkDisk()).toBe(true);
+  expect(io.meta("alpha").description).toBe("Alpha edited mid-load");
+});
+
+test("13. createEditGuard preserves Save button click across pointerdown -> focusout -> pointerup -> click", async () => {
+  const { createEditGuard } = await import("../panel/edit-guard.ts");
+  const cleanupDom = installMenuDom();
+  try {
+    const renameInput = globalThis.document.createElement("input");
+    const saveBtn = globalThis.document.createElement("button");
+    globalThis.document.body.append(renameInput, saveBtn);
+
+    let renders = 0;
+    let saveClicks = 0;
+    saveBtn.addEventListener("click", () => {
+      if (saveBtn.isConnected) saveClicks++;
+    });
+
+    const guard = createEditGuard({
+      isEditing: () => globalThis.document.activeElement === renameInput,
+      isTargetDeleted: () => false,
+      onDefer: () => {},
+      onRender: () => {
+        renders++;
+        saveBtn.remove(); // simulate DOM rebuild replacing Save button
+      },
+    });
+
+    renameInput.focus();
+    guard.onExternalSync();
+    expect(guard.isPending()).toBe(true);
+
+    // 1. pointerdown on Save -> focusout on input + focus leaves input
+    globalThis.document.dispatchKey("pointerdown");
+    saveBtn.focus();
+    globalThis.document.dispatchKey("focusout");
+
+    // 2. Microtasks drain: Save button must still be connected and no render yet
+    await Promise.resolve();
+    expect(renders).toBe(0);
+    expect(saveBtn.isConnected).toBe(true);
+
+    // 3. pointerup + click on Save
+    globalThis.document.dispatchKey("pointerup");
+    saveBtn.click();
+    globalThis.document.dispatchKey("click");
+    expect(saveClicks).toBe(1);
+
+    // 4. Macrotask timer drains: deferred render flushes cleanly after click
+    await new Promise((r) => setTimeout(r, 10));
+    expect(renders).toBe(1);
+    expect(guard.isPending()).toBe(false);
+    guard.dispose();
+  } finally {
+    cleanupDom();
+  }
+});
+
+test("14. createEditGuard defers sync arriving mid-press between pointerdown and pointerup/click", async () => {
+  const { createEditGuard } = await import("../panel/edit-guard.ts");
+  const cleanupDom = installMenuDom();
+  try {
+    const renameInput = globalThis.document.createElement("input");
+    const saveBtn = globalThis.document.createElement("button");
+    globalThis.document.body.append(renameInput, saveBtn);
+
+    let renders = 0;
+    let saveClicks = 0;
+    saveBtn.addEventListener("click", () => {
+      if (saveBtn.isConnected) saveClicks++;
+    });
+
+    const guard = createEditGuard({
+      isEditing: () => globalThis.document.activeElement === renameInput,
+      isTargetDeleted: () => false,
+      onDefer: () => {},
+      onRender: () => {
+        renders++;
+        saveBtn.remove();
+      },
+    });
+
+    // Case A: deferred sync -> pointerdown -> focusout -> SECOND onExternalSync mid-press -> pointerup -> click
+    renameInput.focus();
+    guard.onExternalSync();
+    expect(guard.isPending()).toBe(true);
+
+    globalThis.document.dispatchKey("pointerdown");
+    saveBtn.focus();
+    globalThis.document.dispatchKey("focusout");
+    guard.onExternalSync(); // second sync arrives while pointerActive is true and input already blurred
+    await Promise.resolve();
+    expect(renders).toBe(0);
+    expect(saveBtn.isConnected).toBe(true);
+
+    globalThis.document.dispatchKey("pointerup");
+    saveBtn.click();
+    globalThis.document.dispatchKey("click");
+    expect(saveClicks).toBe(1);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(renders).toBe(1);
+    expect(guard.isPending()).toBe(false);
+
+    // Case B: FIRST onExternalSync arrives between pointerdown (after blur) and pointerup -> click
+    globalThis.document.body.appendChild(saveBtn);
+    renders = 0;
+    saveClicks = 0;
+    renameInput.focus();
+    globalThis.document.dispatchKey("pointerdown");
+    saveBtn.focus();
+    globalThis.document.dispatchKey("focusout");
+    guard.onExternalSync(); // first sync ever arrives mid-press
+    expect(guard.isPending()).toBe(true);
+    await Promise.resolve();
+    expect(renders).toBe(0);
+    expect(saveBtn.isConnected).toBe(true);
+
+    globalThis.document.dispatchKey("pointerup");
+    saveBtn.click();
+    globalThis.document.dispatchKey("click");
+    expect(saveClicks).toBe(1);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(renders).toBe(1);
+    expect(guard.isPending()).toBe(false);
+
+    guard.dispose();
+  } finally {
+    cleanupDom();
+  }
 });

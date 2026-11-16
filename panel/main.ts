@@ -21,8 +21,9 @@ import { renderDetail } from './detail';
 import { renderCompact, renderCompactBusy } from './compact';
 import { countsFromState, formatTokens, liveLine, livePct, TOKENS_TITLE, tokensOf } from '../status/counts';
 import { $, el, HAND_EDIT, MODE_LABEL, UNBUNDLED, type Disposable } from './dom';
+import { createEditGuard } from './edit-guard';
 import {
-  S, applyChange, bundlesOf, canUndo, commit, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, toastError, undo, undoDepth, undoLabel,
+  S, applyChange, bundlesOf, canUndo, commit, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, startSync, toastError, undo, undoDepth, undoLabel,
 } from './io';
 import { connectHost } from '@openchamber/sdk';
 
@@ -37,6 +38,7 @@ const V = {
   query: '',
   tab: 'bundles' as 'bundles' | 'all',
   renaming: null as string | null,
+  renameDraft: '',
   confirmDelete: null as string | null,
   focusedRow: null as string | null,
   refocusRow: false,
@@ -165,15 +167,15 @@ function renderGroup(g: Group, root: HTMLElement) {
   if (V.renaming === g.id) {
     const f = el('div', 'sb-rename');
     head.appendChild(f);
-    let name = g.name;
-    const field = mountTextField(f, { value: name, onChange: (v) => { name = v; field.update({ value: v }); } });
+    let name = V.renameDraft;
+    const field = mountTextField(f, { value: name, onChange: (v) => { name = v; V.renameDraft = v; field.update({ value: v }); } });
     groupMounts.push(field);
     const done = () => {
       const n = name.trim();
-      if (n && n !== g.name) commit((s) => core.renameBundle(s, g.id, n), () => { V.renaming = null; }, { label: 'rename bundle' });
-      else { V.renaming = null; render(); }
+      if (n && n !== g.name) commit((s) => core.renameBundle(s, g.id, n), () => { V.renaming = null; V.renameDraft = ''; }, { label: 'rename bundle' });
+      else { V.renaming = null; V.renameDraft = ''; render(); }
     };
-    f.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(); if (e.key === 'Escape') { V.renaming = null; render(); } });
+    f.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(); if (e.key === 'Escape') { V.renaming = null; V.renameDraft = ''; render(); } });
     const b = el('span'); head.appendChild(b);
     groupMounts.push(mountButton(b, { label: 'Save', size: 'xs', onClick: done, loading: busy }));
   } else {
@@ -206,7 +208,7 @@ function renderGroup(g: Group, root: HTMLElement) {
       groupMounts.push(mountMenu(m, {
         label: '⋯', variant: 'ghost', size: 'xs',
         items: [{ id: 'rename', label: 'Rename' }, { id: 'delete', label: 'Delete bundle', destructive: true }],
-        onSelect: (a) => { if (a === 'rename') V.renaming = g.id; else V.confirmDelete = g.id; render(); },
+        onSelect: (a) => { if (a === 'rename') { V.renaming = g.id; V.renameDraft = g.name; } else V.confirmDelete = g.id; render(); },
       }));
     }
   }
@@ -377,8 +379,9 @@ let compact = false;
 function render() {
   if (compact) { renderCompact($('compact')); return; }
   if (isDragging()) { deferRender(); renderLight(); return; }
+  editGuard.markRendered();
   const bundles = S.state?.bundles;
-  if (V.renaming && !bundles?.some((b) => b.id === V.renaming)) V.renaming = null;
+  if (V.renaming && !bundles?.some((b) => b.id === V.renaming)) { V.renaming = null; V.renameDraft = ''; }
   if (V.confirmDelete && !bundles?.some((b) => b.id === V.confirmDelete)) V.confirmDelete = null;
   renderBanner();
   renderGroups();
@@ -388,8 +391,36 @@ function render() {
   refreshSendMenu();
 }
 
+function isEditingPageControl(): boolean {
+  if (compact) return false;
+  const docFocused = typeof document.hasFocus === 'function' ? document.hasFocus() : true;
+  if (!docFocused) return false;
+  const active = document.activeElement as HTMLElement | null;
+  if (!active) return false;
+  const inRename = Boolean(V.renaming && active.closest?.('.sb-rename') && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA'));
+  const inDesc = Boolean(active.closest?.('#detail') && active.tagName === 'TEXTAREA');
+  return inRename || inDesc;
+}
+
+const editGuard = createEditGuard({
+  isEditing: isEditingPageControl,
+  isTargetDeleted: () => {
+    const bundles = S.state?.bundles;
+    const renamingDeleted = Boolean(V.renaming && !bundles?.some((b) => b.id === V.renaming));
+    const selectedDeleted = Boolean(V.selected && !S.allIds.includes(V.selected));
+    return renamingDeleted || selectedDeleted;
+  },
+  onDefer: () => {
+    renderLight();
+    refreshProjectsMenu();
+    refreshSendMenu();
+  },
+  onRender: render,
+});
+
 hooks.render = render;
 hooks.renderLight = renderLight;
+hooks.onExternalSync = () => (compact ? renderCompact($('compact')) : editGuard.onExternalSync());
 
 initDrag({
   canDrag: (id) => !fmError(id),
@@ -583,6 +614,7 @@ async function boot() {
   }
   s.dispose();
   render();
+  startSync();
 }
 
 initSend({

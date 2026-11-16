@@ -4,7 +4,8 @@
 import { connectHost } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
 import { errText } from '../shared/panel/host';
-import { readCounts, renderMeterHeader, type SkillCounts } from './counts';
+import { listenChanges } from '../panel/sync';
+import { createStatusRefresher, readCounts, renderMeterHeader, type SkillCounts } from './counts';
 
 const host = connectHost();
 const REFRESH_MS = 30_000;
@@ -26,22 +27,17 @@ function paint(c: SkillCounts) {
   fit();
 }
 
-let reading = false;
-async function refresh() {
-  if (reading) return;
-  reading = true;
-  try {
-    paint(await readCounts(host));
-  } catch (e) {
+const refresh = createStatusRefresher(
+  () => readCounts(host),
+  paint,
+  (e) => {
     $('head').replaceChildren(
       Object.assign(document.createElement('div'), { className: 'err', textContent: "Couldn't count skills" }),
       Object.assign(document.createElement('div'), { className: 'skm-sub', textContent: errText(e) }),
     );
     fit();
-  } finally {
-    reading = false;
-  }
-}
+  },
+);
 
 const openPanel = () => {
   host.openSurface('plugin:skill-bundles').catch((e) => {
@@ -60,6 +56,7 @@ host.onReady((ctx) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPanel(); }
   });
   void refresh();
+  listenChanges(() => { void refresh(); });
   // The frame is unloaded when the section is collapsed, so this only runs while visible.
   setInterval(() => { if (document.visibilityState !== 'hidden') void refresh(); }, REFRESH_MS);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void refresh(); });
