@@ -216,17 +216,22 @@ after the global ones, so a project `allow` beats the global `deny *`.
     managedProjects), printing a note; `on --project` reuses a stored spelling of the same folder.
   - `managedProjects` is carried in the plan's `state`: a dir is added when a write leaves rules in
     its file, and dropped once it is in no bundle (its rules are removed by that same plan).
-- Rail: both views share one header with the page's live/installed stats,
-  enabled bundle count, estimated tokens, and tooltip; rail counts use the active project.
-  The list shows the "Skill Bundles" title; an open bundle replaces it with a bordered "Go Back"
-  button (Escape also returns to the list and restores row focus), with no separate back row.
-  Without bundle state it shows the opencode.json stats above "No bundles yet".
-  The Saving… badge appears inside the stats area; the Work Status meter remains separate.
+- Rail: both views share one muted single-line header: `live / installed` counts with an
+  accessible label and tooltip, and estimated tokens at the right (ellipsized if needed).
+  There is no duplicate title. An open bundle puts "Go Back" first in that row; clicking it
+  or pressing Escape returns to the list and restores row focus.
+  Counts use the active project; without bundle state the same row uses opencode.json counts
+  above "No bundles yet". Saving… stays in the row without changing its height.
 - Work Status: on mount and directory changes, read last displayed counts from extension storage
-  in parallel with refresh. Cached counts paint only before a fresh result for that directory;
+  in parallel with refresh. Cached counts paint only before a fresh result or error for that directory;
   late results from a previous directory cannot paint. Persist changed live/installed/character
-  counts under `skill-counts-v1`, retaining at most 20 directories (oldest changed first to evict).
-  Missing, corrupt or unavailable storage never prevents live refresh.
+  counts under `skill-counts-v1`, retaining at most 20 normalized scopes (oldest changed first to evict).
+  Chats directories share the global entry; trailing slashes share a scope. Raw directory switches
+  still invalidate outstanding paints. Each fresh paint reads storage; unchanged stored values
+  skip writes. Read/modify/write operations are serialized within a frame and best-effort across windows: concurrent
+  writes may lose an entry, costing an instant paint until a later mount refreshes it.
+  Malformed and duplicate entries are dropped individually. Missing or corrupt storage may be
+  replaced; a failed read skips that write and retries on a later refresh. Storage never prevents live refresh.
 - Panel: bundle header "Projects…" control + header/row Alt-click or right-click → flush checklist of
   Global + OpenChamber projects (listProjects, skip chats dir) with filter;
   header badge "Off · N projects" / "On · +N projects"; skill detail lists its projects.

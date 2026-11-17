@@ -1,19 +1,9 @@
-/* Skills meter header. Shared by status/index.html and the rail panel (copied to panel/ at build). */
+/* Skill counts row, used only by status/index.html. */
 .skm-top {
   display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
 }
-.skm-left { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; flex-wrap: wrap; }
-.skm-live-n { font-size: 18px; font-weight: 600; line-height: 1; color: var(--oc-fg); font-variant-numeric: tabular-nums; }
-.skm-live-w { font-size: 12px; font-weight: 500; color: var(--oc-success-text, var(--oc-success)); }
-.skm-rest { font-size: 12px; color: var(--oc-muted); font-variant-numeric: tabular-nums; margin-left: -2px; white-space: nowrap; }
-.skm-tokens { font-size: 12px; color: var(--oc-muted); font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
-
-.skm-meter {
-  margin-top: 6px; height: 6px; border-radius: 999px; overflow: hidden;
-  background: var(--oc-elevated, var(--oc-muted-surface));
-  border: 1px solid var(--oc-subtle, var(--oc-border)); box-sizing: border-box;
-}
-.skm-fill { height: 100%; border-radius: 999px; background: var(--oc-success); transition: width 200ms ease; }
+.skm-live-n, .skm-rest, .skm-tokens { font-variant-numeric: tabular-nums; }
+.skm-tokens { white-space: nowrap; flex: none; }
 
 .skm-sub { font-size: 11px; color: var(--oc-muted); }
 

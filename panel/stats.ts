@@ -1,7 +1,7 @@
 import { formatTokens, liveLine, livePct, TOKENS_TITLE, tokensOf, type SkillCounts } from '../status/counts';
 import { el } from './dom';
 
-/** Shared stats line for the page and rail headers. */
+/** Detailed stats line for the full-screen page header. */
 export function statsLine(c: SkillCounts): HTMLSpanElement {
   const n = c.bundlesOn?.length ?? 0;
   const text = c.fromOpencode

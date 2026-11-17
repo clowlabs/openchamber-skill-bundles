@@ -449,50 +449,24 @@ export const TOKENS_TITLE = 'Estimated tokens the live skills add to every promp
 export const STACK_ICON_SVG =
   '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M20.083 15.2l1.202.721a.5.5 0 0 1 0 .858l-8.77 5.262a1 1 0 0 1-1.03 0l-8.77-5.262a.5.5 0 0 1 0-.858l1.202-.721L12 20.05l8.083-4.85zm0-4.7l1.202.721a.5.5 0 0 1 0 .858L12 17.65l-9.285-5.571a.5.5 0 0 1 0-.858l1.202-.721L12 15.35l8.083-4.85zm-7.569-9.191l8.771 5.262a.5.5 0 0 1 0 .858L12 13 2.715 7.429a.5.5 0 0 1 0-.858l8.77-5.262a1 1 0 0 1 1.03 0zM12 3.332L5.887 7 12 10.668 18.113 7 12 3.332z"/></svg>';
 
-/**
- * Header + meter, shared by the Work Status section and the rail panel:
- *   <35 live / 211 installed · 17%>            <~1.6k tokens>
- *   [■■■■□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□□]
- * Returns `left` so a caller can append to the summary (e.g. a Saving… badge).
- * `compact` (Work Status): one muted list-size line, no meter bar.
- */
-export function renderMeterHeader(c: SkillCounts, opts?: { compact?: boolean }) {
-  const pct = livePct(c);
+/** Work Status: one muted row with an icon, live/installed counts and estimated tokens. */
+export function renderMeterHeader(c: SkillCounts) {
   const wrap = document.createElement('div');
-  wrap.className = opts?.compact ? 'skm skm-compact' : 'skm';
+  wrap.className = 'skm skm-compact';
   const top = document.createElement('div');
   top.className = 'skm-top';
   const left = document.createElement('span');
   left.className = 'skm-left';
   const n = Object.assign(document.createElement('span'), { className: 'skm-live-n', textContent: String(c.live) });
   const w = Object.assign(document.createElement('span'), { className: 'skm-live-w', textContent: 'live' });
-  const rest = Object.assign(document.createElement('span'), { className: 'skm-rest', textContent: ` / ${c.installed} installed · ${pct}%` });
-  left.append(n, w, rest);
+  const rest = Object.assign(document.createElement('span'), { className: 'skm-rest', textContent: `/ ${c.installed}` });
+  left.append(n, rest, w);
   const right = Object.assign(document.createElement('span'), {
     className: 'skm-tokens', title: TOKENS_TITLE, textContent: `~${formatTokens(tokensOf(c.chars))} tokens`,
   });
-  top.append(left, right);
-  if (opts?.compact) {
-    // Work Status reads "4 / 218 live": no percentage, "live" (still green) last.
-    rest.textContent = `/ ${c.installed}`;
-    left.replaceChildren(n, rest, w);
-    const icon = Object.assign(document.createElement('span'), { className: 'skm-icon', innerHTML: STACK_ICON_SVG });
-    icon.setAttribute('aria-hidden', 'true');
-    top.prepend(icon);
-    wrap.append(top);
-    return { wrap, left, fill: null };
-  }
-  const meter = document.createElement('div');
-  meter.className = 'skm-meter';
-  meter.setAttribute('role', 'meter');
-  meter.setAttribute('aria-valuemin', '0');
-  meter.setAttribute('aria-valuemax', String(c.installed));
-  meter.setAttribute('aria-valuenow', String(c.live));
-  meter.setAttribute('aria-label', `${c.live} of ${c.installed} skills live`);
-  const fill = document.createElement('div');
-  fill.className = 'skm-fill';
-  fill.style.width = `${pct}%`;
-  meter.appendChild(fill);
-  wrap.append(top, meter);
-  return { wrap, left, fill };
+  const icon = Object.assign(document.createElement('span'), { className: 'skm-icon', innerHTML: STACK_ICON_SVG });
+  icon.setAttribute('aria-hidden', 'true');
+  top.append(icon, left, right);
+  wrap.append(top);
+  return { wrap };
 }

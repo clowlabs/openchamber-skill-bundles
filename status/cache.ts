@@ -1,8 +1,9 @@
 // Shared persistent skill-ID index in extension storage (`host.storage`), so Work Status mounts
 // paint in a single round-trip instead of walking 200+ skill folders on every expand/open.
 import type { JsonValue } from '@openchamber/sdk';
+import * as core from '../src/core.js';
 import { errorCode, pool, type FileHost } from '../shared/panel/host';
-import type { SkillCounts } from './counts';
+import { createStatusRefresher, type SkillCounts } from './counts';
 
 export const SKILL_COUNTS_KEY = 'skill-counts-v1';
 type LastCounts = Pick<SkillCounts, 'live' | 'installed' | 'chars'>;
@@ -15,21 +16,21 @@ export function parseLastCountsCache(raw: unknown): CountsEntry[] {
   if (r.v !== 1 || !Array.isArray(r.entries)) return [];
   const entries: CountsEntry[] = [];
   for (const entry of r.entries) {
-    if (!entry || typeof entry !== 'object' || typeof entry.directory !== 'string') return [];
+    if (!entry || typeof entry !== 'object' || typeof entry.directory !== 'string') continue;
     const c = entry.counts;
     if (!c || ![c.live, c.installed, c.chars].every((n) => Number.isSafeInteger(n) && n >= 0)
-      || c.live > c.installed) return [];
-    if (entries.some((e) => e.directory === entry.directory)) return [];
+      || c.live > c.installed) continue;
+    if (entries.some((e) => e.directory === entry.directory)) continue;
     entries.push({ directory: entry.directory, counts: { live: c.live, installed: c.installed, chars: c.chars } });
   }
   return entries.slice(-20);
 }
 
-async function readLastCountsCache(host: StorageHost): Promise<CountsEntry[]> {
+async function readLastCountsCache(host: StorageHost): Promise<CountsEntry[] | null> {
   try {
     return host.storage ? parseLastCountsCache(await host.storage.get(SKILL_COUNTS_KEY)) : [];
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -40,41 +41,72 @@ const sameCounts = (a: LastCounts, b: LastCounts) =>
 export function createCachedStatusPainter(host: StorageHost, paint: (c: SkillCounts) => void) {
   let epoch = 0;
   let directory = '';
-  let fresh = false;
+  let settled = false;
   let writes = Promise.resolve();
+  // Deliberately avoid deriving home: that adds a read before first paint. The host
+  // supplies absolute paths; occasional absolute/~ aliases only cost a duplicate slot.
+  const scopeKey = () => core.normalizeScopeDir(directory) ?? '';
   return {
     select(dir: string | null): Promise<void> {
       directory = dir ?? '';
-      fresh = false;
+      settled = false;
       const ticket = ++epoch;
-      const key = directory;
+      const key = scopeKey();
       return readLastCountsCache(host).then((entries) => {
-        const cached = entries.find((e) => e.directory === key);
-        if (cached && ticket === epoch && !fresh) {
+        const cached = entries?.find((e) => e.directory === key);
+        if (cached && ticket === epoch && !settled) {
           paint({ ...cached.counts, bundlesOn: [], fromOpencode: false });
         }
       });
     },
     ticket: () => epoch,
     isCurrent: (ticket: number) => ticket === epoch,
+    settle(ticket: number) {
+      if (ticket === epoch) settled = true;
+    },
     fresh(ticket: number, c: SkillCounts): Promise<void> {
       if (ticket !== epoch) return Promise.resolve();
-      fresh = true;
+      settled = true;
       paint(c);
       if (!host.storage) return Promise.resolve();
-      const key = directory;
+      const key = scopeKey();
       const value = { live: c.live, installed: c.installed, chars: c.chars };
       // Serialize read/modify/write operations in this frame, so rapid paints cannot lose entries.
+      // Across windows this is best-effort: a lost entry only misses an instant paint until next boot.
       writes = writes.then(async () => {
         const entries = await readLastCountsCache(host);
+        if (!entries) return; // Retry next refresh; a failed read must not erase other scopes.
         const previous = entries.find((e) => e.directory === key);
-        if (previous && sameCounts(previous.counts, value)) return;
+        if (previous && sameCounts(previous.counts, value)) {
+          return;
+        }
         const next = [...entries.filter((e) => e.directory !== key), { directory: key, counts: value }].slice(-20);
         await host.storage?.set(SKILL_COUNTS_KEY, { v: 1, entries: next });
       }).catch(() => { /* A cache failure must never affect the live meter. */ });
       return writes;
     },
   };
+}
+
+/** Wire load completion (including errors) to the matching directory's cached paint. */
+export function createCachedStatusRefresher(
+  painter: ReturnType<typeof createCachedStatusPainter>,
+  read: (ticket: number) => Promise<SkillCounts>,
+  onError: (e: unknown) => void,
+) {
+  let ticket = 0;
+  return createStatusRefresher(
+    () => {
+      ticket = painter.ticket();
+      return read(ticket);
+    },
+    (c) => { void painter.fresh(ticket, c); },
+    (e) => {
+      if (!painter.isCurrent(ticket)) return;
+      painter.settle(ticket);
+      onError(e);
+    },
+  );
 }
 
 export const SKILL_INDEX_KEY = 'skill-index-v1';

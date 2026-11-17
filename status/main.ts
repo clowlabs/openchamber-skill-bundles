@@ -1,12 +1,12 @@
-// Work Status section: the skills meter (live / installed, est. tokens). Only cached counts
-// are written. The whole section opens the rail panel, where bundles are toggled.
+// Work Status section: skill counts (live / installed, est. tokens). Writes the
+// skill-counts-v1 and skill index caches. The section opens the rail panel for toggles.
 // The frame only runs while the section is shown.
 import { connectHost } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
 import { errText } from '../shared/panel/host';
 import { listenChanges } from '../panel/sync';
-import { createStatusLoader, createStatusRefresher, renderMeterHeader, type SkillCounts } from './counts';
-import { createCachedStatusPainter } from './cache';
+import { createStatusLoader, renderMeterHeader, type SkillCounts } from './counts';
+import { createCachedStatusPainter, createCachedStatusRefresher } from './cache';
 
 const host = connectHost();
 let currentDir: string | null = null;
@@ -38,7 +38,7 @@ function $(id: string): HTMLElement {
 const fit = () => void host.setHeight(Math.ceil(document.body.scrollHeight));
 
 function paint(c: SkillCounts) {
-  const { wrap } = renderMeterHeader(c, { compact: true });
+  const { wrap } = renderMeterHeader(c);
   $('head').replaceChildren(wrap);
   $('section').setAttribute('aria-label', `Skills: ${c.live} live of ${c.installed} installed. Open Skill Bundles`);
   fit();
@@ -50,22 +50,18 @@ const loader = createStatusLoader(host, {
   onRevalidated: (c) => { void cachedPainter.fresh(loadTicket, c); },
 });
 
-const refresh = createStatusRefresher(
-  async () => {
+const refresh = createCachedStatusRefresher(
+  cachedPainter,
+  async (ticket) => {
     const forceScan = needFull;
     const forceImmediateScan = needImmediateScan;
     needFull = false;
     needImmediateScan = false;
-    const ticket = cachedPainter.ticket();
     loadTicket = ticket;
     if (forceImmediateScan) loader.invalidateScanAge();
-    const c = await loader.load(currentDir, { forceScan: forceScan || forceImmediateScan, forceImmediateScan });
-    void cachedPainter.fresh(ticket, c);
-    return c;
+    return loader.load(currentDir, { forceScan: forceScan || forceImmediateScan, forceImmediateScan });
   },
-  () => {},
   (e) => {
-    if (!cachedPainter.isCurrent(loadTicket)) return;
     $('head').replaceChildren(
       Object.assign(document.createElement('div'), { className: 'err', textContent: "Couldn't count skills" }),
       Object.assign(document.createElement('div'), { className: 'skm-sub', textContent: errText(e) }),

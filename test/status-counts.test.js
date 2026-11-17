@@ -90,18 +90,169 @@ describe("last-counts first paint", () => {
     expect(painted).toEqual([]);
   });
 
-  test("unchanged numbers skip writes, including across fresh frames", async () => {
+  test("unchanged stored numbers skip writes within a frame and after remount", async () => {
     await seed();
     let writes = 0;
     const set = fx.host.storage.set;
     fx.host.storage.set = async (...args) => { writes++; return set(...args); };
     const p = cache.createCachedStatusPainter(fx.host, () => {});
     await p.select(null);
+    let reads = 0;
+    const get = fx.host.storage.get;
+    fx.host.storage.get = async (...args) => { reads++; return get(...args); };
     await p.fresh(p.ticket(), { ...fresh, ...old });
     expect(writes).toBe(0);
+    expect(reads).toBe(1);
     await p.fresh(p.ticket(), fresh);
     await p.fresh(p.ticket(), fresh);
     expect(writes).toBe(1);
+    expect(reads).toBe(3);
+    const remounted = cache.createCachedStatusPainter(fx.host, () => {});
+    await remounted.select(null);
+    await remounted.fresh(remounted.ticket(), fresh);
+    expect(writes).toBe(1);
+  });
+
+  for (const cacheFirst of [true, false]) {
+    test(`error remains visible when cache resolves ${cacheFirst ? "before" : "after"} failure`, async () => {
+      const delayed = deferred();
+      fx.host.storage.get = () => delayed.promise;
+      const paints = [];
+      const p = cache.createCachedStatusPainter(fx.host, (c) => paints.push(c.live));
+      const selected = p.select(null);
+      const refresh = cache.createCachedStatusRefresher(p, async () => {
+        throw new Error("load failed");
+      }, () => paints.push("error"));
+      if (!cacheFirst) await refresh();
+      delayed.resolve({ v: 1, entries: [{ directory: "", counts: old }] });
+      await selected;
+      if (cacheFirst) await refresh();
+      expect(paints).toEqual(cacheFirst ? [2, "error"] : ["error"]);
+    });
+  }
+
+  test("eviction is repaired by the next unchanged fresh paint without selecting again", async () => {
+    const a = `${fx.home}/a`;
+    const b = `${fx.home}/b`;
+    const p = cache.createCachedStatusPainter(fx.host, () => {});
+    await p.select(a);
+    await p.fresh(p.ticket(), fresh);
+    await seed(b);
+    await p.fresh(p.ticket(), fresh);
+    expect(cache.parseLastCountsCache(await fx.host.storage.get(cache.SKILL_COUNTS_KEY)).map((e) => e.directory)).toEqual([b, a]);
+  });
+
+  test("late selection read cannot suppress a write of the latest painted value", async () => {
+    await seed();
+    const get = fx.host.storage.get;
+    const delayed = deferred();
+    let first = true;
+    fx.host.storage.get = (key) => {
+      if (!first) return get(key);
+      first = false;
+      return delayed.promise;
+    };
+    const paints = [];
+    const p = cache.createCachedStatusPainter(fx.host, (c) => paints.push(c.live));
+    const selected = p.select(null);
+    await p.fresh(p.ticket(), fresh);
+    delayed.resolve({ v: 1, entries: [{ directory: "", counts: old }] });
+    await selected;
+    await p.fresh(p.ticket(), { ...fresh, ...old });
+    expect(paints).toEqual([fresh.live, old.live]);
+    expect(cache.parseLastCountsCache(await get(cache.SKILL_COUNTS_KEY))).toEqual([{ directory: "", counts: old }]);
+  });
+
+  test("failed reads retry even for a previously read key with unchanged counts", async () => {
+    const a = `${fx.home}/a`;
+    const b = `${fx.home}/b`;
+    await seed(a);
+    const p = cache.createCachedStatusPainter(fx.host, () => {});
+    await p.select(a);
+    await seed(b);
+    const get = fx.host.storage.get;
+    const set = fx.host.storage.set;
+    let writes = 0;
+    fx.host.storage.set = async (...args) => { writes++; return set(...args); };
+    fx.host.storage.get = async () => { throw new Error("transient"); };
+    await p.select(a);
+    await p.fresh(p.ticket(), { ...fresh, ...old });
+    expect(writes).toBe(0);
+    expect(cache.parseLastCountsCache(await get(cache.SKILL_COUNTS_KEY))).toEqual([{ directory: b, counts: old }]);
+    fx.host.storage.get = get;
+    await p.fresh(p.ticket(), { ...fresh, ...old });
+    expect(writes).toBe(1);
+    expect(cache.parseLastCountsCache(await get(cache.SKILL_COUNTS_KEY))).toEqual([
+      { directory: b, counts: old }, { directory: a, counts: old },
+    ]);
+  });
+
+  test("settling a stale ticket does not suppress the current cache paint", async () => {
+    const paints = [];
+    const p = cache.createCachedStatusPainter(fx.host, (c) => paints.push(c.live));
+    await p.select(null);
+    const stale = p.ticket();
+    await seed();
+    const selected = p.select(null);
+    p.settle(stale);
+    await selected;
+    expect(paints).toEqual([2]);
+  });
+
+  test("queued writes retain both scopes and the latest value", async () => {
+    const p = cache.createCachedStatusPainter(fx.host, () => {});
+    await p.select(`${fx.home}/a`);
+    const first = p.fresh(p.ticket(), fresh);
+    await p.select(`${fx.home}/b`);
+    const second = p.fresh(p.ticket(), fresh);
+    const third = p.fresh(p.ticket(), { ...fresh, ...old });
+    await Promise.all([first, second, third]);
+    expect(cache.parseLastCountsCache(await fx.host.storage.get(cache.SKILL_COUNTS_KEY))).toEqual([
+      { directory: `${fx.home}/a`, counts: { live: fresh.live, installed: fresh.installed, chars: fresh.chars } },
+      { directory: `${fx.home}/b`, counts: old },
+    ]);
+  });
+
+  test("chat directories and trailing-slash spellings share normalized cache entries", async () => {
+    const p = cache.createCachedStatusPainter(fx.host, () => {});
+    for (const dir of [`${fx.home}/.config/openchamber/chats/a`, `${fx.home}/.config/openchamber/chats/b`,
+      `${fx.home}/project/`, `${fx.home}/project`]) {
+      const before = p.ticket();
+      await p.select(dir);
+      expect(p.ticket()).not.toBe(before);
+      await p.fresh(p.ticket(), fresh);
+    }
+    const entries = cache.parseLastCountsCache(await fx.host.storage.get(cache.SKILL_COUNTS_KEY));
+    expect(entries.map((e) => e.directory)).toEqual(["", `${fx.home}/project`]);
+  });
+
+  test("failed writer read preserves other entries and retries on the next refresh", async () => {
+    const a = `${fx.home}/a`;
+    const b = `${fx.home}/b`;
+    await seed(a);
+    const p = cache.createCachedStatusPainter(fx.host, () => {});
+    await p.select(b);
+    const get = fx.host.storage.get;
+    const set = fx.host.storage.set;
+    let writes = 0;
+    fx.host.storage.set = async (...args) => { writes++; return set(...args); };
+    fx.host.storage.get = async () => { throw new Error("transient"); };
+    await p.fresh(p.ticket(), fresh);
+    expect(writes).toBe(0);
+    expect(cache.parseLastCountsCache(await get(cache.SKILL_COUNTS_KEY))).toEqual([{ directory: a, counts: old }]);
+    fx.host.storage.get = get;
+    await p.fresh(p.ticket(), fresh);
+    expect(writes).toBe(1);
+    expect(cache.parseLastCountsCache(await get(cache.SKILL_COUNTS_KEY)).map((e) => e.directory)).toEqual([a, b]);
+  });
+
+  test("malformed entries and duplicate directories are dropped individually", () => {
+    const good = { directory: "a", counts: old };
+    expect(cache.parseLastCountsCache({ v: 1, entries: [
+      null, good, { directory: "bad", counts: { ...old, live: 11 } },
+      { directory: "a", counts: fresh }, { directory: "b", counts: old },
+      { directory: 4, counts: old }, { directory: "c", counts: { ...old, chars: "400" } },
+    ] })).toEqual([good, { directory: "b", counts: old }]);
   });
 
   test("missing, corrupt, unavailable and failing storage are non-fatal", async () => {
@@ -166,21 +317,9 @@ describe("renderMeterHeader", () => {
   };
   const c = { live: 25, installed: 218, chars: 25 * core.CHARS_PER_SKILL, bundlesOn: [], fromOpencode: false };
 
-  test("default (rail panel) keeps the meter bar", () => {
+  test("Work Status is one line with no meter bar", () => {
     withDom(() => {
-      const { wrap, left, fill } = counts.renderMeterHeader(c);
-      expect(wrap.className).toBe("skm");
-      expect(wrap.children.map((x) => x.className)).toEqual(["skm-top", "skm-meter"]);
-      expect(left.children.map((x) => x.textContent)).toEqual(["25", "live", " / 218 installed · 11%"]);
-      expect(left.children.map((x) => x.className)).toEqual(["skm-live-n", "skm-live-w", "skm-rest"]);
-      expect(wrap.children[0].children[1].textContent).toBe("~1.1k tokens");
-      expect(fill.style.width).toBe("11%");
-    });
-  });
-
-  test("compact (Work Status) is one line with no meter bar", () => {
-    withDom(() => {
-      const { wrap, left, fill } = counts.renderMeterHeader(c, { compact: true });
+      const { wrap } = counts.renderMeterHeader(c);
       expect(wrap.className).toBe("skm skm-compact");
       expect(wrap.children.map((x) => x.className)).toEqual(["skm-top"]);
       const top = wrap.children[0];
@@ -188,7 +327,7 @@ describe("renderMeterHeader", () => {
       expect(top.children[0].innerHTML).toBe(counts.STACK_ICON_SVG);
       expect(top.children[0].attrs["aria-hidden"]).toBe("true");
       expect(top.children[2].textContent).toBe("~1.1k tokens");
-      expect(fill).toBeNull();
+      const left = top.children[1];
       expect(left.children.map((x) => x.textContent)).toEqual(["25", "/ 218", "live"]);
       expect(left.children.map((x) => x.className)).toEqual(["skm-live-n", "skm-rest", "skm-live-w"]);
     });

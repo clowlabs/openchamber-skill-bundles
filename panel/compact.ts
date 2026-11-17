@@ -17,8 +17,7 @@ import {
 } from './io';
 import { openProjectsMenu } from './projects';
 import { openSendMenu } from './send';
-import { countsFromState } from '../status/counts';
-import { statsLine } from './stats';
+import { countsFromState, formatTokens, TOKENS_TITLE, tokensOf } from '../status/counts';
 
 let mounts: Disposable[] = [];
 /** Bundle id whose row has keyboard focus, kept across re-renders. */
@@ -196,18 +195,22 @@ function renderHeader(root: HTMLElement, head: HTMLElement, projDir: string | nu
     home: effectiveHome(),
     projectOpencodeText: projCfgPath ? S.projectTexts[projCfgPath] : undefined,
   });
-  const header = el('header', 'sb-header');
-  const stats = el('div', 'sb-stats');
-  stats.appendChild(statsLine(c));
+  const header = el('header', 'sb-c-header');
+  const counts = el('span', 'sb-c-counts', `${c.live} / ${c.installed}`);
+  counts.title = `${c.live} of ${c.installed} skills live`;
+  counts.setAttribute('aria-label', counts.title);
+  const tokens = el('span', 'sb-c-tokens', `~${formatTokens(tokensOf(c.chars))} tokens`);
+  tokens.title = TOKENS_TITLE;
   const back = open ? el('button', 'sb-c-back', 'Go Back') : null;
   if (back) {
     back.type = 'button';
     back.setAttribute('aria-keyshortcuts', 'Escape');
     back.addEventListener('click', () => closeBundle(root));
   }
-  header.append(back ?? el('div', 'sb-title', 'Skill Bundles'), stats);
+  if (back) header.appendChild(back);
+  header.append(counts, tokens);
   head.appendChild(header);
-  if (pending()) busyBadge(stats);
+  if (pending()) busyBadge(header);
   return back;
 }
 
@@ -347,13 +350,13 @@ function closeBundle(root: HTMLElement) {
 
 function busyBadge(at: HTMLElement) {
   const s = el('span', 'sb-c-busy');
-  at.appendChild(s);
+  at.insertBefore(s, at.querySelector('.sb-c-tokens'));
   mounts.push(mountBadge(s, { label: 'Saving…', tone: 'neutral' }));
 }
 
 /** While a save is queued: only the Saving… badge, so the row being clicked isn't replaced. */
 export function renderCompactBusy() {
-  const left = document.querySelector<HTMLElement>('.sb-c-head .sb-stats');
+  const left = document.querySelector<HTMLElement>('.sb-c-head .sb-c-header');
   if (!left || left.querySelector('.sb-c-busy') || !pending()) return;
   busyBadge(left);
 }
