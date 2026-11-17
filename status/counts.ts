@@ -445,6 +445,10 @@ export function formatTokens(n: number) {
 
 export const TOKENS_TITLE = 'Estimated tokens the live skills add to every prompt (skill list only)';
 
+/** Remixicon `stack` (the extension's manifest icon), drawn like the host's Work Status row icons. */
+export const STACK_ICON_SVG =
+  '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M20.083 15.2l1.202.721a.5.5 0 0 1 0 .858l-8.77 5.262a1 1 0 0 1-1.03 0l-8.77-5.262a.5.5 0 0 1 0-.858l1.202-.721L12 20.05l8.083-4.85zm0-4.7l1.202.721a.5.5 0 0 1 0 .858L12 17.65l-9.285-5.571a.5.5 0 0 1 0-.858l1.202-.721L12 15.35l8.083-4.85zm-7.569-9.191l8.771 5.262a.5.5 0 0 1 0 .858L12 13 2.715 7.429a.5.5 0 0 1 0-.858l8.77-5.262a1 1 0 0 1 1.03 0zM12 3.332L5.887 7 12 10.668 18.113 7 12 3.332z"/></svg>';
+
 /**
  * Header + meter, shared by the Work Status section and the rail panel:
  *   <35 live / 211 installed · 17%>            <~1.6k tokens>
@@ -469,6 +473,9 @@ export function renderMeterHeader(c: SkillCounts, opts?: { compact?: boolean }) 
   });
   top.append(left, right);
   if (opts?.compact) {
+    const icon = Object.assign(document.createElement('span'), { className: 'skm-icon', innerHTML: STACK_ICON_SVG });
+    icon.setAttribute('aria-hidden', 'true');
+    top.prepend(icon);
     wrap.append(top);
     return { wrap, left, fill: null };
   }

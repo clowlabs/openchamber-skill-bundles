@@ -17,9 +17,12 @@
 
 .skm-sub { font-size: 11px; color: var(--oc-muted); }
 
-/* Work Status: one quiet line at the host list-row size (13px at the default 14px root; scales with the interface font size), no bar. */
-.skm-compact .skm-top { gap: 6px; }
-.skm-compact .skm-left { gap: 4px; flex-wrap: nowrap; overflow: hidden; }
+/* Work Status: one row shaped like the host's own rows (26px tall, 13px icon + 8px gap, 13px text at the
+   default 14px root; all but the icon scale with the interface font size, like the host), no bar. */
+.skm-compact .skm-top { align-items: center; gap: calc(8rem / 14); height: calc(26rem / 14); }
+.skm-compact .skm-icon { flex: none; display: inline-flex; width: 13px; height: 13px; color: var(--oc-muted); }
+.skm-compact .skm-icon svg { width: 100%; height: 100%; display: block; }
+.skm-compact .skm-left { flex: 1; gap: 4px; flex-wrap: nowrap; overflow: hidden; }
 .skm-compact .skm-live-n,
 .skm-compact .skm-live-w,
 .skm-compact .skm-rest,

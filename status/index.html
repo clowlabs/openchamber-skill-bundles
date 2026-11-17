@@ -9,15 +9,17 @@
     html { font-size: 0.875rem; }
     html, body { margin: 0; background: transparent; color: var(--oc-fg); font-family: var(--oc-font, system-ui, sans-serif); }
     /* The Work Status section already frames this: no outer card, just padding. */
-    #section { padding: 3px 4px; cursor: pointer; border-radius: 6px; }
+    /* The host already insets the frame like its rows (mx-1), so no horizontal padding here. */
+    #section { padding: 0; cursor: pointer; border-radius: 6px; }
+    #section:hover .skm-icon { color: var(--oc-fg); }
     #section:hover .skm-rest, #section:hover .skm-tokens { color: var(--oc-fg); }
-    #section:focus-visible { outline: 2px solid var(--oc-focus, var(--oc-primary)); outline-offset: -2px; }
+    #section:focus-visible { outline: 1px solid var(--oc-focus, var(--oc-primary)); outline-offset: -1px; }
     .err { color: var(--oc-error-text, var(--oc-error)); font-size: 12px; }
   </style>
 </head>
 <body>
   <div id="section" role="button" tabindex="0" title="Open Skill Bundles" aria-label="Skills. Open Skill Bundles">
-    <div id="head"><div class="skm skm-compact"><div class="skm-top"><span class="skm-left"><span class="skm-live-n">—</span><span class="skm-rest">skills</span></span></div></div></div>
+    <div id="head"><div class="skm skm-compact"><div class="skm-top"><span class="skm-icon" aria-hidden="true"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M20.083 15.2l1.202.721a.5.5 0 0 1 0 .858l-8.77 5.262a1 1 0 0 1-1.03 0l-8.77-5.262a.5.5 0 0 1 0-.858l1.202-.721L12 20.05l8.083-4.85zm0-4.7l1.202.721a.5.5 0 0 1 0 .858L12 17.65l-9.285-5.571a.5.5 0 0 1 0-.858l1.202-.721L12 15.35l8.083-4.85zm-7.569-9.191l8.771 5.262a.5.5 0 0 1 0 .858L12 13 2.715 7.429a.5.5 0 0 1 0-.858l8.77-5.262a1 1 0 0 1 1.03 0zM12 3.332L5.887 7 12 10.668 18.113 7 12 3.332z"/></svg></span><span class="skm-left"><span class="skm-live-n">—</span><span class="skm-rest">skills</span></span></div></div></div>
   </div>
   <script src="main.js"></script>
 </body>

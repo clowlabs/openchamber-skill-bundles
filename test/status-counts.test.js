@@ -31,6 +31,7 @@ describe("renderMeterHeader", () => {
         attrs: {},
         style: {},
         append: (...c) => el.children.push(...c),
+        prepend: (...c) => el.children.unshift(...c),
         appendChild: (c) => el.children.push(c),
         setAttribute: (k, v) => { el.attrs[k] = v; },
       };
@@ -60,6 +61,10 @@ describe("renderMeterHeader", () => {
       const { wrap, left, fill } = counts.renderMeterHeader(c, { compact: true });
       expect(wrap.className).toBe("skm skm-compact");
       expect(wrap.children.map((x) => x.className)).toEqual(["skm-top"]);
+      const top = wrap.children[0];
+      expect(top.children.map((x) => x.className)).toEqual(["skm-icon", "skm-left", "skm-tokens"]);
+      expect(top.children[0].innerHTML).toBe(counts.STACK_ICON_SVG);
+      expect(top.children[0].attrs["aria-hidden"]).toBe("true");
       expect(fill).toBeNull();
       expect(left.children.map((x) => x.textContent)).toEqual(["25", "live", " / 218 installed · 11%"]);
     });
