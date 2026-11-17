@@ -22,12 +22,15 @@
 .skm-compact .skm-top { align-items: center; gap: calc(8rem / 14); height: calc(26rem / 14); }
 .skm-compact .skm-icon { flex: none; display: inline-flex; width: 13px; height: 13px; color: var(--oc-muted); }
 .skm-compact .skm-icon svg { width: 100%; height: 100%; display: block; }
-.skm-compact .skm-left { flex: 1; gap: 4px; flex-wrap: nowrap; overflow: hidden; }
+/* A block, not flex, so a narrow pane ellipsizes the end of "4 / 218 live" instead of squeezing out "/ 218". */
+.skm-compact .skm-left { display: block; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--oc-muted); }
+.skm-compact .skm-left > span + span { margin-left: 4px; }
+.skm-compact .skm-left,
 .skm-compact .skm-live-n,
 .skm-compact .skm-live-w,
 .skm-compact .skm-rest,
 .skm-compact .skm-tokens { font-size: calc(13rem / 14); font-weight: 400; line-height: 1.45; }
 .skm-compact .skm-live-n { color: var(--oc-fg); }
 .skm-compact .skm-live-w { color: color-mix(in srgb, var(--oc-success-text, var(--oc-success)) 55%, var(--oc-muted)); }
-.skm-compact .skm-rest { margin-left: 0; min-width: 0; color: var(--oc-muted); overflow: hidden; text-overflow: ellipsis; }
+.skm-compact .skm-rest { color: var(--oc-muted); }
 .skm-compact .skm-tokens { color: var(--oc-muted); }

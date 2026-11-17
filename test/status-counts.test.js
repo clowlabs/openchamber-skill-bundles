@@ -32,6 +32,7 @@ describe("renderMeterHeader", () => {
         style: {},
         append: (...c) => el.children.push(...c),
         prepend: (...c) => el.children.unshift(...c),
+        replaceChildren: (...c) => el.children.splice(0, el.children.length, ...c),
         appendChild: (c) => el.children.push(c),
         setAttribute: (k, v) => { el.attrs[k] = v; },
       };
@@ -49,9 +50,12 @@ describe("renderMeterHeader", () => {
 
   test("default (rail panel) keeps the meter bar", () => {
     withDom(() => {
-      const { wrap, fill } = counts.renderMeterHeader(c);
+      const { wrap, left, fill } = counts.renderMeterHeader(c);
       expect(wrap.className).toBe("skm");
       expect(wrap.children.map((x) => x.className)).toEqual(["skm-top", "skm-meter"]);
+      expect(left.children.map((x) => x.textContent)).toEqual(["25", "live", " / 218 installed · 11%"]);
+      expect(left.children.map((x) => x.className)).toEqual(["skm-live-n", "skm-live-w", "skm-rest"]);
+      expect(wrap.children[0].children[1].textContent).toBe("~1.1k tokens");
       expect(fill.style.width).toBe("11%");
     });
   });
@@ -65,8 +69,10 @@ describe("renderMeterHeader", () => {
       expect(top.children.map((x) => x.className)).toEqual(["skm-icon", "skm-left", "skm-tokens"]);
       expect(top.children[0].innerHTML).toBe(counts.STACK_ICON_SVG);
       expect(top.children[0].attrs["aria-hidden"]).toBe("true");
+      expect(top.children[2].textContent).toBe("~1.1k tokens");
       expect(fill).toBeNull();
-      expect(left.children.map((x) => x.textContent)).toEqual(["25", "live", " / 218 installed · 11%"]);
+      expect(left.children.map((x) => x.textContent)).toEqual(["25", "/ 218", "live"]);
+      expect(left.children.map((x) => x.className)).toEqual(["skm-live-n", "skm-rest", "skm-live-w"]);
     });
   });
 });

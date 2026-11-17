@@ -473,6 +473,9 @@ export function renderMeterHeader(c: SkillCounts, opts?: { compact?: boolean }) 
   });
   top.append(left, right);
   if (opts?.compact) {
+    // Work Status reads "4 / 218 live": no percentage, "live" (still green) last.
+    rest.textContent = `/ ${c.installed}`;
+    left.replaceChildren(n, rest, w);
     const icon = Object.assign(document.createElement('span'), { className: 'skm-icon', innerHTML: STACK_ICON_SVG });
     icon.setAttribute('aria-hidden', 'true');
     top.prepend(icon);
