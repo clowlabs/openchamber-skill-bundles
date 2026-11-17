@@ -1,10 +1,17 @@
 // Bundle "Projects" checklist: which project folders a bundle is turned on in.
 import * as core from '../src/core.js';
-import { button, createPopup, note, projectList, projectsNote, replace, shortDir, watchProjects, type Project } from './popup';
-import { S, activeProjectDir, commit, errText, homeOpt, host } from './io';
+import { button, createPopup, note, onRefreshMenus, projectList, projectsNote, replace, sectionTitle, shortDir, watchProjects, type Project } from './popup';
+import { S, activeProjectDir, commit, errText, homeOpt, host, sameProjectDir } from './io';
 
-const sameDir = (a: string, b: string) => {
-  try { return core.normalizeProjectDir(a, homeOpt()) === core.normalizeProjectDir(b, homeOpt()); } catch { return a === b; }
+const GLOBAL_KEY = '__global';
+
+type RowOptions = {
+  key: string;
+  label: string;
+  title?: string;
+  sub?: string;
+  checked: boolean;
+  onChange?: (checked: boolean) => void;
 };
 
 /** Validate an "Add folder…" entry the way the CLI does: absolute or ~/, not ~ itself, an existing directory. */
@@ -72,7 +79,7 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
         showErr(errText(x));
         return;
       }
-      if (bundle()?.projects?.some((d) => sameDir(d, dir))) { showErr('Already in this bundle'); return; }
+      if (bundle()?.projects?.some((d) => sameProjectDir(d, dir))) { showErr('Already in this bundle'); return; }
       showErr('');
       commit((s) => core.addBundleProject(s, bundleId, dir, homeOpt()), () => { input.value = ''; }, { label: 'add project' });
     })();
@@ -80,35 +87,31 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
 
   const toggle = (dir: string, on: boolean) => {
     commit((s) => {
-      const cur = s.bundles.find((x) => x.id === bundleId);
-      if (!cur) return s;
-      if (cur.enabled) {
-        return on
-          ? core.includeBundleProject(s, bundleId, dir, homeOpt())
-          : core.excludeBundleProject(s, bundleId, dir, homeOpt());
+      if (!s.bundles.some((x) => x.id === bundleId)) return s;
+      const opts = homeOpt();
+      if (core.normalizeScopeDir(dir, opts) === null) {
+        return on ? s : core.removeBundleProject(s, bundleId, dir, opts);
       }
-      return on
-        ? core.addBundleProject(s, bundleId, dir, homeOpt())
-        : core.removeBundleProject(s, bundleId, dir, homeOpt());
+      return core.setBundleInScope(s, bundleId, on, { projectDir: dir, ...opts });
     }, undefined, { label: on ? 'add project' : 'remove project' });
   };
 
-  const row = (label: string, dir: string, checked: boolean, extra?: string, onChange?: (checked: boolean) => void) => {
+  const row = (opts: RowOptions) => {
     const l = document.createElement('label');
     l.className = 'sb-proj-row';
-    l.title = dir === '__global' ? 'Turn on in every project' : dir;
+    l.title = opts.title ?? opts.key;
     const c = document.createElement('input');
     c.type = 'checkbox';
     c.className = 'sb-proj-check';
-    c.checked = checked;
-    c.dataset.dir = dir;
-    c.addEventListener('change', () => (onChange ? onChange(c.checked) : toggle(dir, c.checked)));
+    c.checked = opts.checked;
+    c.dataset.dir = opts.key;
+    c.addEventListener('change', () => (opts.onChange ? opts.onChange(c.checked) : toggle(opts.key, c.checked)));
     const name = document.createElement('span');
     name.className = 'sb-ctx-name';
-    name.textContent = label;
+    name.textContent = opts.label;
     const d = document.createElement('span');
     d.className = 'sb-ctx-dir';
-    d.textContent = extra ?? shortDir(dir);
+    d.textContent = opts.sub ?? shortDir(opts.key);
     l.append(c, name, d);
     return l;
   };
@@ -122,49 +125,81 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
     list.textContent = '';
     const mine = b.projects ?? [];
     const excluded = b.excludedProjects ?? [];
-    pop.ensureFilter(projectList().projects.length + mine.length + excluded.length, 'Filter projects', (v) => { filter = v; paint(); });
+    const allProjects = projectList().projects.filter((p) => core.normalizeScopeDir(p.directory, homeOpt()) !== null);
+    pop.ensureFilter(allProjects.length + mine.length + excluded.length, 'Filter projects', (v) => { filter = v; paint(); });
 
-    list.appendChild(row('Global (all projects)', '__global', b.enabled, 'every project', (checked) => {
-      commit((s) => core.setBundleGlobal(s, bundleId, checked), undefined, {
-        label: checked ? 'enable bundle globally' : 'disable bundle globally',
-      });
+    list.appendChild(row({
+      key: GLOBAL_KEY,
+      label: 'Global (all projects)',
+      title: 'Turn on in every project',
+      sub: 'every project',
+      checked: b.enabled,
+      onChange: (checked) => {
+        commit((s) => core.setBundleGlobal(s, bundleId, checked), undefined, {
+          label: checked ? 'enable bundle globally' : 'disable bundle globally',
+        });
+      },
     }));
 
+    const hOpt = homeOpt();
     const curDir = activeProjectDir();
-    const knownRaw: Project[] = core.filterProjects(projectList().projects, filter);
-    const known = curDir
-      ? [...knownRaw.filter((p) => sameDir(p.directory, curDir)), ...knownRaw.filter((p) => !sameDir(p.directory, curDir))]
-      : knownRaw;
+    const curNorm = curDir ? core.normalizeScopeDir(curDir, hOpt) : null;
+    const sameNorm = (a: string, bNorm: string | null) =>
+      bNorm != null && core.normalizeScopeDir(a, hOpt) === bNorm;
+
+    const knownNorms = new Set<string>();
+    for (const p of allProjects) {
+      const n = core.normalizeScopeDir(p.directory, hOpt);
+      if (n != null) knownNorms.add(n);
+    }
+    const isKnown = (dir: string) => {
+      const n = core.normalizeScopeDir(dir, hOpt);
+      return n != null ? knownNorms.has(n) : allProjects.some((p) => sameProjectDir(p.directory, dir));
+    };
+    const mineNorms = new Set<string>();
+    for (const m of mine) {
+      const n = core.normalizeScopeDir(m, hOpt);
+      if (n != null) mineNorms.add(n);
+    }
+    const inMine = (dir: string) => {
+      const n = core.normalizeScopeDir(dir, hOpt);
+      return n != null ? mineNorms.has(n) : mine.some((m) => sameProjectDir(m, dir));
+    };
+
+    const knownRaw: Project[] = core.filterProjects(allProjects, filter);
+    const known = curNorm
+      ? [...knownRaw.filter((p) => sameNorm(p.directory, curNorm)), ...knownRaw.filter((p) => !sameNorm(p.directory, curNorm))]
+      : curDir
+        ? [...knownRaw.filter((p) => sameProjectDir(p.directory, curDir)), ...knownRaw.filter((p) => !sameProjectDir(p.directory, curDir))]
+        : knownRaw;
     const status = projectsNote(known.length, filter);
     const q = filter.trim().toLowerCase();
-    const unlistedMine = mine.filter((d) => !projectList().projects.some((p) => sameDir(p.directory, d)) && (!q || d.toLowerCase().includes(q)));
+    const unlistedMine = mine.filter((d) => !isKnown(d) && (!q || d.toLowerCase().includes(q)));
     const unlistedExcluded = b.enabled
-      ? excluded.filter((d) => !mine.some((m) => sameDir(m, d)) && !projectList().projects.some((p) => sameDir(p.directory, d)) && (!q || d.toLowerCase().includes(q)))
+      ? excluded.filter((d) => !inMine(d) && !isKnown(d) && (!q || d.toLowerCase().includes(q)))
       : [];
 
     if (known.length || unlistedMine.length || unlistedExcluded.length || status) {
-      const h = document.createElement('div');
-      h.className = 'sb-ctx-title';
-      h.textContent = 'Projects';
-      list.appendChild(h);
+      list.appendChild(sectionTitle('Projects'));
     }
     if (status) list.appendChild(note(status));
     for (const p of known) {
-      const isCur = curDir != null && sameDir(p.directory, curDir);
-      const checked = b.enabled
-        ? !excluded.some((d) => sameDir(d, p.directory)) || mine.some((d) => sameDir(d, p.directory))
-        : mine.some((d) => sameDir(d, p.directory));
-      list.appendChild(row(p.name, p.directory, checked, isCur ? `current · ${shortDir(p.directory)}` : undefined));
+      const isCur = curNorm ? sameNorm(p.directory, curNorm) : (curDir != null && sameProjectDir(p.directory, curDir));
+      const checked = core.isBundleActive(b, { projectDir: p.directory, ...hOpt });
+      list.appendChild(row({
+        key: p.directory,
+        label: p.name,
+        sub: isCur ? `current · ${shortDir(p.directory)}` : undefined,
+        checked,
+      }));
     }
 
     // Folders in the bundle that OpenChamber doesn't list, so they can be unchecked.
     if (unlistedMine.length || unlistedExcluded.length) {
-      const h = document.createElement('div');
-      h.className = 'sb-ctx-title';
-      h.textContent = 'Other folders';
-      list.appendChild(h);
-      for (const d of unlistedMine) list.appendChild(row(d.split('/').filter(Boolean).pop() ?? d, d, true));
-      for (const d of unlistedExcluded) list.appendChild(row(d.split('/').filter(Boolean).pop() ?? d, d, false));
+      list.appendChild(sectionTitle('Other folders'));
+      const folderLabel = (d: string) => d.split('/').filter(Boolean).pop() ?? d;
+      for (const d of unlistedMine) list.appendChild(row({ key: d, label: folderLabel(d), checked: true }));
+      for (const d of unlistedExcluded) list.appendChild(row({ key: d, label: folderLabel(d), checked: false }));
     }
     if (keep) list.querySelector<HTMLElement>(`[data-dir="${CSS.escape(keep)}"]`)?.focus();
   };
@@ -181,3 +216,4 @@ let repaintOpen: (() => void) | null = null;
 export function refreshProjectsMenu() {
   repaintOpen?.();
 }
+onRefreshMenus(refreshProjectsMenu);

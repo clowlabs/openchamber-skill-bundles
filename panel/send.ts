@@ -6,7 +6,7 @@ import type { SkillRef } from '../src/discover.js';
 import { HAND_EDIT } from './dom';
 import { S, bundlesOf, commit, fmError, orderBundles } from './io';
 import {
-  button, closePopup, codeOf, createPopup, note, projectList, projectsNote, replace, shortDir, watchProjects, type Project,
+  button, closePopup, codeOf, createPopup, note, onRefreshMenus, projectList, projectsNote, replace, sectionTitle, shortDir, watchProjects, type Project,
 } from './popup';
 
 export type SendDeps = {
@@ -164,6 +164,7 @@ let repaintOpen: (() => void) | null = null;
 export function refreshSendMenu() {
   repaintOpen?.();
 }
+onRefreshMenus(refreshSendMenu);
 
 export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolean, returnFocus?: HTMLElement | null, from?: string) {
   let altDown = altAtOpen;
@@ -240,6 +241,43 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
     }
   };
 
+  const menuItem = (opts: {
+    label: string;
+    sub: string;
+    title: string;
+    disabled: boolean;
+    dataKey: 'bid' | 'pid';
+    dataVal: string;
+    onPick: (useAlt: boolean) => void;
+  }) => {
+    const item = button('', 'sb-ctx-item');
+    item.dataset[opts.dataKey] = opts.dataVal;
+    item.setAttribute('role', 'menuitem');
+    item.tabIndex = -1;
+    const icon = document.createElement('span');
+    icon.className = 'sb-ctx-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    const name = document.createElement('span');
+    name.className = 'sb-ctx-name';
+    name.textContent = opts.label;
+    const sub = document.createElement('span');
+    sub.className = 'sb-ctx-dir';
+    sub.textContent = opts.sub;
+    item.append(icon, name, sub);
+    item.title = opts.title;
+    if (opts.disabled) {
+      item.disabled = true;
+      item.setAttribute('aria-disabled', 'true');
+    }
+    const onTrigger = (e: MouseEvent) => {
+      const useAlt = e.detail > 0 ? e.altKey : Boolean(e.altKey || dup());
+      opts.onPick(useAlt);
+    };
+    item.addEventListener('click', onTrigger);
+    item.addEventListener('dblclick', onTrigger);
+    return item;
+  };
+
   const paint = () => {
     const blocked = deps.blockedReason(id);
     const bundleBlocked = (deps.bundleBlockedReason ?? defaultBundleBlocked)(id);
@@ -256,46 +294,24 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
     pop.ensureFilter(allBundles.length + projectList().projects.length, allBundles.length ? 'Filter bundles or projects' : 'Filter projects', (v) => { filter = v; paint(); });
 
     if (shownBundles.length) {
-      const h = document.createElement('div');
-      h.className = 'sb-ctx-title';
-      h.textContent = 'Bundles';
-      list.appendChild(h);
+      list.appendChild(sectionTitle('Bundles'));
       for (const b of shownBundles) {
-        const item = button('', 'sb-ctx-item');
-        item.dataset.bid = b.id;
-        item.setAttribute('role', 'menuitem');
-        item.tabIndex = -1;
-        const icon = document.createElement('span');
-        icon.className = 'sb-ctx-icon';
-        icon.setAttribute('aria-hidden', 'true');
-        const name = document.createElement('span');
-        name.className = 'sb-ctx-name';
-        name.textContent = b.name;
-        const meta = document.createElement('span');
-        meta.className = 'sb-ctx-dir';
-        meta.textContent = b.synthetic ? 'remove from bundle' : `${b.skills.length} skill${b.skills.length === 1 ? '' : 's'} · ${b.enabled ? 'on' : 'off'}`;
-        item.append(icon, name, meta);
-        item.title = bundleBlocked ?? (b.synthetic ? 'Remove from bundle' : b.name);
-        if (bundleBlocked || busy) { item.disabled = true; item.setAttribute('aria-disabled', 'true'); }
-        item.addEventListener('click', (e) => {
-          const useAlt = e.detail > 0 ? e.altKey : Boolean(e.altKey || dup());
-          activateBundle(b.id, useAlt);
-        });
-        item.addEventListener('dblclick', (e) => {
-          const useAlt = e.detail > 0 ? e.altKey : Boolean(e.altKey || dup());
-          activateBundle(b.id, useAlt);
-        });
-        list.appendChild(item);
+        list.appendChild(menuItem({
+          label: b.name,
+          sub: b.synthetic ? 'remove from bundle' : `${b.skills.length} skill${b.skills.length === 1 ? '' : 's'} · ${b.enabled ? 'on' : 'off'}`,
+          title: bundleBlocked ?? (b.synthetic ? 'Remove from bundle' : b.name),
+          disabled: Boolean(bundleBlocked || busy),
+          dataKey: 'bid',
+          dataVal: b.id,
+          onPick: (useAlt) => activateBundle(b.id, useAlt),
+        }));
       }
     }
 
     const shown: Project[] = core.filterProjects(projectList().projects, filter);
     const status = projectsNote(shown.length, filter);
     if (allBundles.length && (shown.length || !q)) {
-      const h = document.createElement('div');
-      h.className = 'sb-ctx-title';
-      h.textContent = 'Projects';
-      list.appendChild(h);
+      list.appendChild(sectionTitle('Projects'));
     }
     if (status && (!q || !shownBundles.length)) {
       list.appendChild(note(q && allBundles.length && status === 'No matching projects' ? 'No matching bundles or projects' : status));
@@ -333,31 +349,15 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
         list.appendChild(c);
         continue;
       }
-      const b = button('', 'sb-ctx-item');
-      b.dataset.pid = p.id;
-      b.setAttribute('role', 'menuitem');
-      b.tabIndex = -1;
-      const icon = document.createElement('span');
-      icon.className = 'sb-ctx-icon';
-      icon.setAttribute('aria-hidden', 'true');
-      const name = document.createElement('span');
-      name.className = 'sb-ctx-name';
-      name.textContent = p.name;
-      const dir = document.createElement('span');
-      dir.className = 'sb-ctx-dir';
-      dir.textContent = shortDir(p.directory);
-      b.append(icon, name, dir);
-      b.title = blocked ?? p.directory;
-      if (blocked || busy) { b.disabled = true; b.setAttribute('aria-disabled', 'true'); }
-      b.addEventListener('click', (e) => {
-        const useAlt = e.detail > 0 ? e.altKey : Boolean(e.altKey || dup());
-        void activate(p, useAlt);
-      });
-      b.addEventListener('dblclick', (e) => {
-        const useAlt = e.detail > 0 ? e.altKey : Boolean(e.altKey || dup());
-        void activate(p, useAlt);
-      }); // guarded by `busy`/close
-      list.appendChild(b);
+      list.appendChild(menuItem({
+        label: p.name,
+        sub: shortDir(p.directory),
+        title: blocked ?? p.directory,
+        disabled: Boolean(blocked || busy),
+        dataKey: 'pid',
+        dataVal: p.id,
+        onPick: (useAlt) => { void activate(p, useAlt); },
+      }));
     }
     foot.textContent = bundleBlocked ?? (allBundles.length ? HINT : (blocked ?? HINT));
     paintTitle();

@@ -3,7 +3,7 @@
 import * as core from '../src/core.js';
 import type { State } from '../src/core.js';
 import { discoverSkills } from '../panel/discover';
-import { errorCode, readOptional, type FileHost } from '../shared/panel/host';
+import { isUnreadable, readOptional, type FileHost } from '../shared/panel/host';
 import { homeFromDirs } from '../shared/panel/projects';
 
 export type SkillCounts = {
@@ -26,7 +26,35 @@ export async function listSkillIds(host: FileHost, opencodeText?: string | null)
   return [...new Set([...Object.keys(skills), ...core.BUILTIN_SKILLS])].sort();
 }
 
-type Rule = { action?: unknown; resource?: unknown; effect?: unknown };
+export type SkillRule = { action: 'skill'; resource: string; effect?: unknown };
+
+/**
+ * Parse `permissions` skill rules from an `opencode.json` text:
+ * - filtered `action === 'skill'` rules when valid JSON object with an array `permissions`,
+ * - `[]` when valid JSON object with no `permissions` key,
+ * - `null` otherwise (invalid JSON, non-object, or non-array `permissions`).
+ */
+export function parseSkillRules(text: string): SkillRule[] | null {
+  try {
+    const j = JSON.parse(text) as { permissions?: unknown };
+    if (!j || typeof j !== 'object' || Array.isArray(j)) return null;
+    if (!Object.hasOwn(j, 'permissions')) return [];
+    if (!Array.isArray(j.permissions)) return null;
+    return (j.permissions as { action?: unknown; resource?: unknown; effect?: unknown }[]).filter(
+      (r): r is SkillRule => Boolean(r && r.action === 'skill' && typeof r.resource === 'string'),
+    );
+  } catch {
+    return null;
+  }
+}
+
+export function applySkillRules(allowed: boolean, rules: readonly SkillRule[], id: string): boolean {
+  let cur = allowed;
+  for (const r of rules) {
+    if (r.resource === '*' || r.resource === id) cur = r.effect !== 'deny';
+  }
+  return cur;
+}
 
 /**
  * Live skills from opencode.json alone, the way OpenCode reads it: the last skill rule matching an
@@ -34,102 +62,52 @@ type Rule = { action?: unknown; resource?: unknown; effect?: unknown };
  * When `projectOpencodeText` is provided, matching rules there override/allow on top of global.
  */
 export function liveFromOpencode(opencodeText: string | null, allIds: string[], projectOpencodeText?: string | null): number {
-  let globalSkill: Rule[] = [];
+  let globalSkill: SkillRule[] = [];
   if (opencodeText != null) {
-    let rules: Rule[] = [];
-    try {
-      const j = JSON.parse(opencodeText) as { permissions?: unknown };
-      if (Array.isArray(j.permissions)) rules = j.permissions as Rule[];
-    } catch {
-      return 0;
-    }
-    globalSkill = rules.filter((r) => r && r.action === 'skill' && typeof r.resource === 'string');
+    const parsed = parseSkillRules(opencodeText);
+    if (parsed === null) return 0;
+    globalSkill = parsed;
   }
-  let projSkill: Rule[] = [];
-  if (projectOpencodeText != null) {
-    try {
-      const pj = JSON.parse(projectOpencodeText) as { permissions?: unknown };
-      if (Array.isArray(pj.permissions)) {
-        projSkill = (pj.permissions as Rule[]).filter((r) => r && r.action === 'skill' && typeof r.resource === 'string');
-      }
-    } catch {
-      // ignore invalid project opencode.json
-    }
-  }
+  const projSkill = projectOpencodeText != null ? (parseSkillRules(projectOpencodeText) ?? []) : [];
   if (!globalSkill.length && !projSkill.length) return allIds.length;
   let live = 0;
   for (const id of allIds) {
-    let allowed = true;
-    for (const r of globalSkill) {
-      if (r.resource === '*' || r.resource === id) allowed = r.effect !== 'deny';
-    }
-    for (const r of projSkill) {
-      if (r.resource === '*' || r.resource === id) allowed = r.effect !== 'deny';
-    }
-    if (allowed) live++;
+    if (applySkillRules(applySkillRules(true, globalSkill, id), projSkill, id)) live++;
   }
   return live;
-}
-
-function normalizeScopeDir(projectDir: string | null | undefined, home?: string): string | null {
-  if (!projectDir || core.isChatsDir(projectDir)) return null;
-  try {
-    const d = core.normalizeProjectDir(projectDir, home ? { home } : {});
-    return d === '~' || d === '/' ? null : d;
-  } catch {
-    return null;
-  }
 }
 
 export type CountsOptions = {
   projectDir?: string | null;
   home?: string;
   projectOpencodeText?: string | null;
+  opencodeText?: string | null;
+  cachedIds?: string[];
 };
-
-function projectSkillRulesFromText(text: string | null): Rule[] | null {
-  if (text === null) return [];
-  try {
-    const pj = JSON.parse(text) as { permissions?: unknown };
-    if (!pj || typeof pj !== 'object' || Array.isArray(pj)) return null;
-    if (!Object.hasOwn(pj, 'permissions')) return [];
-    if (!Array.isArray(pj.permissions)) return null;
-    return (pj.permissions as Rule[]).filter((r) => r && r.action === 'skill' && typeof r.resource === 'string');
-  } catch {
-    return null;
-  }
-}
 
 /** Counts from already-loaded data (the panel passes its state). */
 export function countsFromState(state: State | null, allIds: string[], opencodeText: string | null, opts?: CountsOptions): SkillCounts {
   const home = opts?.home ?? homeFromDirs(opts?.projectDir ? [opts.projectDir] : []);
-  const normDir = normalizeScopeDir(opts?.projectDir, home);
+  const homeOpt = home ? { home } : {};
+  const normDir = core.normalizeScopeDir(opts?.projectDir, homeOpt);
   if (!state) {
     const live = liveFromOpencode(opencodeText, allIds, opts?.projectOpencodeText);
     return { live, installed: allIds.length, chars: live * core.CHARS_PER_SKILL, bundlesOn: null, fromOpencode: true };
   }
-  const homeOpt = home ? { home } : {};
-  const matches = (list: string[] | undefined) =>
-    normDir != null &&
-    (list ?? []).some((x) => {
-      try { return core.normalizeProjectDir(x, homeOpt) === normDir; } catch { return x === normDir; }
-    });
-  const bundlesOn = state.bundles
-    .filter((b) => (normDir != null ? matches(b.projects) || (b.enabled && !matches(b.excludedProjects)) : b.enabled))
-    .map((b) => b.id);
+  const scope = { projectDir: normDir, ...homeOpt };
+  const bundlesOn = state.bundles.filter((b) => core.isBundleActive(b, scope)).map((b) => b.id);
 
-  const projRules = normDir != null && opts?.projectOpencodeText !== undefined
-    ? projectSkillRulesFromText(opts.projectOpencodeText)
-    : null;
+  const projRules =
+    normDir != null && opts?.projectOpencodeText !== undefined
+      ? opts.projectOpencodeText === null
+        ? []
+        : parseSkillRules(opts.projectOpencodeText)
+      : null;
   if (projRules !== null) {
     let live = 0;
     let auto = 0;
     for (const id of allIds) {
-      const gm = core.effectiveMode(state, id);
-      let allowed = gm !== 'off';
-      for (const r of projRules) {
-        if (r.resource === '*' || r.resource === id) allowed = r.effect !== 'deny';
-      }
+      const allowed = applySkillRules(core.effectiveMode(state, id) !== 'off', projRules, id);
       if (allowed) {
         live++;
         if (!Object.hasOwn(state.overrides, id) || state.overrides[id] !== 'called' || core.isBuiltin(id)) {
@@ -146,37 +124,60 @@ export function countsFromState(state: State | null, allIds: string[], opencodeT
     };
   }
 
-  const sum = core.summary(state, allIds, { projectDir: normDir, home });
+  let auto = 0;
+  let called = 0;
+  const activeBundleSkills = new Set<string>();
+  for (const b of state.bundles) {
+    if (bundlesOn.includes(b.id)) {
+      for (const id of b.skills) activeBundleSkills.add(id);
+    }
+  }
+  for (const id of allIds) {
+    const ov =
+      Object.hasOwn(state.overrides, id) && core.MODES.includes(state.overrides[id]) ? state.overrides[id] : undefined;
+    let mode = ov ?? (activeBundleSkills.has(id) ? 'auto' : 'off');
+    if (mode === 'called' && core.isBuiltin(id)) mode = 'auto';
+    if (mode === 'auto') auto++;
+    else if (mode === 'called') called++;
+  }
   return {
-    live: sum.on,
+    live: auto + called,
     installed: allIds.length,
-    chars: sum.chars,
+    chars: auto * core.CHARS_PER_SKILL,
     // ids ("dev, plan"): short enough for one line; names can be long.
     bundlesOn,
     fromOpencode: false,
   };
 }
 
+async function readProjectConfigSafe(
+  host: FileHost,
+  normDir: string | null,
+  given: string | null | undefined,
+): Promise<string | null | undefined> {
+  if (normDir == null || given !== undefined) return given;
+  try {
+    return await readOptional(host, core.projectConfigPath(normDir));
+  } catch (e) {
+    if (!isUnreadable(e)) throw e;
+    return undefined;
+  }
+}
+
 /** Read the files and count. */
 export async function readCounts(host: FileHost, opts?: CountsOptions): Promise<SkillCounts> {
   const home = opts?.home ?? homeFromDirs(opts?.projectDir ? [opts.projectDir] : []);
-  const normDir = normalizeScopeDir(opts?.projectDir, home);
-  const [bundlesText, opencodeText] = await Promise.all([
+  const homeOpt = home ? { home } : {};
+  const normDir = core.normalizeScopeDir(opts?.projectDir, homeOpt);
+  const opencodePromise =
+    opts?.opencodeText !== undefined ? Promise.resolve(opts.opencodeText) : readOptional(host, core.OPENCODE_PATH);
+  const [bundlesText, opencodeText, projectOpencodeText, allIds] = await Promise.all([
     readOptional(host, core.BUNDLES_PATH),
-    readOptional(host, core.OPENCODE_PATH),
+    opencodePromise,
+    readProjectConfigSafe(host, normDir, opts?.projectOpencodeText),
+    opts?.cachedIds ? Promise.resolve(opts.cachedIds) : opencodePromise.then((oc) => listSkillIds(host, oc)),
   ]);
-  const allIds = await listSkillIds(host, opencodeText);
-  const state = bundlesText == null ? null : core.parseBundles(bundlesText, home ? { home } : {});
-  let projectOpencodeText = opts?.projectOpencodeText;
-  if (normDir != null && projectOpencodeText === undefined) {
-    try {
-      projectOpencodeText = await readOptional(host, core.projectConfigPath(normDir));
-    } catch (e) {
-      const code = errorCode(e);
-      if (code !== 'DENIED' && code !== 'BAD_PATH' && code !== 'FILE_TOO_LARGE') throw e;
-      projectOpencodeText = undefined;
-    }
-  }
+  const state = bundlesText == null ? null : core.parseBundles(bundlesText, homeOpt);
   return countsFromState(state, allIds, opencodeText, { projectDir: normDir, home, projectOpencodeText });
 }
 

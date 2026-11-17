@@ -1,7 +1,7 @@
 // bun test shared/test/panel-lock.test.js
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createFakeHost } from "./fake-host.js";
-import { createPanelLock, LockedError } from "../panel/panel-lock.ts";
+import { createPanelLock, LockedError, statMtimeMs } from "../panel/panel-lock.ts";
 
 // A tiny protocol: {"owner":"panel","token":…} is ours; {"released":true,"owner":"panel"} is free.
 const PATH = "~/app/.lock";
@@ -141,4 +141,11 @@ test("reclaim race: someone else takes the stale lock first → we wait, not ove
   };
   await expect(lock.acquire()).rejects.toBeInstanceOf(LockedError);
   expect(JSON.parse(fx.read(PATH)).token).toBe("winner");
+});
+
+test("statMtimeMs normalizes missing, second, and millisecond mtimes", () => {
+  expect(statMtimeMs({ kind: "missing", mtime: 1_700_000_000 })).toBe(0);
+  expect(statMtimeMs({ kind: "file", mtime: 1_700_000_000 })).toBe(1_700_000_000_000);
+  expect(statMtimeMs({ kind: "file", mtime: 1_000_000_000_000 })).toBe(1_000_000_000_000);
+  expect(statMtimeMs({ kind: "file", mtime: 1_700_000_000_500 })).toBe(1_700_000_000_500);
 });

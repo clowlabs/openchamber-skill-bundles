@@ -1,6 +1,9 @@
 import { replaceTopLevelValue, spliceTopLevelArray } from "../shared/core/json-splice.js";
 import { createLockProtocol } from "../shared/core/lock.js";
 import { splitDoc, stripComment, yamlQuote, parseFrontmatter, requireSupported, readKey, setKey, removeKey } from "../shared/core/frontmatter.js";
+import { filterProjects, shortenDir } from "../shared/core/projects.js";
+
+export { filterProjects, shortenDir };
 
 export const BUNDLES_PATH = "~/.config/opencode/skill-bundles.json";
 export const OPENCODE_PATH = "~/.config/opencode/opencode.json";
@@ -20,7 +23,7 @@ export function backupName(date = new Date()) {
   const ymd = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, "0")}${String(date.getDate()).padStart(2, "0")}`;
   return `opencode.json.skill-bundles-${ymd}`;
 }
-const hasOwn = (o, k) => o != null && Object.prototype.hasOwnProperty.call(o, k);
+const hasOwn = (o, k) => o != null && Object.hasOwn(o, k);
 // Null-prototype copy so ids like "__proto__" / "constructor" are plain data keys.
 function copyOverrides(src) {
   const out = Object.create(null);
@@ -129,9 +132,17 @@ export function markMovedToProject(state, id, projectDir) {
   return setOverride(addProjectCopy(state, id, projectDir), id, "off");
 }
 
+// Pre-normalize `home` once per loop/call; null when absent or not an absolute directory.
+function normalizeHome(home) {
+  if (typeof home !== "string" || !home.startsWith("/")) return null;
+  const h = normalizeDirWithHome(home, null);
+  return h === "/" ? null : h;
+}
+
 // Normalized, deduped, sorted dir list.
 function dirList(dirs, home) {
-  return uniq(dirs.map((d) => normalizeDir(d, home))).sort();
+  const h = normalizeHome(home);
+  return uniq(dirs.map((d) => normalizeDirWithHome(d, h))).sort();
 }
 
 // Optional dir list from a file: undefined when absent or empty. Stored aliases are migrated
@@ -148,9 +159,9 @@ function parseDirList(v, where, home) {
   return out.length ? out : undefined;
 }
 
-// Canonical spelling: "." segments, repeated and trailing slashes collapsed; ".." refused.
-// With `home`, a dir under home is spelled "~/…" (home itself "~"), so the two spellings meet.
-function normalizeDir(dir, home) {
+// Canonical spelling with a pre-normalized `home` (`null` = none): "." segments, repeated and
+// trailing slashes collapsed; ".." refused. Under `home`, spelled "~/…" (home itself "~").
+function normalizeDirWithHome(dir, h) {
   if (typeof dir !== "string" || !(dir.startsWith("/") || dir === "~" || dir.startsWith("~/"))) {
     throw new Error(`Project directory must be absolute: ${JSON.stringify(dir)}`);
   }
@@ -158,11 +169,14 @@ function normalizeDir(dir, home) {
   const segs = (tilde ? dir.slice(1) : dir).split("/").filter((x) => x !== "" && x !== ".");
   if (segs.includes("..")) throw new Error(`Project directory must not contain "..": ${dir}`);
   let d = tilde ? (segs.length ? `~/${segs.join("/")}` : "~") : `/${segs.join("/")}`;
-  if (!tilde && typeof home === "string" && home.startsWith("/")) {
-    const h = normalizeDir(home);
-    if (h !== "/" && (d === h || d.startsWith(h + "/"))) d = d === h ? "~" : `~${d.slice(h.length)}`;
+  if (!tilde && h !== null && (d === h || d.startsWith(h + "/"))) {
+    d = d === h ? "~" : `~${d.slice(h.length)}`;
   }
   return d;
+}
+
+function normalizeDir(dir, home) {
+  return normalizeDirWithHome(dir, normalizeHome(home));
 }
 
 /** `<projectDir>/.opencode/skills/<id>` */
@@ -177,61 +191,112 @@ export function isChatsDir(dir) {
   return /(^|\/)\.config\/openchamber\/chats(\/|$)/.test(String(dir ?? ""));
 }
 
-/** Short label for a directory: `~/…` under home, else the last two segments. */
-export function shortenDir(dir, home) {
-  const d = String(dir ?? "").replace(/\/+$/, "");
-  if (home) {
-    const h = home.replace(/\/+$/, "");
-    if (d === h) return "~";
-    if (d.startsWith(h + "/")) return "~" + d.slice(h.length);
-  }
-  const segs = d.split("/").filter(Boolean);
-  return segs.length <= 2 ? d || "/" : `…/${segs.slice(-2).join("/")}`;
-}
-
-/** Case-insensitive match on name or directory. */
-export function filterProjects(projects, query) {
-  const q = String(query ?? "").trim().toLowerCase();
-  if (!q) return [...projects];
-  return projects.filter((p) => p.name.toLowerCase().includes(q) || p.directory.toLowerCase().includes(q));
-}
-
 /** True when text read as UTF-8 looks like it was not text (replacement chars or NULs). */
 export function looksBinary(text) {
   return text.includes("\uFFFD") || text.includes("\0");
 }
 
-export function effectiveMode(state, id, opts) {
+function normalizeScopeWithHome(dir, h) {
+  if (!dir || isChatsDir(dir)) return null;
+  try {
+    const d = normalizeDirWithHome(dir, h);
+    return d === "~" || d === "/" ? null : d;
+  } catch {
+    return null;
+  }
+}
+
+/** Normalized project dir when `dir` is a real project scope (not null, chats dir, "~", "/", or invalid); else null. */
+export function normalizeScopeDir(dir, { home } = {}) {
+  if (!dir || isChatsDir(dir)) return null;
+  try {
+    const d = normalizeDir(dir, home);
+    return d === "~" || d === "/" ? null : d;
+  } catch {
+    return null;
+  }
+}
+
+function sameDirWithNormalizedTarget(x, normalizedTarget, h) {
+  try {
+    return normalizeDirWithHome(x, h) === normalizedTarget;
+  } catch {
+    return false;
+  }
+}
+
+/** True when `a` and `b` normalize to the same project directory (falling back to strict equality on invalid paths). */
+export function sameProjectDir(a, b, { home } = {}) {
+  try {
+    const h = normalizeHome(home);
+    return normalizeDirWithHome(a, h) === normalizeDirWithHome(b, h);
+  } catch {
+    return a === b;
+  }
+}
+
+const hasNormalizedDir = (list, d, h) => (list ?? []).some((x) => sameDirWithNormalizedTarget(x, d, h));
+const isBundleActiveInNormalizedDir = (b, d, h) =>
+  hasNormalizedDir(b.projects, d, h) || (!!b.enabled && !hasNormalizedDir(b.excludedProjects, d, h));
+
+function resolveScope(opts) {
+  if (!opts?.projectDir || isChatsDir(opts.projectDir)) return { scopeDir: null, h: null };
+  try {
+    const h = normalizeHome(opts.home);
+    return { scopeDir: normalizeScopeWithHome(opts.projectDir, h), h };
+  } catch {
+    return { scopeDir: null, h: null };
+  }
+}
+
+/** True when `bundle` is active in `projectDir` (or globally when `projectDir` is not a project scope). */
+export function isBundleActive(bundle, opts = {}) {
+  const { scopeDir, h } = resolveScope(opts);
+  return scopeDir === null ? !!bundle.enabled : isBundleActiveInNormalizedDir(bundle, scopeDir, h);
+}
+
+/** Turn `bundleId` on or off in `projectDir` (or globally when `projectDir` is not a project scope). */
+export function setBundleInScope(state, bundleId, on, { projectDir, home } = {}) {
+  const d = normalizeScopeDir(projectDir, { home });
+  if (d === null) return setBundleGlobal(state, bundleId, on);
+  const b = requireBundle(state, bundleId);
+  const hOpt = home ? { home } : {};
+  if (on) return includeBundleProject(state, bundleId, d, hOpt);
+  return b.enabled ? excludeBundleProject(state, bundleId, d, hOpt) : removeBundleProject(state, bundleId, d, hOpt);
+}
+
+function effectiveModeInScope(state, id, scopeDir, h) {
   const ov = hasOwn(state.overrides, id) && MODES.includes(state.overrides[id]) ? state.overrides[id] : undefined;
-  let d = null;
-  if (opts?.projectDir && !isChatsDir(opts.projectDir)) {
-    try {
-      const norm = normalizeDir(opts.projectDir, opts.home);
-      if (norm !== "~" && norm !== "/") d = norm;
-    } catch {
-      d = null;
-    }
-  }
-  let mode;
-  if (ov !== undefined) {
-    mode = ov;
-  } else if (d !== null) {
-    const matchDir = (list) => (list ?? []).some((x) => normalizeDir(x, opts?.home) === d);
-    mode = state.bundles.some(
-      (b) => b.skills.includes(id) && (matchDir(b.projects) || (b.enabled && !matchDir(b.excludedProjects))),
-    ) ? "auto" : "off";
-  } else {
-    mode = state.bundles.some((b) => b.enabled && b.skills.includes(id)) ? "auto" : "off";
-  }
+  let mode = ov ?? (
+    state.bundles.some(
+      (b) => b.skills.includes(id) && (scopeDir === null ? !!b.enabled : isBundleActiveInNormalizedDir(b, scopeDir, h)),
+    )
+      ? "auto"
+      : "off"
+  );
   if (mode === "called" && isBuiltin(id)) mode = "auto";
   return mode;
 }
 
+export function effectiveMode(state, id, opts) {
+  const { scopeDir, h } = resolveScope(opts);
+  return effectiveModeInScope(state, id, scopeDir, h);
+}
+
 // Counts over allIds; `chars` estimates prompt size (only auto skills are advertised).
 export function summary(state, allIds, opts) {
+  const { scopeDir, h } = resolveScope(opts);
+  const activeSkills = new Set();
+  for (const b of state.bundles) {
+    if (scopeDir === null ? !!b.enabled : isBundleActiveInNormalizedDir(b, scopeDir, h)) {
+      for (const s of b.skills) activeSkills.add(s);
+    }
+  }
   let auto = 0, called = 0;
   for (const id of allIds) {
-    const m = effectiveMode(state, id, opts);
+    const ov = hasOwn(state.overrides, id) && MODES.includes(state.overrides[id]) ? state.overrides[id] : undefined;
+    let m = ov ?? (activeSkills.has(id) ? "auto" : "off");
+    if (m === "called" && isBuiltin(id)) m = "auto";
     if (m === "auto") auto++;
     else if (m === "called") called++;
   }
@@ -267,17 +332,9 @@ const mapBundle = (state, id, fn) => ({
 
 export function setBundleEnabled(state, bundleId, on) {
   const b = requireBundle(state, bundleId);
-  const flag = !!on;
   const overrides = copyOverrides(state.overrides);
   for (const s of b.skills) delete overrides[s];
-  return {
-    ...mapBundle(state, bundleId, (x) => {
-      const next = { ...x, enabled: flag };
-      if (!flag) delete next.excludedProjects;
-      return next;
-    }),
-    overrides,
-  };
+  return { ...setBundleGlobal(state, bundleId, on), overrides };
 }
 
 export function setBundleGlobal(state, bundleId, on) {
@@ -628,30 +685,25 @@ const withExcluded = (b, dirs) => {
   return dirs.length ? { ...rest, excludedProjects: dirs } : rest;
 };
 
-const isBundleActiveInDir = (b, d) => (b.projects ?? []).includes(d) || (b.enabled && !(b.excludedProjects ?? []).includes(d));
-
-/**
- * Every bundle's projects, excludedProjects and managedProjects in canonical spelling (aliases merged, deduped).
- * Returns `state` itself when nothing changes.
- */
-export function canonicalizeProjects(state, { home } = {}) {
+function canonicalizeProjectsWithHome(state, h) {
+  const dirListWithHome = (dirs) => uniq(dirs.map((d) => normalizeDirWithHome(d, h))).sort();
   let changed = false;
   const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
   const bundles = state.bundles.map((b) => {
     let cur = b;
     if (cur.projects) {
-      const list = dirList(cur.projects, home);
+      const list = dirListWithHome(cur.projects);
       if (!same(list, cur.projects)) { changed = true; cur = withProjects(cur, list); }
     }
     if (cur.excludedProjects) {
-      const list = dirList(cur.excludedProjects, home);
+      const list = dirListWithHome(cur.excludedProjects);
       if (!same(list, cur.excludedProjects)) { changed = true; cur = withExcluded(cur, list); }
     }
     return cur;
   });
   let managed = state.managedProjects;
   if (managed) {
-    const list = dirList(managed, home);
+    const list = dirListWithHome(managed);
     if (!same(list, managed)) { changed = true; managed = list; }
   }
   if (!changed) return state;
@@ -659,6 +711,14 @@ export function canonicalizeProjects(state, { home } = {}) {
   if (managed?.length) out.managedProjects = managed;
   else delete out.managedProjects;
   return out;
+}
+
+/**
+ * Every bundle's projects, excludedProjects and managedProjects in canonical spelling (aliases merged, deduped).
+ * Returns `state` itself when nothing changes.
+ */
+export function canonicalizeProjects(state, { home } = {}) {
+  return canonicalizeProjectsWithHome(state, normalizeHome(home));
 }
 
 /**
@@ -735,24 +795,31 @@ function projectSkills(state, dir) {
   ).sort();
 }
 
-/** Skill ids explicitly denied in canonical `dir` because every global bundle holding them excludes `dir`. */
+/** Skill ids explicitly denied in canonical `dir` because every global bundle holding them excludes `dir` (state must already be canonical). */
 function projectDenySkills(state, dir) {
   const candidateIds = uniq(
     state.bundles
       .filter((b) => b.enabled && (b.excludedProjects ?? []).includes(dir))
       .flatMap((b) => b.skills),
   );
+  if (!candidateIds.length) return [];
+  const activeInDir = new Set(
+    state.bundles
+      .filter((b) => (b.projects ?? []).includes(dir) || (b.enabled && !(b.excludedProjects ?? []).includes(dir)))
+      .flatMap((b) => b.skills),
+  );
   return candidateIds.filter((id) => {
     if (hasOwn(state.overrides, id)) return false;
-    if (effectiveMode(state, id) === "off") return false;
-    return !state.bundles.some((b) => b.skills.includes(id) && isBundleActiveInDir(b, dir));
+    if (effectiveModeInScope(state, id, null, null) === "off") return false;
+    return !activeInDir.has(id);
   }).sort();
 }
 
 /** Exact sorted allow and deny skill ids for `dir` (canonicalized with `opts.home`). */
 export function projectRuleSet(state, dir, opts = {}) {
-  const s = canonicalizeProjects(state, opts);
-  const d = normalizeDir(dir, opts.home);
+  const h = normalizeHome(opts.home);
+  const s = canonicalizeProjectsWithHome(state, h);
+  const d = normalizeDirWithHome(dir, h);
   return {
     allowIds: projectSkills(s, d),
     denyIds: projectDenySkills(s, d),

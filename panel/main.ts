@@ -13,14 +13,14 @@ import {
 } from '@openchamber/sdk/ui';
 import * as core from '../src/core.js';
 import type { Group, Mode } from '../src/core.js';
-import { closeSendMenu, initSend, openSendMenu, refreshSendMenu } from './send';
-import { initPopup, isPopupOpen, setHomeSource } from './popup';
-import { openProjectsMenu, refreshProjectsMenu } from './projects';
+import { closeSendMenu, initSend, openSendMenu } from './send';
+import { initPopup, isPopupOpen, refreshOpenMenus, setHomeSource } from './popup';
+import { openProjectsMenu } from './projects';
 import { deferRender, endDrag, initDrag, isDragging, onPillDown } from './drag';
 import { renderDetail } from './detail';
 import { renderCompact, renderCompactBusy } from './compact';
 import { countsFromState, formatTokens, liveLine, livePct, TOKENS_TITLE, tokensOf } from '../status/counts';
-import { $, el, HAND_EDIT, MODE_LABEL, UNBUNDLED, type Disposable } from './dom';
+import { $, el, HAND_EDIT, isMenuKey, MODE_LABEL, onAltOrContext, openAtAnchor, rovingKey, UNBUNDLED, type Disposable } from './dom';
 import { createEditGuard } from './edit-guard';
 import {
   S, activeProjectDir, applyChange, bundlesOf, canUndo, checkDisk, commit, effectiveHome, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, startSync, toastError, undo, undoDepth, undoLabel,
@@ -148,14 +148,9 @@ function renderPill(id: string, from: string, parent: HTMLElement) {
   });
   p.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(id); }
-    else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) { e.preventDefault(); menuAt(p, id, e.altKey, from); }
+    else if (isMenuKey(e)) { e.preventDefault(); openAtAnchor(p, (x, y) => openSendMenu(id, x, y, e.altKey, p, from)); }
   });
   parent.appendChild(p);
-}
-
-function menuAt(anchor: HTMLElement, id: string, alt: boolean, from?: string) {
-  const r = anchor.getBoundingClientRect();
-  openSendMenu(id, r.left, r.bottom, alt, anchor, from);
 }
 
 function sendBlocked(id: string): string | null {
@@ -221,20 +216,11 @@ function renderGroup(g: Group, root: HTMLElement) {
       pb.setAttribute('aria-haspopup', 'dialog');
       pb.title = 'Turn this bundle on in specific projects';
       if (total) pb.appendChild(el('span', 'sb-proj-count', String(total)));
-      pb.addEventListener('click', () => { const r = pb.getBoundingClientRect(); openProjectsMenu(g.id, r.left, r.bottom, pb); });
+      pb.addEventListener('click', () => openAtAnchor(pb, (x, y) => openProjectsMenu(g.id, x, y, pb)));
       head.appendChild(pb);
-      head.addEventListener('click', (e) => {
-        if (!e.altKey) return;
-        if ((e.target as HTMLElement).closest('button, input, label, .sb-pill, .oc-sdk')) return;
-        e.preventDefault();
-        openProjectsMenu(g.id, e.clientX, e.clientY, pb);
-      });
-      head.addEventListener('contextmenu', (e) => {
-        if ((e.target as HTMLElement).closest('.sb-pill')) return;
-        e.preventDefault();
-        openProjectsMenu(g.id, e.clientX, e.clientY, pb);
-      });
+      onAltOrContext(head, (x, y) => openProjectsMenu(g.id, x, y, pb), 'button, .oc-switch, a, input, label, .sb-pill, .oc-sdk', '.sb-pill');
       const sw = el('span'); head.appendChild(sw);
+      // Page editor switch resets per-skill overrides (setBundleEnabled), unlike Rail / Global (setBundleGlobal) which preserves them.
       groupMounts.push(mountSwitch(sw, { label: '', checked: g.enabled, onChange: (on) => commit((s) => core.setBundleEnabled(s, g.id, on), undefined, { label: 'toggle bundle' }) }));
       const m = el('span'); head.appendChild(m);
       groupMounts.push(mountMenu(m, {
@@ -326,20 +312,14 @@ function setModeQuick(id: string, m: Mode) {
 function onRowKey(e: KeyboardEvent, id: string, rows: HTMLElement[]) {
   if (e.target !== e.currentTarget || e.ctrlKey || e.metaKey) return;
   const i = rows.findIndex((r) => r.dataset.id === id);
-  const go = (n: number) => {
-    const r = rows[Math.max(0, Math.min(rows.length - 1, n))];
-    if (!r) return;
-    rows.forEach((x) => (x.tabIndex = -1));
-    r.tabIndex = 0;
-    r.focus();
-  };
+  if (rovingKey(e, rows, i)) return;
   const k = e.key.toLowerCase();
-  if (e.key === 'ArrowDown') { e.preventDefault(); go(i + 1); }
-  else if (e.key === 'ArrowUp') { e.preventDefault(); go(i - 1); }
-  else if (e.key === 'Home') { e.preventDefault(); go(0); }
-  else if (e.key === 'End') { e.preventDefault(); go(rows.length - 1); }
-  else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(id); }
-  else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) { e.preventDefault(); menuAt(e.currentTarget as HTMLElement, id, e.altKey); }
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(id); }
+  else if (isMenuKey(e)) {
+    e.preventDefault();
+    const anchor = e.currentTarget as HTMLElement;
+    openAtAnchor(anchor, (x, y) => openSendMenu(id, x, y, e.altKey, anchor));
+  }
   else if (!e.altKey && k in MODE_KEYS) { e.preventDefault(); V.refocusRow = true; setModeQuick(id, MODE_KEYS[k]); }
 }
 
@@ -411,8 +391,7 @@ let compact = false;
 function render() {
   if (compact) {
     renderCompact($('compact'));
-    refreshProjectsMenu();
-    refreshSendMenu();
+    refreshOpenMenus();
     return;
   }
   if (isDragging()) { deferRender(); renderLight(); return; }
@@ -424,8 +403,7 @@ function render() {
   renderGroups();
   renderDetail(V.selected);
   renderLight();
-  refreshProjectsMenu();
-  refreshSendMenu();
+  refreshOpenMenus();
 }
 
 function isEditingPageControl(): boolean {
@@ -440,6 +418,7 @@ function isEditingPageControl(): boolean {
 }
 
 const editGuard = createEditGuard({
+  enabled: false,
   isEditing: isEditingPageControl,
   isTargetDeleted: () => {
     const bundles = S.state?.bundles;
@@ -449,8 +428,7 @@ const editGuard = createEditGuard({
   },
   onDefer: () => {
     renderLight();
-    refreshProjectsMenu();
-    refreshSendMenu();
+    refreshOpenMenus();
   },
   onRender: render,
 });
@@ -459,12 +437,10 @@ hooks.render = render;
 hooks.renderLight = renderLight;
 hooks.onExternalSync = () => {
   if (compact) {
-    renderCompact($('compact'));
-    refreshProjectsMenu();
-    refreshSendMenu();
-  } else {
-    editGuard.onExternalSync();
+    render();
+    return;
   }
+  editGuard.onExternalSync();
 };
 
 initDrag({
@@ -577,7 +553,7 @@ function mountChrome() {
   tabsHandle = mountTabs($('tabs'), {
     items: [{ id: 'bundles', label: 'Bundles' }, { id: 'all', label: 'All skills' }],
     activeId: V.tab,
-    onChange: (id) => { closeSendMenu(); V.tab = id as typeof V.tab; tabsHandle!.update({ activeId: id }); render(); },
+    onChange: (id) => { closeSendMenu(); V.tab = id as typeof V.tab; tabsHandle?.update({ activeId: id }); render(); },
   });
   const undoWrap = $('undo-wrap');
   undoSpan = el('span');
@@ -615,7 +591,7 @@ function mountChrome() {
   const f = el('div'), b = el('div');
   nb.append(f, b);
   let name = '';
-  newField = mountTextField(f, { value: '', placeholder: 'New bundle name', disabled: true, onChange: (v) => { name = v; newField!.update({ value: v }); } });
+  newField = mountTextField(f, { value: '', placeholder: 'New bundle name', disabled: true, onChange: (v) => { name = v; newField?.update({ value: v }); } });
   const create = () => {
     const n = name.trim();
     if (!n || !S.loaded) return;
@@ -679,7 +655,10 @@ host.onReady((ctx) => {
   mounted = true;
   compact = ctx.surface === 'panel';
   document.body.classList.toggle('sb-compact', compact);
-  if (!compact) {
+  if (compact) {
+    editGuard.dispose();
+  } else {
+    editGuard.enable();
     mountChrome();
     void host.storage.get(SKIP_UNDO_CONFIRM_KEY, storageOpts)
       .then((val) => {

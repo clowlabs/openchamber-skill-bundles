@@ -1,5 +1,7 @@
 // OpenChamber's project list for panels: one subscription shared by every menu, OpenChamber's
 // synthetic chat folders skipped, plus the home folder guess and short directory labels.
+import { filterProjects, shortenDir } from '../core/projects.js';
+export { filterProjects, shortenDir };
 import { errorCode, type ProjectInfo, type ProjectsHost, type ProjectsSnapshot } from './host';
 
 export type Project = ProjectInfo;
@@ -35,23 +37,35 @@ export function homeFromDirs(dirs: readonly string[], opts: { chatsSuffix?: stri
   return homes.size === 1 ? [...homes][0] : undefined;
 }
 
-/** `~/…` under home, else the last two segments (`…/a/b`). */
-export function shortenDir(dir: string | null | undefined, home?: string) {
-  const d = String(dir ?? '').replace(/\/+$/, '');
-  if (home) {
-    const h = home.replace(/\/+$/, '');
-    if (d === h) return '~';
-    if (d.startsWith(h + '/')) return '~' + d.slice(h.length);
+export type HomeState = { home: string | undefined; homeDerived: boolean };
+
+/** Derive home once from `host.listProjects()`, storing into `state` (`home` / `homeDerived`). */
+export async function deriveHomeFromHost(
+  host: ProjectsHost,
+  state: HomeState,
+  onError?: (e: unknown) => void,
+): Promise<string | undefined> {
+  if (state.homeDerived) return state.home;
+  try {
+    const snap = await host.listProjects();
+    state.home = homeFromDirs(snap.projects.map((p) => p.directory));
+    state.homeDerived = snap.state === 'ready' || state.home != null;
+  } catch (e) {
+    onError?.(e);
   }
-  const segs = d.split('/').filter(Boolean);
-  return segs.length <= 2 ? d || '/' : `…/${segs.slice(-2).join('/')}`;
+  return state.home;
 }
 
-/** Case-insensitive match on name or directory. */
-export function filterProjects<T extends Project>(list: readonly T[], query: string | null | undefined): T[] {
-  const q = String(query ?? '').trim().toLowerCase();
-  if (!q) return [...list];
-  return list.filter((p) => p.name.toLowerCase().includes(q) || p.directory.toLowerCase().includes(q));
+export function createHomeDeriver(host: ProjectsHost, onError?: (e: unknown) => void) {
+  const state: HomeState = { home: undefined, homeDerived: false };
+  return {
+    derive: () => deriveHomeFromHost(host, state, onError),
+    get: () => state.home,
+    reset: () => {
+      state.home = undefined;
+      state.homeDerived = false;
+    },
+  };
 }
 
 export type ProjectListOptions = {

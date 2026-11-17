@@ -48,6 +48,9 @@ export function randomToken() {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+export const statMtimeMs = (st: { kind: string; mtime: number }): number =>
+  st.kind === 'missing' ? 0 : st.mtime < 1e12 ? st.mtime * 1000 : st.mtime;
+
 export type PanelLock = {
   acquire: () => Promise<string>;
   release: (token: string) => Promise<void>;
@@ -64,9 +67,7 @@ export function createPanelLock<Info>(o: PanelLockOptions<Info>): PanelLock {
     return i != null && o.isOwn(i, token);
   };
   async function mtimeMs() {
-    const st = await o.host.stat(o.path);
-    if (st.kind === 'missing') return 0;
-    return st.mtime < 1e12 ? st.mtime * 1000 : st.mtime;
+    return statMtimeMs(await o.host.stat(o.path));
   }
   async function acquire(): Promise<string> {
     const deadline = Date.now() + timing.waitMs;

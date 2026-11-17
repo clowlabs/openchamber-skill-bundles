@@ -8,8 +8,22 @@ export { button, closePopup, isPopupOpen, place, replace } from '../shared/panel
 /** Skill Bundles' menus use the "sb-ctx" class names from styles.css. */
 export const createPopup = (opts: PopupOptions) => sharedCreatePopup({ classPrefix: 'sb-ctx', ...opts });
 export const note = (text: string) => sharedNote(text, 'sb-ctx');
+export function sectionTitle(text: string) {
+  const h = document.createElement('div');
+  h.className = 'sb-ctx-title';
+  h.textContent = text;
+  return h;
+}
 export type { Project } from '../shared/panel/projects';
 export { errorCode as codeOf } from '../shared/panel/host';
+
+const menuRefreshers = new Set<() => void>();
+export const onRefreshMenus = (fn: () => void) => {
+  menuRefreshers.add(fn);
+};
+export const refreshOpenMenus = () => {
+  menuRefreshers.forEach((fn) => fn());
+};
 
 let list: ProjectList;
 let knownHome: () => string | undefined = () => undefined;

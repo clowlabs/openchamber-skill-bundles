@@ -3,36 +3,50 @@
 // The frame only runs while the section is shown.
 import { connectHost } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
-import { errText } from '../shared/panel/host';
-import { homeFromDirs } from '../shared/panel/projects';
+import * as core from '../src/core.js';
+import { skillRoots } from '../src/discover.js';
+import { errorCode, errText, readOptional } from '../shared/panel/host';
+import { createHomeDeriver } from '../shared/panel/projects';
 import { listenChanges } from '../panel/sync';
-import { createStatusRefresher, readCounts, renderMeterHeader, type SkillCounts } from './counts';
+import { createStatusRefresher, listSkillIds, readCounts, renderMeterHeader, type SkillCounts } from './counts';
 
 const host = connectHost();
+const homeDeriver = createHomeDeriver(host);
 let currentDir: string | null = null;
-let home: string | undefined;
-let homeDerived = false;
 let mounted = false;
+let idCache: { allIds: string[]; rootsKey: string; rootStamps: string } | null = null;
+let needFull = true;
 
-async function deriveHome() {
-  if (homeDerived) return;
-  try {
-    const snap = await host.listProjects();
-    home = homeFromDirs(snap.projects.map((p) => p.directory));
-    homeDerived = snap.state === 'ready' || home != null;
-  } catch {
-    // best-effort: status works without listProjects permission
-  }
+function requestRefresh(fast = false) {
+  if (!fast) needFull = true;
+  void refresh();
 }
 
 host.onDirectory((dir) => {
   if (currentDir === dir) return;
   currentDir = dir;
-  if (mounted) void refresh();
+  if (mounted) requestRefresh(true);
 });
+
 const REFRESH_MS = 30_000;
-const $ = (id: string) => document.getElementById(id)!;
+function $(id: string): HTMLElement {
+  const el = document.getElementById(id);
+  if (!el) throw new Error(`Missing #${id}`);
+  return el;
+}
 const fit = () => void host.setHeight(Math.ceil(document.body.scrollHeight));
+
+async function statRoots(roots: readonly string[]): Promise<string> {
+  const stamps = await Promise.all(
+    roots.map((r) =>
+      host.stat(r).then(
+        (st) => `${st.kind}:${st.size}:${st.mtime}`,
+        (e) => `err:${errorCode(e) || 'ERR'}`,
+      ),
+    ),
+  );
+  return stamps.join('|');
+}
 
 function paint(c: SkillCounts) {
   const head = $('head');
@@ -51,8 +65,23 @@ function paint(c: SkillCounts) {
 
 const refresh = createStatusRefresher(
   async () => {
-    await deriveHome();
-    return readCounts(host, { projectDir: currentDir, home });
+    const full = needFull || idCache === null;
+    needFull = false;
+    const [home, opencodeText] = await Promise.all([
+      homeDeriver.derive(),
+      readOptional(host, core.OPENCODE_PATH),
+    ]);
+    const roots = skillRoots(opencodeText);
+    const rootsKey = JSON.stringify(roots);
+    const rootStamps = await statRoots(roots);
+    let allIds: string[];
+    if (!full && idCache && idCache.rootsKey === rootsKey && idCache.rootStamps === rootStamps) {
+      allIds = idCache.allIds;
+    } else {
+      allIds = await listSkillIds(host, opencodeText);
+      idCache = { allIds, rootsKey, rootStamps };
+    }
+    return readCounts(host, { projectDir: currentDir, home, opencodeText, cachedIds: allIds });
   },
   paint,
   (e) => {
@@ -79,9 +108,9 @@ host.onReady((ctx) => {
   section.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPanel(); }
   });
-  void refresh();
-  listenChanges(() => { void refresh(); });
+  requestRefresh(false);
+  listenChanges(({ full }) => { requestRefresh(!full); });
   // The frame is unloaded when the section is collapsed, so this only runs while visible.
-  setInterval(() => { if (document.visibilityState !== 'hidden') void refresh(); }, REFRESH_MS);
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void refresh(); });
+  setInterval(() => { if (document.visibilityState !== 'hidden') requestRefresh(false); }, REFRESH_MS);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') requestRefresh(false); });
 });

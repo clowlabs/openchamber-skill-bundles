@@ -24,7 +24,7 @@ check() {
 check Typecheck bun run typecheck
 check Tests bun run test
 check "Shared tests (node)" node --test shared/test/core-*.test.js shared/test/node-*.test.js
-check "Shared tests (bun)" bun test shared/test/panel-
+check "Shared tests (bun)" bun test shared/test/panel-*.test.js
 check Lint bun run lint
 check "SDK check" bunx openchamber-guest-check .
 

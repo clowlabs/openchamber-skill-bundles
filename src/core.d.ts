@@ -112,7 +112,7 @@ export function markMovedToProject(state: State, id: string, projectDir: string)
 export function projectSkillDir(projectDir: string, id: string): string;
 export function isChatsDir(dir: string | null | undefined): boolean;
 export function shortenDir(dir: string | null | undefined, home?: string): string;
-export function filterProjects<T extends ProjectRef>(projects: T[], query: string | null | undefined): T[];
+export function filterProjects<T extends ProjectRef>(projects: readonly T[], query: string | null | undefined): T[];
 export function looksBinary(text: string): boolean;
 
 // ---------- save planner ----------
@@ -214,6 +214,14 @@ export const PROJECT_CONFIG_REL: ".opencode/opencode.json";
  * throws. With opts.home, a dir under home becomes "~/…" (home itself "~").
  */
 export function normalizeProjectDir(dir: string, opts?: HomeOption): string;
+/** Canonical project dir when `dir` is a real project scope (not null, chats dir, "~", "/", or invalid); else null. */
+export function normalizeScopeDir(dir: string | null | undefined, opts?: HomeOption): string | null;
+/** True when `a` and `b` normalize to the same project directory. */
+export function sameProjectDir(a: string, b: string, opts?: HomeOption): boolean;
+/** True when `bundle` is active in `opts.projectDir` (or globally when not a project scope). */
+export function isBundleActive(bundle: Bundle, opts?: ScopeOption): boolean;
+/** Turn `bundleId` on or off in `opts.projectDir` (or globally when not a project scope). */
+export function setBundleInScope(state: State, bundleId: string, on: boolean, opts?: ScopeOption): State;
 /** "<dir>/.opencode/opencode.json" */
 export function projectConfigPath(dir: string): string;
 export function setBundleProjects(state: State, bundleId: string, dirs: string[], opts?: HomeOption): State;

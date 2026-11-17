@@ -269,11 +269,18 @@ function physicalDir(env, dir) {
   }
 }
 
+function storedProjectDirs(state) {
+  return [
+    ...state.bundles.flatMap((b) => [...(b.projects ?? []), ...(b.excludedProjects ?? [])]),
+    ...(state.managedProjects ?? []),
+  ];
+}
+
 // Canonical dirs that are the same physical folder (symlinks, bind spellings) are merged under
 // the spelling listed first: stored spellings in bundle order, then managedProjects.
 function mergePhysicalAliases(env, state) {
   const order = [];
-  for (const d of [...state.bundles.flatMap((b) => [...(b.projects ?? []), ...(b.excludedProjects ?? [])]), ...(state.managedProjects ?? [])]) {
+  for (const d of storedProjectDirs(state)) {
     if (!order.includes(d)) order.push(d);
   }
   const first = new Map();
@@ -336,7 +343,7 @@ function commit(env, ctx, state, opts) {
     for (const w of writes) print(diff(w.file, w.before, w.after));
     return writes.length;
   }
-  publish(env, writes, ctx.inputs);
+  publish(writes, ctx.inputs);
   // keep ctx in step with disk, so later commits in this run start from what was written
   for (const w of writes) {
     ctx.inputs.set(w.file, w.after);
@@ -349,7 +356,7 @@ function commit(env, ctx, state, opts) {
 
 // Daily backup of the global opencode.json, named after the real file (it may sit behind a
 // symlink): <real>.skill-bundles-YYYYMMDD. Project files get no backup (see SPEC).
-function publish(env, writes, inputs) {
+function publish(writes, inputs) {
   fsSafe.publish(io, writes, {
     inputs,
     rescueTag: "skill-bundles",
@@ -402,6 +409,16 @@ function projectArg(dir) {
   if (dir === "~" || dir === "~/") throw new CliError("--project: use a project directory, not your home directory");
   if (dir.startsWith("~/") || path.isAbsolute(dir)) return dir;
   return path.resolve(process.cwd(), dir);
+}
+
+function offProjectMessage(ids, unpinned, dir) {
+  if (unpinned.length === ids.length) {
+    return `unpinned ${unpinned.join(", ")} in ${dir} (still on globally; run 'skills off ${unpinned[0]} --project ${dir}' again to exclude it here)`;
+  }
+  if (unpinned.length) {
+    return `stopped allowing ${ids.join(", ")} in ${dir}; unpinned ${unpinned.join(", ")} (still on globally; run 'skills off <bundle> --project ${dir}' again to exclude it here)`;
+  }
+  return `stopped allowing ${ids.join(", ")} in ${dir}`;
 }
 
 function totals(state, allIds) {
@@ -492,34 +509,25 @@ function run(env, opts, pos, cmd) {
           }
           // an alias of a dir already stored is the same project: use the stored spelling
           const key = physicalDir(env, dir);
-          const stored = [...state.bundles.flatMap((b) => [...(b.projects ?? []), ...(b.excludedProjects ?? [])]), ...(state.managedProjects ?? [])]
-            .find((d) => d !== dir && physicalDir(env, d) === key);
+          const stored = storedProjectDirs(state).find((d) => d !== dir && physicalDir(env, d) === key);
           if (stored) dir = stored;
           const unpinnedGlobal = [];
+          const norm = core.normalizeProjectDir(dir, { home: env.home });
+          const hasProj = (list) => (list ?? []).some((x) => core.normalizeProjectDir(x, { home: env.home }) === norm);
           for (const id of ids) {
             const b = state.bundles.find((x) => x.id === id);
-            const norm = core.normalizeProjectDir(dir, { home: env.home });
-            const hasProj = (list) => (list ?? []).some((x) => core.normalizeProjectDir(x, { home: env.home }) === norm);
             if (cmd === "on") {
               state = hasProj(b?.excludedProjects)
                 ? core.includeBundleProject(state, id, dir, { home: env.home })
                 : core.addBundleProject(state, id, dir, { home: env.home });
-            } else {
-              if (hasProj(b?.projects)) {
-                state = core.removeBundleProject(state, id, dir, { home: env.home });
-                if (b?.enabled) unpinnedGlobal.push(id);
-              } else if (b?.enabled) {
-                state = core.excludeBundleProject(state, id, dir, { home: env.home });
-              }
+            } else if (hasProj(b?.projects)) {
+              state = core.removeBundleProject(state, id, dir, { home: env.home });
+              if (b?.enabled) unpinnedGlobal.push(id);
+            } else if (b?.enabled) {
+              state = core.excludeBundleProject(state, id, dir, { home: env.home });
             }
           }
-          const msg = cmd === "on"
-            ? `allowed ${ids.join(", ")} in ${dir}`
-            : unpinnedGlobal.length === ids.length
-              ? `unpinned ${unpinnedGlobal.join(", ")} in ${dir} (still on globally; run 'skills off ${unpinnedGlobal[0]} --project ${dir}' again to exclude it here)`
-              : unpinnedGlobal.length
-                ? `stopped allowing ${ids.join(", ")} in ${dir}; unpinned ${unpinnedGlobal.join(", ")} (still on globally; run 'skills off <bundle> --project ${dir}' again to exclude it here)`
-                : `stopped allowing ${ids.join(", ")} in ${dir}`;
+          const msg = cmd === "on" ? `allowed ${ids.join(", ")} in ${dir}` : offProjectMessage(ids, unpinnedGlobal, dir);
           return mutate(state, msg);
         } catch (e) {
           throw new CliError(e.message);

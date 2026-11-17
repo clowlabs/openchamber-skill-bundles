@@ -34,6 +34,10 @@ export interface ProjectsHost {
 export const errorCode = (e: unknown): string =>
   e && typeof e === 'object' && typeof (e as { code?: unknown }).code === 'string' ? (e as { code: string }).code : '';
 export const isNotFound = (e: unknown) => errorCode(e) === 'NOT_FOUND';
+export function isUnreadable(e: unknown): boolean {
+  const c = errorCode(e);
+  return c === 'DENIED' || c === 'BAD_PATH' || c === 'FILE_TOO_LARGE';
+}
 
 /** "CODE: message" for host errors, else the message. */
 export function errText(e: unknown) {

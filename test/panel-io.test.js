@@ -2884,3 +2884,357 @@ test("regression: missing or empty {} project opencode.json reports 0 live for p
     cleanupDom();
   }
 });
+
+test("checkDisk uses fast path (0 listDir calls) on external skill-bundles.json edit and full path on direct SKILL.md edit", async () => {
+  let listDirCalls = 0;
+  const h = fakeHost();
+  const origListDir = h.listDir;
+  h.listDir = async (p) => {
+    listDirCalls++;
+    return origListDir(p);
+  };
+  io.setHost(h);
+  await io.load();
+  listDirCalls = 0;
+
+  // External skill-bundles.json edit only -> fast path with 0 listDir calls
+  const next = core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [{ id: "b", name: "B", enabled: true, skills: ["alpha", "beta"] }],
+    overrides: {},
+  }));
+  put(core.BUNDLES_PATH, core.serializeBundles(next));
+  const future = new Date(Date.now() + 5000);
+  fs.utimesSync(real(core.BUNDLES_PATH), future, future);
+
+  expect(await io.checkDisk()).toBe(true);
+  expect(listDirCalls).toBe(0);
+  expect(io.S.state.bundles[0].enabled).toBe(true);
+
+  // Direct SKILL.md edit -> full path (walks skill roots) and updates meta(id).description
+  put("~/.config/opencode/skills/alpha/SKILL.md", skillMd("Alpha updated via SKILL.md"));
+  const future2 = new Date(Date.now() + 10000);
+  fs.utimesSync(real("~/.config/opencode/skills/alpha/SKILL.md"), future2, future2);
+
+  expect(await io.checkDisk()).toBe(true);
+  expect(listDirCalls).toBeGreaterThan(0);
+  expect(io.meta("alpha").description).toBe("Alpha updated via SKILL.md");
+});
+
+test("malformed skill-bundles.json during checkDisk warns once and does not retry infinitely on unchanged checkDisk", async () => {
+  let reads = 0;
+  let warns = 0;
+  const h = fakeHost();
+  const origRead = h.readFile;
+  h.readFile = async (p) => {
+    reads++;
+    return origRead(p);
+  };
+  io.setHost(h);
+  await io.load();
+
+  const origWarn = console.warn;
+  console.warn = (...args) => {
+    if (String(args[0] ?? "").includes("failed to parse skill-bundles.json")) warns++;
+  };
+  try {
+    put(core.BUNDLES_PATH, "{ invalid json\n");
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(real(core.BUNDLES_PATH), future, future);
+
+    reads = 0;
+    expect(await io.checkDisk()).toBe(false);
+    expect(warns).toBe(1);
+    expect(reads).toBeGreaterThan(0);
+    // Existing S.state remains intact
+    expect(io.S.state.bundles[0].id).toBe("b");
+
+    // Subsequent unchanged checkDisk() does not re-read files or warn again
+    reads = 0;
+    expect(await io.checkDisk()).toBe(false);
+    expect(reads).toBe(0);
+    expect(warns).toBe(1);
+
+    // Once fixed on disk, checkDisk() recovers cleanly
+    const fixed = core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B", enabled: true, skills: ["alpha"] }],
+      overrides: {},
+    }));
+    put(core.BUNDLES_PATH, core.serializeBundles(fixed));
+    const future2 = new Date(Date.now() + 10000);
+    fs.utimesSync(real(core.BUNDLES_PATH), future2, future2);
+    expect(await io.checkDisk()).toBe(true);
+    expect(io.S.state.bundles[0].enabled).toBe(true);
+    expect(io.S.state.bundles[0].skills).toEqual(["alpha"]);
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+// ---------- simplify-code regression & efficiency tests ----------
+
+test("core scope primitives: normalizeScopeDir, sameProjectDir, isBundleActive, and setBundleInScope", () => {
+  const hOpt = { home: "/home/me" };
+
+  // normalizeScopeDir rejects empty, chats dirs, "~", "/", relative paths, and ".."; canonicalizes valid project paths
+  expect(core.normalizeScopeDir(null, hOpt)).toBeNull();
+  expect(core.normalizeScopeDir(undefined, hOpt)).toBeNull();
+  expect(core.normalizeScopeDir("", hOpt)).toBeNull();
+  expect(core.normalizeScopeDir("~/.config/openchamber/chats/2026-01-01/s1", hOpt)).toBeNull();
+  expect(core.normalizeScopeDir("/home/me/.config/openchamber/chats/s1", hOpt)).toBeNull();
+  expect(core.normalizeScopeDir("~", hOpt)).toBeNull();
+  expect(core.normalizeScopeDir("/home/me", hOpt)).toBeNull();
+  expect(core.normalizeScopeDir("/", hOpt)).toBeNull();
+  expect(core.normalizeScopeDir("relative/path", hOpt)).toBeNull();
+  expect(core.normalizeScopeDir("work/app", hOpt)).toBeNull();
+  expect(core.normalizeScopeDir("~/work/../escape", hOpt)).toBeNull();
+  expect(core.normalizeScopeDir("~/work/app/", hOpt)).toBe("~/work/app");
+  expect(core.normalizeScopeDir("/home/me/work/app", hOpt)).toBe("~/work/app");
+  expect(core.normalizeScopeDir("/srv/work/app/", hOpt)).toBe("/srv/work/app");
+
+  // sameProjectDir matches "~/..." and absolute path under home, and falls back safely on invalid paths
+  expect(core.sameProjectDir("~/work/app/", "/home/me/work/app", hOpt)).toBe(true);
+  expect(core.sameProjectDir("/home/me/work/app", "/home/me/work/other", hOpt)).toBe(false);
+  expect(core.sameProjectDir("relative/a", "relative/a", hOpt)).toBe(true);
+  expect(core.sameProjectDir("relative/a", "relative/b", hOpt)).toBe(false);
+
+  // Global scope toggles via setBundleGlobal, preserving per-skill 'off' overrides
+  let st = core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [{ id: "b", name: "B", enabled: false, skills: ["alpha", "beta"] }],
+    overrides: { alpha: "off" },
+  }), hOpt);
+  expect(core.isBundleActive(st.bundles[0], { projectDir: null, ...hOpt })).toBe(false);
+  expect(core.isBundleActive(st.bundles[0], { projectDir: "~/.config/openchamber/chats/c1", ...hOpt })).toBe(false);
+
+  st = core.setBundleInScope(st, "b", true, { projectDir: null, ...hOpt });
+  expect(st.bundles[0].enabled).toBe(true);
+  expect(st.overrides.alpha).toBe("off");
+  expect(core.isBundleActive(st.bundles[0], { projectDir: null, ...hOpt })).toBe(true);
+
+  // Project scope on an enabled bundle: turning off adds excludedProjects and clears any explicit projects entry
+  st = core.addBundleProject(st, "b", "/home/me/work/app", hOpt);
+  expect(st.bundles[0].projects).toEqual(["~/work/app"]);
+  st = core.setBundleInScope(st, "b", false, { projectDir: "/home/me/work/app/", ...hOpt });
+  expect(st.bundles[0].enabled).toBe(true);
+  expect(st.bundles[0].projects).toBeUndefined();
+  expect(st.bundles[0].excludedProjects).toEqual(["~/work/app"]);
+  expect(core.isBundleActive(st.bundles[0], { projectDir: "~/work/app", ...hOpt })).toBe(false);
+  expect(core.isBundleActive(st.bundles[0], { projectDir: "~/work/other", ...hOpt })).toBe(true);
+
+  // Turning back on in project scope clears excludedProjects via includeBundleProject without redundant projects entry
+  st = core.setBundleInScope(st, "b", true, { projectDir: "/home/me/work/app", ...hOpt });
+  expect(st.bundles[0].enabled).toBe(true);
+  expect(st.bundles[0].excludedProjects).toBeUndefined();
+  expect(st.bundles[0].projects).toBeUndefined();
+  expect(core.isBundleActive(st.bundles[0], { projectDir: "~/work/app", ...hOpt })).toBe(true);
+
+  // Global off clears excludedProjects; disabled bundle toggles on/off in a project via projects
+  st = core.setBundleInScope(st, "b", false, { projectDir: "~/work/app", ...hOpt });
+  expect(st.bundles[0].excludedProjects).toEqual(["~/work/app"]);
+  st = core.setBundleInScope(st, "b", false, { projectDir: null, ...hOpt });
+  expect(st.bundles[0].enabled).toBe(false);
+  expect(st.bundles[0].excludedProjects).toBeUndefined();
+  expect(st.overrides.alpha).toBe("off");
+
+  st = core.setBundleInScope(st, "b", true, { projectDir: "/home/me/work/app/", ...hOpt });
+  expect(st.bundles[0].enabled).toBe(false);
+  expect(st.bundles[0].projects).toEqual(["~/work/app"]);
+  expect(core.isBundleActive(st.bundles[0], { projectDir: "/home/me/work/app", ...hOpt })).toBe(true);
+  expect(core.isBundleActive(st.bundles[0], { projectDir: "/home/me/work/other", ...hOpt })).toBe(false);
+
+  st = core.setBundleInScope(st, "b", false, { projectDir: "~/work/app", ...hOpt });
+  expect(st.bundles[0].projects).toBeUndefined();
+  expect(core.isBundleActive(st.bundles[0], { projectDir: "~/work/app", ...hOpt })).toBe(false);
+});
+
+test("efficiency #1: checkDisk fast-path (0 listDir calls on BUNDLES_PATH edit) vs full-path (SKILL.md description update)", async () => {
+  let listDirCount = 0;
+  const h = fakeHost();
+  const origListDir = h.listDir;
+  h.listDir = async (p) => {
+    listDirCount++;
+    return origListDir(p);
+  };
+  io.setHost(h);
+  await io.load();
+  expect(listDirCount).toBeGreaterThan(0);
+  listDirCount = 0;
+
+  // External BUNDLES_PATH change + mtime bump -> fast path: updates S.state with 0 listDir calls
+  const updatedBundles = core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [
+      { id: "b", name: "B", enabled: true, skills: ["alpha"] },
+      { id: "extra", name: "Extra", enabled: false, skills: ["beta"] },
+    ],
+    overrides: { beta: "called" },
+  }));
+  put(core.BUNDLES_PATH, core.serializeBundles(updatedBundles));
+  const t1 = new Date(Date.now() + 5_000);
+  fs.utimesSync(real(core.BUNDLES_PATH), t1, t1);
+
+  expect(await io.checkDisk()).toBe(true);
+  expect(listDirCount).toBe(0);
+  expect(io.S.state.bundles.map((b) => [b.id, b.enabled, b.skills])).toEqual([
+    ["b", true, ["alpha"]],
+    ["extra", false, ["beta"]],
+  ]);
+  expect(io.S.state.overrides.beta).toBe("called");
+
+  // External SKILL.md description edit + mtime bump -> full path: updates io.meta(id).description
+  put("~/.config/opencode/skills/beta/SKILL.md", skillMd("Beta revised description"));
+  const t2 = new Date(Date.now() + 10_000);
+  fs.utimesSync(real("~/.config/opencode/skills/beta/SKILL.md"), t2, t2);
+
+  expect(await io.checkDisk()).toBe(true);
+  expect(listDirCount).toBeGreaterThan(0);
+  expect(io.meta("beta").description).toBe("Beta revised description");
+});
+
+test("efficiency #3: malformed skill-bundles.json during checkDisk records bad stamp (0 BUNDLES_PATH reads on retry) and recovers", async () => {
+  let bundleReads = 0;
+  const h = fakeHost();
+  const origRead = h.readFile;
+  h.readFile = async (p) => {
+    if (p === core.BUNDLES_PATH) bundleReads++;
+    return origRead(p);
+  };
+  io.setHost(h);
+  await io.load();
+  const priorState = JSON.parse(JSON.stringify(io.S.state));
+
+  const origWarn = console.warn;
+  console.warn = () => {};
+  try {
+    // Write invalid JSON "{broken", add a new skill, AND edit an existing SKILL.md during the broken window
+    put(core.BUNDLES_PATH, "{broken");
+    put("~/.config/opencode/skills/delta/SKILL.md", skillMd("Delta added while broken"));
+    put("~/.config/opencode/skills/beta/SKILL.md", skillMd("Beta edited while broken"));
+    const t1 = new Date(Date.now() + 5_000);
+    fs.utimesSync(real(core.BUNDLES_PATH), t1, t1);
+    fs.utimesSync(real("~/.config/opencode/skills"), t1, t1);
+    fs.utimesSync(real("~/.config/opencode/skills/beta/SKILL.md"), t1, t1);
+
+    bundleReads = 0;
+    expect(await io.checkDisk()).toBe(false);
+    expect(bundleReads).toBe(1);
+    expect(JSON.parse(JSON.stringify(io.S.state))).toEqual(priorState);
+
+    // Second checkDisk with NO file/mtime change does 0 readFile calls on core.BUNDLES_PATH
+    bundleReads = 0;
+    expect(await io.checkDisk()).toBe(false);
+    expect(bundleReads).toBe(0);
+    expect(JSON.parse(JSON.stringify(io.S.state))).toEqual(priorState);
+
+    // Writing valid updated JSON with a newer mtime recovers, runs deferred full scan, and refreshes both "delta" and "beta"
+    const validNext = core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B Recovered", enabled: true, skills: ["beta"] }],
+      overrides: {},
+    }));
+    put(core.BUNDLES_PATH, core.serializeBundles(validNext));
+    const t2 = new Date(Date.now() + 10_000);
+    fs.utimesSync(real(core.BUNDLES_PATH), t2, t2);
+
+    expect(await io.checkDisk()).toBe(true);
+    expect(io.S.state.bundles).toEqual([{ id: "b", name: "B Recovered", enabled: true, skills: ["beta"] }]);
+    expect(io.S.allIds).toContain("delta");
+    expect(io.meta("delta").description).toBe("Delta added while broken");
+    expect(io.meta("beta").description).toBe("Beta edited while broken");
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test("efficiency #5: overlapping checkDisk() calls coalesce with in-flight sync and update state once", async () => {
+  let bundleReads = 0;
+  let externalSyncCalls = 0;
+  let releaseRead;
+  const readGate = new Promise((r) => { releaseRead = r; });
+
+  const h = fakeHost();
+  const origRead = h.readFile;
+  let pauseFirstBundleRead = false;
+  h.readFile = async (p) => {
+    if (p === core.BUNDLES_PATH) {
+      bundleReads++;
+      if (pauseFirstBundleRead) {
+        pauseFirstBundleRead = false;
+        await readGate;
+      }
+    }
+    return origRead(p);
+  };
+  io.setHost(h);
+  await io.load();
+
+  const prevOnExternalSync = io.hooks.onExternalSync;
+  io.hooks.onExternalSync = () => {
+    externalSyncCalls++;
+    prevOnExternalSync();
+  };
+  try {
+    const next = core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B Coalesced", enabled: true, skills: ["alpha", "beta"] }],
+      overrides: {},
+    }));
+    put(core.BUNDLES_PATH, core.serializeBundles(next));
+    const future = new Date(Date.now() + 5_000);
+    fs.utimesSync(real(core.BUNDLES_PATH), future, future);
+
+    bundleReads = 0;
+    pauseFirstBundleRead = true;
+
+    // Start first checkDisk() and let it enter syncFromDisk() (syncInFlight active) before firing the second
+    const p1 = io.checkDisk();
+    const p2 = io.checkDisk();
+    await new Promise((r) => setTimeout(r, 10));
+    const p3 = io.checkDisk();
+    releaseRead();
+
+    const results = await Promise.all([p1, p2, p3]);
+    expect(results).toEqual([true, true, true]);
+    expect(bundleReads).toBe(1);
+    expect(externalSyncCalls).toBe(1);
+    expect(io.S.state.bundles[0].name).toBe("B Coalesced");
+    expect(io.S.state.bundles[0].enabled).toBe(true);
+  } finally {
+    io.hooks.onExternalSync = prevOnExternalSync;
+  }
+});
+
+test("regression: checkDisk({ includeSkills: false }) escalates to full sync when SKILL.md changed alongside config", async () => {
+  const h = fakeHost();
+  io.setHost(h);
+  await io.load();
+
+  // Simulate CLI `skills set alpha auto` rewriting both BUNDLES_PATH and alpha/SKILL.md externally
+  await io.enqueue(async () => {
+    expect(await io.applyChange((s) => core.setOverride(s, "alpha", "called"))).toBe(true);
+  });
+  await settle();
+  const alphaPath = "~/.config/opencode/skills/alpha/SKILL.md";
+  expect(core.readFrontmatter(read(alphaPath)).autoinvoke).toBe(false);
+
+  const cliState = core.setOverride(io.S.state, "alpha", "auto");
+  const cliAlphaMd = core.setAutoinvoke(read(alphaPath), true);
+  put(alphaPath, cliAlphaMd);
+  put(core.BUNDLES_PATH, core.serializeBundles(cliState));
+  const t1 = new Date(Date.now() + 5_000);
+  fs.utimesSync(real(alphaPath), t1, t1);
+  fs.utimesSync(real(core.BUNDLES_PATH), t1, t1);
+
+  // Quick-tier poll tick must notice SKILL.md changed too and refresh S.skillMds
+  expect(await io.checkDisk({ includeSkills: false })).toBe(true);
+  expect(io.S.skillMds.alpha).toBe(cliAlphaMd);
+
+  // Subsequent panel change back to `called` must rewrite SKILL.md with `autoinvoke: false`
+  await io.enqueue(async () => {
+    expect(await io.applyChange((s) => core.setOverride(s, "alpha", "called"))).toBe(true);
+  });
+  await settle();
+  expect(core.readFrontmatter(read(alphaPath)).autoinvoke).toBe(false);
+});

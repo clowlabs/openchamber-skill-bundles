@@ -6,6 +6,7 @@ export type EditGuardDeps = {
   isTargetDeleted: () => boolean;
   onDefer: () => void;
   onRender: () => void;
+  enabled?: boolean;
 };
 
 export function createEditGuard(deps: EditGuardDeps) {
@@ -34,15 +35,19 @@ export function createEditGuard(deps: EditGuardDeps) {
     document.addEventListener('focusout', onFocusOut);
   };
 
+  const reset = () => {
+    pending = false;
+    clearTimer();
+    detachFocusOut();
+  };
+
   const flushIfReady = () => {
     if (!pending) {
       detachFocusOut();
       return;
     }
     if (!deps.isEditing() || deps.isTargetDeleted()) {
-      pending = false;
-      clearTimer();
-      detachFocusOut();
+      reset();
       deps.onRender();
     }
   };
@@ -67,44 +72,35 @@ export function createEditGuard(deps: EditGuardDeps) {
     }, 0);
   };
 
+  const pointerListeners = (): [EventTarget, string, EventListener][] => {
+    const out: [EventTarget, string, EventListener][] = [];
+    if (typeof document !== 'undefined') {
+      for (const ev of ['pointerdown', 'mousedown']) out.push([document, ev, onPointerDown]);
+      for (const ev of ['pointerup', 'mouseup', 'pointercancel', 'click']) out.push([document, ev, onPointerEnd]);
+    }
+    if (typeof window !== 'undefined') {
+      for (const ev of ['pointerup', 'mouseup', 'pointercancel']) out.push([window, ev, onPointerEnd]);
+    }
+    return out;
+  };
+
   const attachPointer = () => {
     if (pointerAttached || typeof document === 'undefined') return;
     pointerAttached = true;
-    document.addEventListener('pointerdown', onPointerDown, true);
-    document.addEventListener('mousedown', onPointerDown, true);
-    document.addEventListener('pointerup', onPointerEnd, true);
-    document.addEventListener('mouseup', onPointerEnd, true);
-    document.addEventListener('pointercancel', onPointerEnd, true);
-    document.addEventListener('click', onPointerEnd, true);
-    if (typeof window !== 'undefined') {
-      window.addEventListener('pointerup', onPointerEnd, true);
-      window.addEventListener('mouseup', onPointerEnd, true);
-      window.addEventListener('pointercancel', onPointerEnd, true);
-    }
+    for (const [target, ev, fn] of pointerListeners()) target.addEventListener(ev, fn, true);
   };
 
   const detachPointer = () => {
     pointerActive = false;
     if (!pointerAttached) return;
     pointerAttached = false;
-    if (typeof document !== 'undefined') {
-      document.removeEventListener('pointerdown', onPointerDown, true);
-      document.removeEventListener('mousedown', onPointerDown, true);
-      document.removeEventListener('pointerup', onPointerEnd, true);
-      document.removeEventListener('mouseup', onPointerEnd, true);
-      document.removeEventListener('pointercancel', onPointerEnd, true);
-      document.removeEventListener('click', onPointerEnd, true);
-    }
-    if (typeof window !== 'undefined') {
-      window.removeEventListener('pointerup', onPointerEnd, true);
-      window.removeEventListener('mouseup', onPointerEnd, true);
-      window.removeEventListener('pointercancel', onPointerEnd, true);
-    }
+    for (const [target, ev, fn] of pointerListeners()) target.removeEventListener(ev, fn, true);
   };
 
-  attachPointer();
+  if (deps.enabled !== false) attachPointer();
 
   return {
+    enable: attachPointer,
     onExternalSync() {
       if (!deps.isTargetDeleted() && (deps.isEditing() || pointerActive || flushTimer != null)) {
         deps.onDefer();
@@ -112,20 +108,12 @@ export function createEditGuard(deps: EditGuardDeps) {
         attachFocusOut();
         return;
       }
-      pending = false;
-      clearTimer();
-      detachFocusOut();
+      reset();
       deps.onRender();
     },
-    markRendered() {
-      pending = false;
-      clearTimer();
-      detachFocusOut();
-    },
+    markRendered: reset,
     dispose() {
-      pending = false;
-      clearTimer();
-      detachFocusOut();
+      reset();
       detachPointer();
     },
     isPending: () => pending,
