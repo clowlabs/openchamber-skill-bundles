@@ -1,7 +1,7 @@
 // Bundle "Projects" checklist: which project folders a bundle is turned on in.
 import * as core from '../src/core.js';
-import { button, createPopup, note, onRefreshMenus, projectList, projectsNote, replace, sectionTitle, shortDir, watchProjects, type Project } from './popup';
-import { S, activeProjectDir, commit, errText, homeOpt, host, sameProjectDir } from './io';
+import { createPopup, note, onRefreshMenus, projectList, projectsNote, shortDir, watchProjects, type Project } from './popup';
+import { S, activeProjectDir, commit, homeOpt, sameProjectDir } from './io';
 
 const GLOBAL_KEY = '__global';
 
@@ -13,24 +13,6 @@ type RowOptions = {
   checked: boolean;
   onChange?: (checked: boolean) => void;
 };
-
-/** Validate an "Add folder…" entry the way the CLI does: absolute or ~/, not ~ itself, an existing directory. */
-async function validateFolder(raw: string): Promise<string> {
-  const text = raw.trim();
-  if (!text) throw new Error('Enter a folder path');
-  if (!text.startsWith('/') && !text.startsWith('~/') && text !== '~') throw new Error('Use an absolute path or one starting with ~/');
-  const dir = core.normalizeProjectDir(text, homeOpt());
-  if (dir === '~' || dir === '/') throw new Error('Pick a project folder, not your home or the root folder');
-  let kind: string;
-  try {
-    kind = (await host.stat(dir)).kind;
-  } catch (e) {
-    throw new Error(`Can't check that folder (${errText(e)})`);
-  }
-  if (kind === 'missing') throw new Error('That folder does not exist');
-  if (kind !== 'directory') throw new Error('That path is not a folder');
-  return dir;
-}
 
 export function openProjectsMenu(bundleId: string, x: number, y: number, returnFocus?: HTMLElement | null) {
   const bundle = () => S.state?.bundles.find((b) => b.id === bundleId);
@@ -44,46 +26,8 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
     returnFocus,
     onClose: () => { unwatch(); if (repaintOpen === paint) repaintOpen = null; },
   });
-  const { menu, title, list, foot } = pop;
+  const { menu, title, list } = pop;
   menu.setAttribute('aria-modal', 'false');
-
-  // "Add folder…" lives in the footer so re-painting the list keeps its draft.
-  const add = document.createElement('form');
-  add.className = 'sb-proj-add';
-  const input = document.createElement('input');
-  input.className = 'sb-ctx-filter sb-proj-path';
-  input.placeholder = 'Add folder… (/path or ~/path)';
-  input.setAttribute('aria-label', 'Add a project folder by path');
-  input.spellcheck = false;
-  const addBtn = button('Add', 'sb-ctx-btn');
-  addBtn.type = 'submit';
-  const err = document.createElement('div');
-  err.className = 'sb-proj-err';
-  err.setAttribute('role', 'alert');
-  add.append(input, addBtn);
-  foot.append(add, err);
-  const showErr = (msg: string) => {
-    err.textContent = msg;
-    input.title = msg;
-    input.setAttribute('aria-invalid', msg ? 'true' : 'false');
-    replace(menu);
-  };
-  input.addEventListener('input', () => { if (err.textContent) showErr(''); });
-  add.addEventListener('submit', (e) => {
-    e.preventDefault();
-    void (async () => {
-      let dir: string;
-      try {
-        dir = await validateFolder(input.value);
-      } catch (x) {
-        showErr(errText(x));
-        return;
-      }
-      if (bundle()?.projects?.some((d) => sameProjectDir(d, dir))) { showErr('Already in this bundle'); return; }
-      showErr('');
-      commit((s) => core.addBundleProject(s, bundleId, dir, homeOpt()), () => { input.value = ''; }, { label: 'add project' });
-    })();
-  });
 
   const toggle = (dir: string, on: boolean) => {
     commit((s) => {
@@ -123,9 +67,10 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
     title.textContent = `${b.name}: turn on in projects`;
     menu.setAttribute('aria-label', title.textContent);
     list.textContent = '';
+    const hOpt = homeOpt();
     const mine = b.projects ?? [];
     const excluded = b.excludedProjects ?? [];
-    const allProjects = projectList().projects.filter((p) => core.normalizeScopeDir(p.directory, homeOpt()) !== null);
+    const allProjects = projectList().projects.filter((p) => core.normalizeScopeDir(p.directory, hOpt) !== null);
     pop.ensureFilter(allProjects.length + mine.length + excluded.length, 'Filter projects', (v) => { filter = v; paint(); });
 
     list.appendChild(row({
@@ -141,7 +86,6 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
       },
     }));
 
-    const hOpt = homeOpt();
     const curDir = activeProjectDir();
     const curNorm = curDir ? core.normalizeScopeDir(curDir, hOpt) : null;
     const sameNorm = (a: string, bNorm: string | null) =>
@@ -172,16 +116,13 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
       : curDir
         ? [...knownRaw.filter((p) => sameProjectDir(p.directory, curDir)), ...knownRaw.filter((p) => !sameProjectDir(p.directory, curDir))]
         : knownRaw;
-    const status = projectsNote(known.length, filter);
     const q = filter.trim().toLowerCase();
     const unlistedMine = mine.filter((d) => !isKnown(d) && (!q || d.toLowerCase().includes(q)));
     const unlistedExcluded = b.enabled
       ? excluded.filter((d) => !inMine(d) && !isKnown(d) && (!q || d.toLowerCase().includes(q)))
       : [];
+    const status = projectsNote(known.length + unlistedMine.length + unlistedExcluded.length, filter);
 
-    if (known.length || unlistedMine.length || unlistedExcluded.length || status) {
-      list.appendChild(sectionTitle('Projects'));
-    }
     if (status) list.appendChild(note(status));
     for (const p of known) {
       const isCur = curNorm ? sameNorm(p.directory, curNorm) : (curDir != null && sameProjectDir(p.directory, curDir));
@@ -194,9 +135,8 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
       }));
     }
 
-    // Folders in the bundle that OpenChamber doesn't list, so they can be unchecked.
+    // Folders in the bundle that OpenChamber doesn't list, kept flush in the checklist so they can be unchecked.
     if (unlistedMine.length || unlistedExcluded.length) {
-      list.appendChild(sectionTitle('Other folders'));
       const folderLabel = (d: string) => d.split('/').filter(Boolean).pop() ?? d;
       for (const d of unlistedMine) list.appendChild(row({ key: d, label: folderLabel(d), checked: true }));
       for (const d of unlistedExcluded) list.appendChild(row({ key: d, label: folderLabel(d), checked: false }));

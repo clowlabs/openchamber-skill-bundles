@@ -6,9 +6,10 @@
   <title>Skills</title>
   <link rel="stylesheet" href="meter.css" />
   <style>
+    html { font-size: 0.875rem; }
     html, body { margin: 0; background: transparent; color: var(--oc-fg); font-family: var(--oc-font, system-ui, sans-serif); }
     /* The Work Status section already frames this: no outer card, just padding. */
-    #section { padding: 12px; cursor: pointer; border-radius: 6px; }
+    #section { padding: 3px 4px; cursor: pointer; border-radius: 6px; }
     #section:hover .skm-rest, #section:hover .skm-tokens { color: var(--oc-fg); }
     #section:focus-visible { outline: 2px solid var(--oc-focus, var(--oc-primary)); outline-offset: -2px; }
     .err { color: var(--oc-error-text, var(--oc-error)); font-size: 12px; }
@@ -16,7 +17,7 @@
 </head>
 <body>
   <div id="section" role="button" tabindex="0" title="Open Skill Bundles" aria-label="Skills. Open Skill Bundles">
-    <div id="head"><span class="skm-sub">Counting skills…</span></div>
+    <div id="head"><div class="skm skm-compact"><div class="skm-top"><span class="skm-left"><span class="skm-live-n">—</span><span class="skm-rest">skills</span></span></div></div></div>
   </div>
   <script src="main.js"></script>
 </body>

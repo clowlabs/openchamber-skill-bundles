@@ -623,18 +623,25 @@ async function boot() {
   const spin = el('div');
   (compact ? $('compact') : $('groups')).appendChild(spin);
   const s = mountSpinner(spin, { label: 'Loading skills…' });
+  let rendered = false;
   try {
-    await load();
+    await load(() => {
+      rendered = true;
+      s.dispose();
+      render();
+    });
   } catch (e) {
-    s.dispose();
+    if (!rendered) s.dispose();
     // On the rail the editor (#app, which holds #banner) is hidden: mount where it shows.
     const at = compact ? $('compact') : $('banner');
     if (compact) at.textContent = '';
     mountBanner(at, { tone: 'error', title: 'Could not load skills', body: errText(e) });
     return;
   }
-  s.dispose();
-  render();
+  if (!rendered) {
+    s.dispose();
+    render();
+  }
   startSync();
 }
 
@@ -653,6 +660,7 @@ host.onReady((ctx) => {
   storageOpts = ctx.features?.deviceStorage ? { scope: 'device' as const } : undefined;
   if (mounted) return;
   mounted = true;
+  if (S.activeDir === null && ctx.directory !== null) S.activeDir = ctx.directory;
   compact = ctx.surface === 'panel';
   document.body.classList.toggle('sb-compact', compact);
   if (compact) {

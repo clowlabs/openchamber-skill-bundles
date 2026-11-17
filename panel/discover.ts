@@ -44,7 +44,7 @@ export async function discoverSkills(host: FileHost, opencodeText: string | null
     let frontier: string[] = [''];
     while (frontier.length) {
       const nextFrontier: string[] = [];
-      await pool(frontier, 8, async (rel) => {
+      await pool(frontier, 32, async (rel) => {
         const dir = join(root, rel);
         if (budget-- <= 0) { truncated = true; return; }
         let entries: { name: string; kind: 'file' | 'directory' | 'other' }[];
@@ -66,7 +66,7 @@ export async function discoverSkills(host: FileHost, opencodeText: string | null
         }
 
         if (others.length) {
-          await pool(others, 8, async (name) => {
+          await pool(others, 32, async (name) => {
             const p = join(dir, name);
             try {
               const { kind } = await host.stat(p);

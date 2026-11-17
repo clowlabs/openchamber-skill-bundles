@@ -14,9 +14,57 @@ const { afterEach, beforeEach, describe, expect, test } = isBun
 const { HostRequestError } = await import("@openchamber/sdk");
 const core = await import("../src/core.js");
 const counts = isBun ? await import("../status/counts.ts") : null;
+const cache = isBun ? await import("../status/cache.ts") : null;
 const { createFakeHost } = await import("../shared/test/fake-host.js");
 
 const skillMd = (desc) => `---\nname: x\ndescription: ${desc}\n---\nBody\n`;
+
+describe("renderMeterHeader", () => {
+  const withDom = (fn) => {
+    const saved = Object.getOwnPropertyDescriptor(globalThis, "document");
+    const make = () => {
+      const el = {
+        className: "",
+        textContent: "",
+        title: "",
+        children: [],
+        attrs: {},
+        style: {},
+        append: (...c) => el.children.push(...c),
+        appendChild: (c) => el.children.push(c),
+        setAttribute: (k, v) => { el.attrs[k] = v; },
+      };
+      return el;
+    };
+    globalThis.document = { createElement: make };
+    try {
+      return fn();
+    } finally {
+      if (saved) Object.defineProperty(globalThis, "document", saved);
+      else delete globalThis.document;
+    }
+  };
+  const c = { live: 25, installed: 218, chars: 25 * core.CHARS_PER_SKILL, bundlesOn: [], fromOpencode: false };
+
+  test("default (rail panel) keeps the meter bar", () => {
+    withDom(() => {
+      const { wrap, fill } = counts.renderMeterHeader(c);
+      expect(wrap.className).toBe("skm");
+      expect(wrap.children.map((x) => x.className)).toEqual(["skm-top", "skm-meter"]);
+      expect(fill.style.width).toBe("11%");
+    });
+  });
+
+  test("compact (Work Status) is one line with no meter bar", () => {
+    withDom(() => {
+      const { wrap, left, fill } = counts.renderMeterHeader(c, { compact: true });
+      expect(wrap.className).toBe("skm skm-compact");
+      expect(wrap.children.map((x) => x.className)).toEqual(["skm-top"]);
+      expect(fill).toBeNull();
+      expect(left.children.map((x) => x.textContent)).toEqual(["25", "live", " / 218 installed · 11%"]);
+    });
+  });
+});
 
 describe("parseSkillRules & applySkillRules", () => {
   test("parses valid skill rules, ignores non-skill entries, and handles missing/malformed inputs", () => {
@@ -323,5 +371,376 @@ describe("readCounts", () => {
     const res = await counts.readCounts(host, { projectDir: proj, home });
     expect(res.bundlesOn).toEqual(["p"]);
     expect(res.live).toBe(2);
+  });
+});
+
+describe("status/cache & createStatusLoader", () => {
+  let fx;
+  let home;
+
+  beforeEach(() => {
+    fx = createFakeHost({ makeError: (code, msg) => new HostRequestError(code, msg) });
+    home = fx.home;
+    fx.put("~/.config/opencode/opencode.json", JSON.stringify({ permissions: [] }) + "\n");
+    fx.put("~/.config/opencode/skills/alpha/SKILL.md", skillMd("Alpha"));
+    fx.put("~/.config/opencode/skills/beta/SKILL.md", skillMd("Beta"));
+    fx.put(
+      "~/.config/opencode/skill-bundles.json",
+      core.serializeBundles(
+        core.parseBundles(
+          JSON.stringify({
+            version: 1,
+            bundles: [{ id: "global-b", name: "Global B", enabled: true, skills: ["alpha"] }],
+            overrides: {},
+          }),
+          { home },
+        ),
+      ),
+    );
+  });
+
+  afterEach(() => {
+    fx.cleanup();
+  });
+
+  test("parseSkillIndexCache validates schema and read/writeSkillIndexCache handle storage safely", async () => {
+    expect(cache.parseSkillIndexCache(null)).toBeNull();
+    expect(cache.parseSkillIndexCache({ v: 2, rootsKey: "[]", rootStamps: "", allIds: [], scannedAt: 1 })).toBeNull();
+    expect(cache.parseSkillIndexCache({ v: 1, rootsKey: "[]", rootStamps: "", allIds: [1], scannedAt: 1 })).toBeNull();
+    expect(
+      cache.parseSkillIndexCache({
+        v: 1,
+        rootsKey: "[]",
+        rootStamps: "",
+        allIds: ["a"],
+        home: "/home/u",
+        scannedAt: 100,
+      }),
+    ).toEqual({
+      v: 1,
+      rootsKey: "[]",
+      rootStamps: "",
+      allIds: ["a"],
+      home: "/home/u",
+      scannedAt: 100,
+    });
+
+    const entry = {
+      v: 1,
+      rootsKey: '["~/.config/opencode/skills"]',
+      rootStamps: "directory:0:1",
+      allIds: ["alpha"],
+      home,
+      scannedAt: 123,
+    };
+    await cache.writeSkillIndexCache(fx.host, entry);
+    expect(await cache.readSkillIndexCache(fx.host)).toEqual(entry);
+    expect(await cache.readSkillIndexCache({})).toBeNull();
+  });
+
+  test("cold loader populates storage, and a brand-new loader instance returns project-scoped counts in 0 listDir calls", async () => {
+    const proj = `${home}/work/proj-fast`;
+    fs.mkdirSync(fx.real(proj), { recursive: true });
+    fx.put(
+      "~/.config/opencode/skill-bundles.json",
+      core.serializeBundles(
+        core.parseBundles(
+          JSON.stringify({
+            version: 1,
+            bundles: [
+              { id: "global-b", name: "Global B", enabled: true, skills: ["alpha"] },
+              { id: "proj-b", name: "Proj B", enabled: false, skills: ["beta"], projects: [proj] },
+            ],
+            overrides: {},
+          }),
+          { home },
+        ),
+      ),
+    );
+    fx.put(
+      `${proj}/.opencode/opencode.json`,
+      JSON.stringify({ permissions: [{ action: "skill", resource: "beta", effect: "allow" }] }) + "\n",
+    );
+
+    const coldLoader = counts.createStatusLoader(fx.host);
+    const coldRes = await coldLoader.load(null);
+    expect(coldRes.live).toBe(1);
+    expect(coldRes.installed).toBe(2 + core.BUILTIN_SKILLS.length);
+
+    // Wait a microtask for fire-and-forget writeSkillIndexCache to settle
+    await new Promise((r) => setTimeout(r, 10));
+    const stored = await fx.host.storage.get(cache.SKILL_INDEX_KEY);
+    expect(stored).toBeDefined();
+    expect(stored.allIds).toEqual(["alpha", "beta", ...core.BUILTIN_SKILLS].sort());
+    expect(stored.home).toBe(home);
+
+    // Simulate reopening the Work Status iframe: brand-new loader instance!
+    let listDirCalls = 0;
+    const spiedHost = {
+      ...fx.host,
+      listDir: async (p) => {
+        listDirCalls++;
+        return fx.host.listDir(p);
+      },
+    };
+    const warmLoader = counts.createStatusLoader(spiedHost);
+    const warmRes = await warmLoader.load(proj);
+    expect(listDirCalls).toBe(0);
+    expect(warmRes.bundlesOn).toEqual(["global-b", "proj-b"]);
+    expect(warmRes.live).toBe(2);
+    expect(warmRes.installed).toBe(2 + core.BUILTIN_SKILLS.length);
+  });
+
+  test("stale-while-revalidate: added skill + bumped root mtime returns optimistic counts with 0 blocking listDirs, then calls onRevalidated", async () => {
+    const firstLoader = counts.createStatusLoader(fx.host);
+    const initial = await firstLoader.load(null);
+    expect(initial.installed).toBe(2 + core.BUILTIN_SKILLS.length);
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Add a new skill folder and bump root mtime while unmounted
+    fx.put("~/.config/opencode/skills/gamma/SKILL.md", skillMd("Gamma"));
+    const rootReal = fx.real("~/.config/opencode/skills");
+    const bumpedTime = new Date(Date.now() + 5_000);
+    fs.utimesSync(rootReal, bumpedTime, bumpedTime);
+
+    let listDirCalls = 0;
+    let releaseListDir;
+    const listDirGate = new Promise((r) => {
+      releaseListDir = r;
+    });
+
+    const spiedHost = {
+      ...fx.host,
+      listDir: async (p) => {
+        listDirCalls++;
+        await listDirGate;
+        return fx.host.listDir(p);
+      },
+    };
+
+    let revalidatedCounts = null;
+    let resolveRevalidated;
+    const revalidatedDone = new Promise((r) => {
+      resolveRevalidated = r;
+    });
+
+    const reopenedLoader = counts.createStatusLoader(spiedHost, {
+      onRevalidated: (c) => {
+        revalidatedCounts = c;
+        resolveRevalidated(c);
+      },
+    });
+
+    // load() resolves BEFORE listDirGate is released — 0 blocking listDirs!
+    const immediate = await reopenedLoader.load(null);
+    expect(immediate.installed).toBe(2 + core.BUILTIN_SKILLS.length);
+    expect(revalidatedCounts).toBeNull();
+
+    // Unblock background scan
+    releaseListDir();
+    const updated = await revalidatedDone;
+    expect(listDirCalls).toBeGreaterThan(0);
+    expect(updated.installed).toBe(3 + core.BUILTIN_SKILLS.length);
+
+    const storedAfter = await fx.host.storage.get(cache.SKILL_INDEX_KEY);
+    expect(storedAfter.allIds).toEqual(["alpha", "beta", "gamma", ...core.BUILTIN_SKILLS].sort());
+  });
+
+  test("forceImmediateScan revalidates even when root mtime and revalidateAfterMs are fresh", async () => {
+    fs.mkdirSync(fx.real("~/.config/opencode/skills/nested"), { recursive: true });
+    const loader = counts.createStatusLoader(fx.host, { revalidateAfterMs: 60_000 });
+    await loader.load(null);
+    await new Promise((r) => setTimeout(r, 10));
+
+    let listDirCalls = 0;
+    const spiedHost = {
+      ...fx.host,
+      listDir: async (p) => {
+        listDirCalls++;
+        return fx.host.listDir(p);
+      },
+    };
+
+    let revalidated = null;
+    const done = new Promise((r) => {
+      revalidated = r;
+    });
+    const warmLoader = counts.createStatusLoader(spiedHost, {
+      revalidateAfterMs: 60_000,
+      onRevalidated: (c) => revalidated(c),
+    });
+
+    // Add a skill under an already-existing subfolder so top-level root size and mtime stay unchanged
+    fx.put("~/.config/opencode/skills/nested/delta/SKILL.md", skillMd("Delta"));
+
+    // Ordinary forceScan within 60s window does NOT scan when rootStamps match
+    await warmLoader.load(null, { forceScan: true });
+    expect(listDirCalls).toBe(0);
+
+    // forceImmediateScan (e.g. { full: true } ping) DOES scan immediately in background
+    await warmLoader.load(null, { forceScan: true, forceImmediateScan: true });
+    const fresh = await done;
+    expect(listDirCalls).toBeGreaterThan(0);
+    expect(fresh.installed).toBe(3 + core.BUILTIN_SKILLS.length);
+  });
+
+  test("incomplete discovery (DENIED on a skill root) is NOT persisted to host.storage", async () => {
+    fx.failOn = (p, op) => op === "list" && p.includes(".claude/skills");
+    const loader = counts.createStatusLoader(fx.host);
+    const res = await loader.load(null);
+    expect(res.installed).toBe(2 + core.BUILTIN_SKILLS.length);
+    await new Promise((r) => setTimeout(r, 10));
+
+    const stored = await fx.host.storage.get(cache.SKILL_INDEX_KEY);
+    expect(stored).toBeUndefined();
+  });
+
+  test("race: switching directory while background onRevalidated readCounts is pending never overwrites newer directory counts", async () => {
+    const projA = `${home}/work/proj-a`;
+    const projB = `${home}/work/proj-b`;
+    fs.mkdirSync(fx.real(projA), { recursive: true });
+    fs.mkdirSync(fx.real(projB), { recursive: true });
+    fx.put(
+      "~/.config/opencode/skill-bundles.json",
+      core.serializeBundles(
+        core.parseBundles(
+          JSON.stringify({
+            version: 1,
+            bundles: [{ id: "only-a", name: "Only A", enabled: false, skills: ["alpha", "beta", "gamma"], projects: [projA] }],
+            overrides: {},
+          }),
+          { home },
+        ),
+      ),
+    );
+
+    // Seed storage cache before adding gamma
+    const seedLoader = counts.createStatusLoader(fx.host);
+    await seedLoader.load(projA);
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Add gamma and bump root mtime
+    fx.put("~/.config/opencode/skills/gamma/SKILL.md", skillMd("Gamma"));
+    const bumped = new Date(Date.now() + 5_000);
+    fs.utimesSync(fx.real("~/.config/opencode/skills"), bumped, bumped);
+    fx.put(
+      `${projA}/.opencode/opencode.json`,
+      JSON.stringify({
+        permissions: [
+          { action: "skill", resource: "alpha", effect: "allow" },
+          { action: "skill", resource: "beta", effect: "allow" },
+          { action: "skill", resource: "gamma", effect: "allow" },
+        ],
+      }) + "\n",
+    );
+
+    let gateNextProjARead = false;
+    let enteredBgRead;
+    const bgReadStarted = new Promise((r) => {
+      enteredBgRead = r;
+    });
+    let releaseProjARead;
+    const projAReadGate = new Promise((r) => {
+      releaseProjARead = r;
+    });
+
+    const host = {
+      ...fx.host,
+      listDir: async (p) => {
+        const res = await fx.host.listDir(p);
+        // Once background discovery lists skills, gate the subsequent readCounts(projA) project file read
+        gateNextProjARead = true;
+        return res;
+      },
+      readFile: async (p) => {
+        if (gateNextProjARead && p.endsWith("proj-a/.opencode/opencode.json")) {
+          gateNextProjARead = false;
+          enteredBgRead();
+          await projAReadGate;
+        }
+        return fx.host.readFile(p);
+      },
+    };
+
+    const painted = [];
+    const loader = counts.createStatusLoader(host, {
+      onRevalidated: (c) => painted.push(c),
+    });
+
+    // 1. Load projA -> returns optimistic 2 live, starts background scan
+    const cA = await loader.load(projA);
+    expect(cA.live).toBe(2);
+    painted.push(cA);
+
+    // 2. Wait until background scan updated idCache and paused inside readCounts(projA)
+    await bgReadStarted;
+
+    // 3. Switch to projB -> uses fresh idCache (3 + builtins installed, 0 live in projB)
+    const cB = await loader.load(projB);
+    expect(cB.live).toBe(0);
+    expect(cB.installed).toBe(3 + core.BUILTIN_SKILLS.length);
+    painted.push(cB);
+
+    // 4. Release stale readCounts(projA) -> must NOT fire onRevalidated and overwrite projB
+    releaseProjARead();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(painted.at(-1).live).toBe(0);
+    expect(painted.at(-1).installed).toBe(3 + core.BUILTIN_SKILLS.length);
+  });
+
+  test("race: obsolete background scan from old roots never overwrites newer roots cache or storage", async () => {
+    const seedLoader = counts.createStatusLoader(fx.host);
+    await seedLoader.load(null);
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Bump default skills root mtime to trigger background scan on old roots
+    const bumped = new Date(Date.now() + 5_000);
+    fs.utimesSync(fx.real("~/.config/opencode/skills"), bumped, bumped);
+
+    let pauseOldScan = true;
+    let enteredOldScan;
+    const oldScanStarted = new Promise((r) => {
+      enteredOldScan = r;
+    });
+    let releaseOldScan;
+    const oldScanGate = new Promise((r) => {
+      releaseOldScan = r;
+    });
+
+    const host = {
+      ...fx.host,
+      listDir: async (p) => {
+        if (pauseOldScan && p.endsWith(".config/opencode/skills")) {
+          pauseOldScan = false;
+          enteredOldScan();
+          await oldScanGate;
+        }
+        return fx.host.listDir(p);
+      },
+    };
+
+    const revalidated = [];
+    const loader = counts.createStatusLoader(host, {
+      onRevalidated: (c) => revalidated.push(c),
+    });
+
+    // 1. Trigger warm load on old roots -> starts background scan that pauses in listDir
+    await loader.load(null);
+    await oldScanStarted;
+
+    // 2. Add a custom extra root with skill "zeta" in opencode.json and run a new load()
+    fx.put("~/extra-skills/zeta/SKILL.md", skillMd("Zeta"));
+    fx.put("~/.config/opencode/opencode.json", JSON.stringify({ skills: ["~/extra-skills"], permissions: [] }) + "\n");
+    const newCounts = await loader.load(null);
+    expect(newCounts.installed).toBe(3 + core.BUILTIN_SKILLS.length);
+    await new Promise((r) => setTimeout(r, 10));
+
+    // 3. Release the obsolete background scan from the old roots -> must NOT clobber storage or emit stale counts
+    releaseOldScan();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(revalidated).toEqual([]);
+    const stored = await fx.host.storage.get(cache.SKILL_INDEX_KEY);
+    expect(stored.allIds).toContain("zeta");
+    expect(stored.installed ?? stored.allIds.length).toBe(3 + core.BUILTIN_SKILLS.length);
   });
 });

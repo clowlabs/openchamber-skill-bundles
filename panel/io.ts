@@ -8,6 +8,7 @@ import seed from '../data/default-bundles.json';
 import { discoverSkills, type Unreachable } from './discover';
 import { broadcastChange, listenChanges } from './sync';
 import { parseSkillRules } from '../status/counts';
+import { formatRootStamps, statFileStamp, writeSkillIndexCache } from '../status/cache';
 import { errorCode, errText as hostErrText, isUnreadable, pool, readOptional as readOpt } from '../shared/panel/host';
 import { createQueue } from '../shared/panel/queue';
 import { createPanelLock, LockedError, statMtimeMs, type PanelLock } from '../shared/panel/panel-lock';
@@ -21,6 +22,7 @@ export function setHost(h: HostClient) {
   gen++;
   resetStamps();
   syncInFlight = null;
+  postLoadStamps = null;
   queuedSync = null;
   deferredSync = null;
   clearLockRetry();
@@ -174,6 +176,7 @@ function setMd(id: string, text: string) {
 // ---------- write queue: every write runs here, one at a time, none dropped ----------
 
 let activeWrites = 0;
+let writeSeq = 0;
 
 const queue = createQueue({
   onQueued: () => hooks.renderLight(),
@@ -187,8 +190,9 @@ const queue = createQueue({
   },
   onError: (e) => toastError(e, 'Saving failed'),
 });
-export const enqueue: typeof queue.enqueue = (task) =>
-  queue.enqueue(async () => {
+export const enqueue: typeof queue.enqueue = (task) => {
+  writeSeq++;
+  return queue.enqueue(async () => {
     if (syncInFlight) await syncInFlight.catch(() => false);
     activeWrites++;
     try {
@@ -197,6 +201,7 @@ export const enqueue: typeof queue.enqueue = (task) =>
       activeWrites--;
     }
   });
+};
 /** Writes queued or running. */
 export const pending = () => queue.pending;
 
@@ -218,10 +223,12 @@ const withLock = <T>(fn: () => Promise<T>) => lock.withLock(fn);
 type SyncOpts = { full?: boolean };
 
 let gen = 0;
+let syncSeq = 0;
 let lastDiskStamp: string | null = null;
 let configStamps: Record<string, string> = Object.create(null);
 let skillFileStamps: Record<string, string> = Object.create(null);
 let syncInFlight: Promise<boolean> | null = null;
+let postLoadStamps: Promise<void> | null = null;
 let queuedSync: SyncOpts | null = null;
 let deferredSync: SyncOpts | null = null;
 let lockRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -249,11 +256,7 @@ function mergeSyncOpts(a: SyncOpts | null, b?: SyncOpts): SyncOpts {
   return a?.full || b?.full ? { full: true } : {};
 }
 
-const statStamp = (p: string): Promise<string> =>
-  host.stat(p).then(
-    (st) => `${st.kind}:${st.size}:${st.mtime}`,
-    (e) => `err:${errorCode(e) || 'ERR'}`,
-  );
+const statStamp = (p: string): Promise<string> => statFileStamp(host, p);
 
 function projectConfigPaths(state: State | null): string[] {
   const dirs = new Set<string>(state ? core.projectTargets(state, homeOpt()) : []);
@@ -274,7 +277,7 @@ async function readStampsMap(paths: readonly string[], preset?: Record<string, s
     if (preset && Object.hasOwn(preset, p)) out[p] = preset[p];
     else toStat.push(p);
   }
-  await pool(toStat, 16, async (p) => {
+  await pool(toStat, 32, async (p) => {
     out[p] = await statStamp(p);
   });
   return out;
@@ -282,7 +285,7 @@ async function readStampsMap(paths: readonly string[], preset?: Record<string, s
 
 async function readProjectTextsSafe(paths: readonly string[]): Promise<Record<string, string | null>> {
   const out: Record<string, string | null> = Object.create(null);
-  await pool([...new Set(paths)], 8, async (p) => {
+  await pool([...new Set(paths)], 16, async (p) => {
     try {
       out[p] = await readOptional(p);
     } catch (e) {
@@ -323,6 +326,7 @@ async function readReleasedLockStamp(): Promise<string> {
 }
 
 async function recordOwnWrite(lockedCfgStamps: Record<string, string>, writtenSkillStamps: Record<string, string>) {
+  if (lastDiskStamp === null) return;
   try {
     const lockStamp = await readReleasedLockStamp();
     configStamps = { ...configStamps, ...lockedCfgStamps, [core.LOCK_PATH]: lockStamp };
@@ -353,7 +357,7 @@ async function scanSkills(opencodeText: string, reuse?: SkillScanReuse) {
   const unreadable: string[] = [];
   const mds: Record<string, string> = {};
   const unreadablePrev = reuse ? new Set(reuse.prevUnreadable) : null;
-  await pool(discoveredIds, 8, async (id) => {
+  await pool(discoveredIds, 32, async (id) => {
     const p = skillPaths[id];
     const st = skillStamps[p];
     if (
@@ -403,8 +407,11 @@ export const undoLabel = () => undoStack.at(-1)?.label ?? null;
 
 export type ChangeOpts = { label?: string; undoable?: boolean | 'clear' };
 
-export async function load() {
+export async function load(onLoaded?: () => void) {
   const myGen = ++gen;
+  const loadWriteSeq = writeSeq;
+  const loadSyncSeq = syncSeq;
+  resetStamps();
   queuedSync = null;
   deferredSync = null;
   clearLockRetry();
@@ -442,44 +449,63 @@ export async function load() {
   S.state = nextState;
   S.projectTexts = projTexts;
   S.loaded = true;
-  if (myGen === gen) {
-    try {
-      const lockCheck = await checkLock();
-      const [postConfigStamps, postSkillStamps] = await Promise.all([
-        readStampsMap(
-          configStampPaths(opencodeText, nextState),
-          lockCheck.lockStamp !== null ? { [core.LOCK_PATH]: lockCheck.lockStamp } : undefined,
-        ),
-        readStampsMap(scan.sortedSkillPaths),
-      ]);
-      if (myGen === gen) {
-        const nextSkillStamps: Record<string, string> = Object.create(null);
-        let skillsStable = true;
-        for (const p of scan.sortedSkillPaths) {
-          if (scan.skillStamps[p] === postSkillStamps[p]) {
-            nextSkillStamps[p] = postSkillStamps[p];
+  if (myGen === gen && writeSeq === loadWriteSeq && syncSeq === loadSyncSeq) {
+    let activePost!: Promise<void>;
+    activePost = (async () => {
+      try {
+        const lockCheck = await checkLock();
+        const [postConfigStamps, postSkillStamps] = await Promise.all([
+          readStampsMap(
+            [core.BUNDLES_PATH, core.OPENCODE_PATH, core.LOCK_PATH, ...roots, ...projPaths],
+            lockCheck.lockStamp !== null ? { [core.LOCK_PATH]: lockCheck.lockStamp } : undefined,
+          ),
+          readStampsMap(scan.sortedSkillPaths),
+        ]);
+        if (myGen === gen && writeSeq === loadWriteSeq && syncSeq === loadSyncSeq) {
+          const nextSkillStamps: Record<string, string> = Object.create(null);
+          let skillsStable = true;
+          for (const p of scan.sortedSkillPaths) {
+            if (scan.skillStamps[p] === postSkillStamps[p]) {
+              nextSkillStamps[p] = postSkillStamps[p];
+            } else {
+              skillsStable = false;
+            }
+          }
+          skillFileStamps = nextSkillStamps;
+          const cfgStable =
+            !lockCheck.held &&
+            [core.BUNDLES_PATH, core.OPENCODE_PATH, core.LOCK_PATH].every((p) => preConfigStamps[p] === postConfigStamps[p]) &&
+            roots.every((r) => preRootStamps[r] === postConfigStamps[r]) &&
+            projPaths.every((p) => preProjStamps[p] === postConfigStamps[p]);
+          if (cfgStable && skillsStable) {
+            configStamps = postConfigStamps;
+            lastDiskStamp = combineStamp(opencodeText, postConfigStamps, scan.skillPaths, nextSkillStamps, nextState);
+            if (!scan.incomplete) {
+              const home = effectiveHome();
+              void writeSkillIndexCache(host, {
+                v: 1,
+                rootsKey: JSON.stringify(roots),
+                rootStamps: formatRootStamps(roots, postConfigStamps),
+                allIds: scan.allIds,
+                ...(home ? { home } : {}),
+                scannedAt: Date.now(),
+              });
+            }
           } else {
-            skillsStable = false;
+            configStamps = Object.create(null);
+            lastDiskStamp = null;
           }
         }
-        skillFileStamps = nextSkillStamps;
-        const cfgStable =
-          !lockCheck.held &&
-          [core.BUNDLES_PATH, core.OPENCODE_PATH, core.LOCK_PATH].every((p) => preConfigStamps[p] === postConfigStamps[p]) &&
-          roots.every((r) => preRootStamps[r] === postConfigStamps[r]) &&
-          projPaths.every((p) => preProjStamps[p] === postConfigStamps[p]);
-        if (cfgStable && skillsStable) {
-          configStamps = postConfigStamps;
-          lastDiskStamp = combineStamp(opencodeText, postConfigStamps, scan.skillPaths, nextSkillStamps, nextState);
-        } else {
-          configStamps = Object.create(null);
-          lastDiskStamp = null;
-        }
+      } catch {
+        if (myGen === gen && writeSeq === loadWriteSeq && syncSeq === loadSyncSeq) resetStamps();
+      } finally {
+        if (postLoadStamps === activePost) postLoadStamps = null;
       }
-    } catch {
-      resetStamps();
-    }
+    })();
+    postLoadStamps = activePost;
   }
+  if (myGen === gen) onLoaded?.();
+  if (postLoadStamps) await postLoadStamps;
 }
 
 // ---------- save ----------
@@ -848,6 +874,7 @@ function scheduleLockRetry(opts?: SyncOpts) {
 }
 
 async function runSync(opts?: SyncOpts): Promise<boolean> {
+  syncSeq++;
   const myGen = gen;
   const interrupted = (defer?: SyncOpts): boolean => {
     if (myGen !== gen || !S.loaded) return true;
@@ -1000,6 +1027,18 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
   const nextCfgStamps: Record<string, string> = Object.create(null);
   for (const p of newCfgPaths) nextCfgStamps[p] = postConfigStamps[p];
   configStamps = nextCfgStamps;
+  if (needsFull && !nextIncomplete) {
+    const roots = skillRoots(opencodeText);
+    const home = effectiveHome();
+    void writeSkillIndexCache(host, {
+      v: 1,
+      rootsKey: JSON.stringify(roots),
+      rootStamps: formatRootStamps(roots, nextCfgStamps),
+      allIds: nextAllIds,
+      ...(home ? { home } : {}),
+      scannedAt: Date.now(),
+    });
+  }
   if (needsFull && postSkillStamps) {
     skillFileStamps = postSkillStamps;
     pendingFullSync = false;
@@ -1091,6 +1130,7 @@ export async function syncFromDisk(opts?: SyncOpts): Promise<boolean> {
 
 /** Stat key files and sync from disk if anything changed externally. */
 export async function checkDisk(opts?: { includeSkills?: boolean }): Promise<boolean> {
+  if (postLoadStamps) await postLoadStamps;
   if (!S.loaded || activeWrites > 0) return false;
   if (syncInFlight) return syncInFlight;
   if (lastDiskStamp === null) return syncFromDisk({ full: true });

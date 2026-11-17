@@ -16,3 +16,15 @@
 .skm-fill { height: 100%; border-radius: 999px; background: var(--oc-success); transition: width 200ms ease; }
 
 .skm-sub { font-size: 11px; color: var(--oc-muted); }
+
+/* Work Status: one quiet line at the host list-row size (13px at the default 14px root; scales with the interface font size), no bar. */
+.skm-compact .skm-top { gap: 6px; }
+.skm-compact .skm-left { gap: 4px; flex-wrap: nowrap; overflow: hidden; }
+.skm-compact .skm-live-n,
+.skm-compact .skm-live-w,
+.skm-compact .skm-rest,
+.skm-compact .skm-tokens { font-size: calc(13rem / 14); font-weight: 400; line-height: 1.45; }
+.skm-compact .skm-live-n { color: var(--oc-fg); }
+.skm-compact .skm-live-w { color: color-mix(in srgb, var(--oc-success-text, var(--oc-success)) 55%, var(--oc-muted)); }
+.skm-compact .skm-rest { margin-left: 0; min-width: 0; color: var(--oc-muted); overflow: hidden; text-overflow: ellipsis; }
+.skm-compact .skm-tokens { color: var(--oc-muted); }

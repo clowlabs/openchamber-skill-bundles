@@ -47,6 +47,8 @@ export function createFakeHost(opts = {}) {
     projectsState: "ready",
     /** onProjects listeners */
     projectListeners: new Set(),
+    /** in-memory extension storage (instance + device scopes) */
+    storage: new Map(),
 
     put(p, text) {
       fs.mkdirSync(path.dirname(real(p)), { recursive: true });
@@ -120,6 +122,27 @@ export function createFakeHost(opts = {}) {
       async onProjects(listener) {
         fx.projectListeners.add(listener);
         return () => fx.projectListeners.delete(listener);
+      },
+      storage: {
+        async get(key, options) {
+          const k = `${options?.scope ?? "instance"}:${key}`;
+          return fx.storage.has(k) ? structuredClone(fx.storage.get(k)) : undefined;
+        },
+        async set(key, value, options) {
+          const k = `${options?.scope ?? "instance"}:${key}`;
+          fx.storage.set(k, structuredClone(value));
+        },
+        async delete(key, options) {
+          const k = `${options?.scope ?? "instance"}:${key}`;
+          fx.storage.delete(k);
+        },
+        async keys(options) {
+          const prefix = `${options?.scope ?? "instance"}:`;
+          return [...fx.storage.keys()]
+            .filter((k) => k.startsWith(prefix))
+            .map((k) => k.slice(prefix.length))
+            .sort();
+        },
       },
     },
   };

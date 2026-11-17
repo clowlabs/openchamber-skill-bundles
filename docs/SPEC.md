@@ -216,7 +216,7 @@ after the global ones, so a project `allow` beats the global `deny *`.
     managedProjects), printing a note; `on --project` reuses a stored spelling of the same folder.
   - `managedProjects` is carried in the plan's `state`: a dir is added when a write leaves rules in
     its file, and dropped once it is in no bundle (its rules are removed by that same plan).
-- Panel: bundle header "Projects…" control + header right-click → checklist of OpenChamber projects
-  (listProjects, skip chats dir) with filter + "Add folder…" text field (absolute/`~/` path);
+- Panel: bundle header "Projects…" control + header/row Alt-click or right-click → flush checklist of
+  Global + OpenChamber projects (listProjects, skip chats dir) with filter;
   header badge "Off · N projects" / "On · +N projects"; skill detail lists its projects.
   Manifest filesystem adds "~/**/.opencode/opencode.json" and "/**/.opencode/opencode.json".

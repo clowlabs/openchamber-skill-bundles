@@ -1845,6 +1845,11 @@ test("compact rail: no hints, Alt/right-click opens projects menu, Disable pill 
     expect(checks.map((c) => c.dataset.dir)).toEqual(["__global", projA, projB]);
     expect(checks[0].checked).toBe(false);
     expect(checks[1].checked).toBe(true);
+    const itemsBox = projMenu.children.find((c) => c.classList.contains("sb-ctx-items"));
+    expect(itemsBox.children.every((c) => c.classList.contains("sb-proj-row"))).toBe(true);
+    const footBox = projMenu.children.find((c) => c.classList.contains("sb-ctx-foot"));
+    expect(footBox.children).toEqual([]);
+    expect(footBox.textContent).toBe("");
     popup.closePopup();
 
     // Right-click on bundle row also opens Projects menu without drilling in
@@ -3237,4 +3242,147 @@ test("regression: checkDisk({ includeSkills: false }) escalates to full sync whe
   });
   await settle();
   expect(core.readFrontmatter(read(alphaPath)).autoinvoke).toBe(false);
+});
+
+test("load(onLoaded) fires onLoaded before post-stat verification and warms skill-index-v1 cache unless incomplete", async () => {
+  const { SKILL_INDEX_KEY, formatRootStamps, statRootsMap } = await import("../status/cache.ts");
+  const { skillRoots } = await import("../src/discover.js");
+
+  fx.storage.clear();
+  const h = fakeHost();
+  let statsAfterOnLoaded = 0;
+  let onLoadedFired = false;
+  let loadedDuringCallback = false;
+  let stateDuringCallback = null;
+  const origStat = h.stat;
+  h.stat = async (p) => {
+    if (onLoadedFired) statsAfterOnLoaded++;
+    return origStat(p);
+  };
+  io.setHost(h);
+  io.S.loaded = false;
+  io.S.state = null;
+
+  await io.load(() => {
+    onLoadedFired = true;
+    loadedDuringCallback = io.S.loaded;
+    stateDuringCallback = io.S.state;
+  });
+
+  expect(onLoadedFired).toBe(true);
+  expect(loadedDuringCallback).toBe(true);
+  expect(stateDuringCallback?.bundles.map((b) => b.id)).toEqual(["b"]);
+  expect(statsAfterOnLoaded).toBeGreaterThan(0);
+
+  const roots = skillRoots(io.S.opencodeText);
+  const expectedStamps = formatRootStamps(roots, await statRootsMap(h, roots));
+  const cached = await h.storage.get(SKILL_INDEX_KEY);
+  expect(cached).toMatchObject({
+    v: 1,
+    rootsKey: JSON.stringify(roots),
+    rootStamps: expectedStamps,
+    allIds: io.S.allIds,
+    home,
+  });
+  expect(typeof cached.scannedAt).toBe("number");
+
+  // Full sync updates skill-index-v1 when a new skill is added on disk
+  put("~/.config/opencode/skills/gamma/SKILL.md", skillMd("Gamma"));
+  const future = new Date(Date.now() + 5_000);
+  fs.utimesSync(real("~/.config/opencode/skills"), future, future);
+  expect(await io.syncFromDisk({ full: true })).toBe(true);
+  await Promise.resolve();
+  const cachedAfterSync = await h.storage.get(SKILL_INDEX_KEY);
+  expect(cachedAfterSync.allIds).toContain("gamma");
+
+  // Incomplete discovery does NOT overwrite or populate skill-index-v1
+  fx.storage.clear();
+  put(core.OPENCODE_PATH, JSON.stringify({ $schema: "x", skills: ["/outside/skills"], permissions: [] }, null, 2) + "\n");
+  const origListDir = h.listDir;
+  h.listDir = async (p) => {
+    if (p === "/outside/skills") throw new HostRequestError("BAD_PATH", "outside");
+    return origListDir(p);
+  };
+  await io.load();
+  expect(io.S.incomplete).toBe(true);
+  expect(await h.storage.get(SKILL_INDEX_KEY)).toBeUndefined();
+});
+
+test("regression: commit() inside load(onLoaded) keeps lastDiskStamp null until verified and discovers concurrent new skills", async () => {
+  const { SKILL_INDEX_KEY } = await import("../status/cache.ts");
+  fx.storage.clear();
+  const h = fakeHost();
+  io.setHost(h);
+
+  // Inside onLoaded (before post-stat verification runs), add a new skill on disk AND queue a user toggle
+  await io.load(() => {
+    put("~/.config/opencode/skills/epsilon/SKILL.md", skillMd("Epsilon added mid-boot"));
+    const t = new Date(Date.now() + 5_000);
+    fs.utimesSync(real("~/.config/opencode/skills"), t, t);
+    io.commit((s) => core.setBundleGlobal(s, "b", true));
+  });
+  await settle();
+  expect(io.S.state.bundles[0].enabled).toBe(true);
+
+  // Because baseline stamps were unverified during save(), checkDisk() runs a full verification scan and discovers epsilon
+  expect(await io.checkDisk()).toBe(true);
+  expect(io.S.allIds).toContain("epsilon");
+  expect((await h.storage.get(SKILL_INDEX_KEY))?.allIds).toContain("epsilon");
+});
+
+test("regression: checkDisk() during load(onLoaded) post-stat waits for postLoadStamps and uses 0-listDir fast path on project switch", async () => {
+  const projNew = `${home}/work/proj-switch`;
+  fs.mkdirSync(real(projNew), { recursive: true });
+  put(`${projNew}/.opencode/opencode.json`, JSON.stringify({ permissions: [] }) + "\n");
+
+  let listDirCalls = 0;
+  const h = fakeHost();
+  const origListDir = h.listDir;
+  h.listDir = async (p) => {
+    listDirCalls++;
+    return origListDir(p);
+  };
+  io.setHost(h);
+
+  let diskPromise;
+  await io.load(() => {
+    // Discovery has already finished when onLoaded fires; reset counter and simulate immediate onDirectory switch
+    listDirCalls = 0;
+    io.S.activeDir = projNew;
+    diskPromise = io.checkDisk();
+  });
+  await diskPromise;
+
+  // checkDisk() waited for postLoadStamps and read projNew's config via the 0-listDir fast path!
+  expect(listDirCalls).toBe(0);
+  expect(Object.hasOwn(io.S.projectTexts, core.projectConfigPath("~/work/proj-switch"))).toBe(true);
+});
+
+test("regression: StaleError reloadAfter() inside enqueue verifies stamps so subsequent checkDisk() needs 0 listDirs", async () => {
+  let listDirCalls = 0;
+  const h = fakeHost();
+  const origListDir = h.listDir;
+  h.listDir = async (p) => {
+    listDirCalls++;
+    return origListDir(p);
+  };
+  io.setHost(h);
+  await io.load();
+
+  // Externally edit skill-bundles.json WITHOUT syncing so applyChange hits StaleError -> reloadAfter() inside enqueue
+  const extState = core.setBundleGlobal(io.S.state, "b", true);
+  put(core.BUNDLES_PATH, core.serializeBundles(extState));
+  const t1 = new Date(Date.now() + 5_000);
+  fs.utimesSync(real(core.BUNDLES_PATH), t1, t1);
+
+  await io.enqueue(async () => {
+    expect(await io.applyChange((s) => core.setOverride(s, "alpha", "called"))).toBe(false);
+  });
+  await settle();
+  expect(io.S.state.bundles[0].enabled).toBe(true);
+
+  // reloadAfter()'s load() verified stamps cleanly even though activeWrites was 1 -> next checkDisk() is a 0-listDir no-op!
+  listDirCalls = 0;
+  expect(await io.checkDisk()).toBe(false);
+  expect(listDirCalls).toBe(0);
 });
