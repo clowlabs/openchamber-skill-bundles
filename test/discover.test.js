@@ -9,7 +9,15 @@ import {
   skillRoots,
   classifySkillDir,
   mergeSkillRefs,
+  join,
 } from "../src/discover.js";
+
+test("join handles empty parts, roots, and trailing separators", () => {
+  for (const [a, b, expected] of [
+    ["", "", ""], ["", "skill", "skill"], ["~/skills/", "", "~/skills/"],
+    ["/", "skill", "/skill"], ["~/skills///", "nested/SKILL.md", "~/skills/nested/SKILL.md"],
+  ]) assert.equal(join(a, b), expected);
+});
 
 test("constants match OpenCode V2 discovery", () => {
   assert.deepEqual(GLOBAL_SKILL_ROOTS, [

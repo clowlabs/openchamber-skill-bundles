@@ -20,6 +20,7 @@ export const SKILL_FILE: "SKILL.md";
 export const SKILL_SCAN_BUDGET: number;
 /** Hidden entries and the folders OpenCode never searches (node_modules, .git, venv, …). */
 export function skipName(name: string): boolean;
+export function join(a: string, b: string): string;
 
 export function normalizeRoot(entry: unknown): string | null;
 export function configSkillRoots(opencodeText: string): string[];

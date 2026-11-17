@@ -1,6 +1,6 @@
 {
   "name": "skill-bundles",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "private": true,
   "type": "module",
   "description": "Turn OpenCode skills on and off in named bundles.",
@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "openchamber-guest-bundle panel/main.ts panel/main.js && openchamber-guest-bundle status/main.ts status/main.js",
-    "test": "node --test test/ && bun test test/panel-io.test.js test/status-counts.test.js",
+    "test": "node --test test/ && bun run test:panel",
     "test:panel": "bun test test/panel-io.test.js test/status-counts.test.js",
     "check": "bash scripts/check.sh",
     "lint": "biome lint --config-path=lint.jsonc .",

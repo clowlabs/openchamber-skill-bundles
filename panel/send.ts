@@ -3,7 +3,8 @@ import type { HostClient } from '@openchamber/sdk';
 import * as core from '../src/core.js';
 import type { State } from '../src/core.js';
 import type { SkillRef } from '../src/discover.js';
-import { HAND_EDIT } from './dom';
+import { pool } from '../shared/panel/host';
+import { HAND_EDIT, plural } from './dom';
 import { S, bundlesOf, commit, fmError, orderBundles } from './io';
 import {
   button, closePopup, codeOf, createPopup, note, onRefreshMenus, projectList, projectsNote, replace, sectionTitle, shortDir, watchProjects, type Project,
@@ -67,7 +68,7 @@ async function readTextFile(path: string, label: string): Promise<string> {
     if (codeOf(err) === 'FILE_TOO_LARGE') throw new Error(`${label} is larger than 2 MB`);
     throw new Error(`${label} could not be read as text (${codeOf(err) || (err as Error).message})`);
   }
-  if (utf8.encode(content).length > FILE_MAX) throw new Error(`${label} is larger than 2 MB`);
+  if (content.length * 3 > FILE_MAX && utf8.encode(content).length > FILE_MAX) throw new Error(`${label} is larger than 2 MB`);
   if (core.looksBinary(content)) throw new Error(`${label} is not UTF-8 text`);
   return content;
 }
@@ -81,21 +82,50 @@ async function walkFiles(root: string, mode: 'preview'): Promise<{ rel: string }
 async function walkFiles(root: string, mode: 'strict' | 'preview'): Promise<{ rel: string; content?: string }[]> {
   const strict = mode === 'strict';
   const out: { rel: string; content?: string }[] = [];
-  const walk = async (rel: string): Promise<void> => {
-    const { entries } = await deps.host.listDir(rel ? `${root}/${rel}` : root);
+  type Listing = Awaited<ReturnType<HostClient['listDir']>>;
+  const walk = async (rel: string, { entries }: Listing): Promise<void> => {
+    // Prefetch siblings together, then consume in the original depth-first order.
+    // Defer listing errors until that directory is visited (preview may hit its cap first).
+    const dirs = new Map<string, PromiseSettledResult<Listing>>();
+    await pool(entries.filter((e) => e.kind === 'directory'), 16, async (e) => {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      try {
+        dirs.set(e.name, { status: 'fulfilled', value: await deps.host.listDir(`${root}/${r}`) });
+      } catch (reason) {
+        dirs.set(e.name, { status: 'rejected', reason });
+      }
+    });
     for (const e of entries) {
       if (out.length >= FILES_MAX) {
         if (strict) throw new Error(`more than ${FILES_MAX} files`);
         return;
       }
       const r = rel ? `${rel}/${e.name}` : e.name;
-      if (e.kind === 'directory') { await walk(r); continue; }
+      if (e.kind === 'directory') {
+        const listing = dirs.get(e.name);
+        if (!listing) throw new Error(`${r} was not listed`);
+        if (listing.status === 'rejected') throw listing.reason;
+        await walk(r, listing.value);
+        continue;
+      }
       if (!strict) { out.push({ rel: r }); continue; }
       if (e.kind !== 'file') throw new Error(`${r} is not a regular file (symlink or special file)`);
-      out.push({ rel: r, content: await readTextFile(`${root}/${r}`, r) });
+      out.push({ rel: r });
     }
   };
-  await walk('');
+  await walk('', await deps.host.listDir(root));
+  if (strict) {
+    const errors = new Map<string, unknown>();
+    await pool(out, 16, async (f) => {
+      try {
+        f.content = await readTextFile(`${root}/${f.rel}`, f.rel);
+      } catch (e) {
+        errors.set(f.rel, e);
+      }
+    });
+    // Select failures by traversal order, not completion timing.
+    for (const f of out) if (errors.has(f.rel)) throw errors.get(f.rel);
+  }
   return out;
 }
 
@@ -114,7 +144,17 @@ async function copySkill(id: string, project: Project, move: boolean) {
     return;
   }
   try {
-    for (const f of files) await deps.host.writeFile(`${dest}/${f.rel}`, f.content);
+    const errors: unknown[] = [];
+    await pool(files, 16, async (f) => {
+      if (errors.length) return;
+      try {
+        await deps.host.writeFile(`${dest}/${f.rel}`, f.content);
+      } catch (e) {
+        errors.push(e);
+      }
+    });
+    // Drain in-flight writes before releasing the queue or reporting a partial copy.
+    if (errors.length) throw errors[0];
   } catch (e) {
     deps.toastError(e, `Copy to ${project.name} stopped partway; check ${dest}`);
     return;
@@ -298,7 +338,7 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
       for (const b of shownBundles) {
         list.appendChild(menuItem({
           label: b.name,
-          sub: b.synthetic ? 'remove from bundle' : `${b.skills.length} skill${b.skills.length === 1 ? '' : 's'} · ${b.enabled ? 'on' : 'off'}`,
+          sub: b.synthetic ? 'remove from bundle' : `${plural(b.skills.length, 'skill')} · ${b.enabled ? 'on' : 'off'}`,
           title: bundleBlocked ?? (b.synthetic ? 'Remove from bundle' : b.name),
           disabled: Boolean(bundleBlocked || busy),
           dataKey: 'bid',
@@ -332,7 +372,7 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
           const s = document.createElement('div');
           s.className = 'sb-ctx-stale';
           const shownStale = staleFiles.slice(0, 5).join(', ');
-          s.textContent = `${staleFiles.length} old file${staleFiles.length > 1 ? 's' : ''} will stay: ${shownStale}${staleFiles.length > 5 ? `, and ${staleFiles.length - 5} more` : ''}`;
+          s.textContent = `${plural(staleFiles.length, 'old file')} will stay: ${shownStale}${staleFiles.length > 5 ? `, and ${staleFiles.length - 5} more` : ''}`;
           s.title = staleFiles.join('\n');
           c.appendChild(s);
         }

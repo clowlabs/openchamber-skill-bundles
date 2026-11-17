@@ -70,7 +70,9 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
     const hOpt = homeOpt();
     const mine = b.projects ?? [];
     const excluded = b.excludedProjects ?? [];
-    const allProjects = projectList().projects.filter((p) => core.normalizeScopeDir(p.directory, hOpt) !== null);
+    const allProjects = projectList().projects
+      .map((project) => ({ project, norm: core.normalizeScopeDir(project.directory, hOpt) }))
+      .filter((p): p is { project: Project; norm: string } => p.norm !== null);
     pop.ensureFilter(allProjects.length + mine.length + excluded.length, 'Filter projects', (v) => { filter = v; paint(); });
 
     list.appendChild(row({
@@ -87,35 +89,26 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
     }));
 
     const curDir = activeProjectDir();
-    const curNorm = curDir ? core.normalizeScopeDir(curDir, hOpt) : null;
-    const sameNorm = (a: string, bNorm: string | null) =>
-      bNorm != null && core.normalizeScopeDir(a, hOpt) === bNorm;
-
-    const knownNorms = new Set<string>();
-    for (const p of allProjects) {
-      const n = core.normalizeScopeDir(p.directory, hOpt);
-      if (n != null) knownNorms.add(n);
-    }
+    const knownNorms = new Set(allProjects.map(({ norm }) => norm));
     const isKnown = (dir: string) => {
       const n = core.normalizeScopeDir(dir, hOpt);
-      return n != null ? knownNorms.has(n) : allProjects.some((p) => sameProjectDir(p.directory, dir));
+      return n != null ? knownNorms.has(n) : allProjects.some(({ project }) => sameProjectDir(project.directory, dir));
     };
-    const mineNorms = new Set<string>();
-    for (const m of mine) {
-      const n = core.normalizeScopeDir(m, hOpt);
-      if (n != null) mineNorms.add(n);
-    }
+    const mineNorms = new Set(mine.map((d) => core.normalizeScopeDir(d, hOpt) ?? d));
+    const excludedNorms = new Set(excluded.map((d) => core.normalizeScopeDir(d, hOpt) ?? d));
     const inMine = (dir: string) => {
       const n = core.normalizeScopeDir(dir, hOpt);
       return n != null ? mineNorms.has(n) : mine.some((m) => sameProjectDir(m, dir));
     };
 
-    const knownRaw: Project[] = core.filterProjects(allProjects, filter);
-    const known = curNorm
-      ? [...knownRaw.filter((p) => sameNorm(p.directory, curNorm)), ...knownRaw.filter((p) => !sameNorm(p.directory, curNorm))]
-      : curDir
-        ? [...knownRaw.filter((p) => sameProjectDir(p.directory, curDir)), ...knownRaw.filter((p) => !sameProjectDir(p.directory, curDir))]
-        : knownRaw;
+    const shown = new Set<Project>(core.filterProjects(allProjects.map(({ project }) => project), filter));
+    const knownRaw = allProjects.filter(({ project }) => shown.has(project));
+    const current: typeof allProjects = [];
+    const others: typeof allProjects = [];
+    for (const p of knownRaw) {
+      (p.norm === curDir ? current : others).push(p);
+    }
+    const known = [...current, ...others];
     const q = filter.trim().toLowerCase();
     const unlistedMine = mine.filter((d) => !isKnown(d) && (!q || d.toLowerCase().includes(q)));
     const unlistedExcluded = b.enabled
@@ -124,9 +117,9 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
     const status = projectsNote(known.length + unlistedMine.length + unlistedExcluded.length, filter);
 
     if (status) list.appendChild(note(status));
-    for (const p of known) {
-      const isCur = curNorm ? sameNorm(p.directory, curNorm) : (curDir != null && sameProjectDir(p.directory, curDir));
-      const checked = core.isBundleActive(b, { projectDir: p.directory, ...hOpt });
+    for (const { project: p, norm } of known) {
+      const isCur = norm === curDir;
+      const checked = mineNorms.has(norm) || (b.enabled && !excludedNorms.has(norm));
       list.appendChild(row({
         key: p.directory,
         label: p.name,

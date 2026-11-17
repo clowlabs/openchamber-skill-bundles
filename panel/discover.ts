@@ -1,6 +1,6 @@
 // Browser/panel skill discovery via HostClient, using src/discover.js rules.
 import { errorCode, isNotFound, pool, type FileHost } from '../shared/panel/host';
-import { classifySkillDir, mergeSkillRefs, skillRoots, skipName, SKILL_SCAN_BUDGET, type DirEntry, type SkillRef } from '../src/discover.js';
+import { classifySkillDir, join, mergeSkillRefs, skillRoots, skipName, SKILL_SCAN_BUDGET, type DirEntry, type SkillRef } from '../src/discover.js';
 
 export type Unreachable = {
   path: string;
@@ -11,8 +11,6 @@ export type DiscoveryResult = {
   skills: Record<string, SkillRef>;
   unreachable: Unreachable[];
 };
-
-const join = (a: string, b: string) => (b ? `${a.replace(/\/+$/, '')}/${b}` : a);
 
 function unreachableCode(e: unknown): string | null {
   const code = errorCode(e);

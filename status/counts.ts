@@ -1,16 +1,19 @@
 // Live vs installed skill counts, read-only. Shared by the Work Status section, the panel header
-// and tests. No writes, no lock.
+// and tests. Only disposable extension-storage caches are written; no lock.
 import * as core from '../src/core.js';
 import type { State } from '../src/core.js';
 import { GLOBAL_SKILL_ROOTS, skillRoots } from '../src/discover.js';
 import { discoverSkills } from '../panel/discover';
+import { el } from '../panel/dom';
 import { isUnreadable, readOptional, type FileHost, type ProjectsHost } from '../shared/panel/host';
 import { createHomeDeriver, homeFromDirs } from '../shared/panel/projects';
 import {
   formatRootStamps,
   readSkillIndexCache,
   statRootsMap,
-  writeSkillIndexCache,
+  saveSkillIndexCache,
+  type createCachedStatusPainter,
+  type LastCounts,
   type SkillIndexCache,
   type StorageHost,
 } from './cache';
@@ -105,11 +108,15 @@ export type CountsOptions = {
   cachedIds?: string[];
 };
 
+function scopeOf(projectDir?: string | null, givenHome?: string) {
+  const home = givenHome ?? homeFromDirs(projectDir ? [projectDir] : []);
+  const homeOpt = home ? { home } : {};
+  return { home, homeOpt, normDir: core.normalizeScopeDir(projectDir, homeOpt) };
+}
+
 /** Counts from already-loaded data (the panel passes its state). */
 export function countsFromState(state: State | null, allIds: string[], opencodeText: string | null, opts?: CountsOptions): SkillCounts {
-  const home = opts?.home ?? homeFromDirs(opts?.projectDir ? [opts.projectDir] : []);
-  const homeOpt = home ? { home } : {};
-  const normDir = core.normalizeScopeDir(opts?.projectDir, homeOpt);
+  const { homeOpt, normDir } = scopeOf(opts?.projectDir, opts?.home);
   if (!state) {
     const live = liveFromOpencode(opencodeText, allIds, normDir != null ? opts?.projectOpencodeText : undefined);
     return { live, installed: allIds.length, chars: live * core.CHARS_PER_SKILL, bundlesOn: null, fromOpencode: true };
@@ -117,12 +124,10 @@ export function countsFromState(state: State | null, allIds: string[], opencodeT
   const scope = { projectDir: normDir, ...homeOpt };
   const bundlesOn = state.bundles.filter((b) => core.isBundleActive(b, scope)).map((b) => b.id);
 
-  const projRules =
-    normDir != null && opts?.projectOpencodeText !== undefined
-      ? opts.projectOpencodeText === null
-        ? []
-        : parseSkillRules(opts.projectOpencodeText)
-      : null;
+  let projRules: SkillRule[] | null = null;
+  if (normDir != null && opts?.projectOpencodeText !== undefined) {
+    projRules = opts.projectOpencodeText === null ? [] : parseSkillRules(opts.projectOpencodeText);
+  }
   if (projRules !== null) {
     let live = 0;
     let auto = 0;
@@ -144,30 +149,8 @@ export function countsFromState(state: State | null, allIds: string[], opencodeT
     };
   }
 
-  let auto = 0;
-  let called = 0;
-  const activeBundleSkills = new Set<string>();
-  for (const b of state.bundles) {
-    if (bundlesOn.includes(b.id)) {
-      for (const id of b.skills) activeBundleSkills.add(id);
-    }
-  }
-  for (const id of allIds) {
-    const ov =
-      Object.hasOwn(state.overrides, id) && core.MODES.includes(state.overrides[id]) ? state.overrides[id] : undefined;
-    let mode = ov ?? (activeBundleSkills.has(id) ? 'auto' : 'off');
-    if (mode === 'called' && core.isBuiltin(id)) mode = 'auto';
-    if (mode === 'auto') auto++;
-    else if (mode === 'called') called++;
-  }
-  return {
-    live: auto + called,
-    installed: allIds.length,
-    chars: auto * core.CHARS_PER_SKILL,
-    // ids ("dev, plan"): short enough for one line; names can be long.
-    bundlesOn,
-    fromOpencode: false,
-  };
+  const s = core.summary(state, allIds, scope);
+  return { live: s.on, installed: allIds.length, chars: s.chars, bundlesOn, fromOpencode: false };
 }
 
 async function readProjectConfigSafe(
@@ -186,9 +169,7 @@ async function readProjectConfigSafe(
 
 /** Read the files and count. */
 export async function readCounts(host: FileHost, opts?: CountsOptions): Promise<SkillCounts> {
-  const home = opts?.home ?? homeFromDirs(opts?.projectDir ? [opts.projectDir] : []);
-  const homeOpt = home ? { home } : {};
-  const normDir = core.normalizeScopeDir(opts?.projectDir, homeOpt);
+  const { home, homeOpt, normDir } = scopeOf(opts?.projectDir, opts?.home);
   const opencodePromise =
     opts?.opencodeText !== undefined ? Promise.resolve(opts.opencodeText) : readOptional(host, core.OPENCODE_PATH);
   const [bundlesText, opencodeText, projectOpencodeText, allIds] = await Promise.all([
@@ -211,7 +192,7 @@ export type StatusLoadOptions = {
   forceImmediateScan?: boolean;
 };
 
-const sameIds = (a: readonly string[], b: readonly string[]) =>
+export const sameIds = (a: readonly string[], b: readonly string[]) =>
   a.length === b.length && a.every((x, i) => x === b[i]);
 
 /**
@@ -233,23 +214,21 @@ export function createStatusLoader(
   let scanGen = 0;
   let bgScan: Promise<void> | null = null;
   let bgDirty = false;
-  let bgArgs: {
+  type BackgroundArgs = {
     roots: readonly string[];
     rootsKey: string;
     opencodeText: string | null;
     home: string | undefined;
     epoch: number;
-  } | null = null;
+  };
+  let bgArgs: BackgroundArgs | null = null;
+  const stale = (cur: BackgroundArgs) => cur.epoch !== scanGen || cur.rootsKey !== activeRootsKey;
 
   function startBackgroundScan(
     prevIds: readonly string[],
-    roots: readonly string[],
-    rootsKey: string,
-    opencodeText: string | null,
-    home: string | undefined,
-    epoch: number,
+    args: BackgroundArgs,
   ): void {
-    bgArgs = { roots, rootsKey, opencodeText, home, epoch };
+    bgArgs = args;
     if (bgScan) {
       bgDirty = true;
       return;
@@ -260,26 +239,16 @@ export function createStatusLoader(
         do {
           bgDirty = false;
           const cur = bgArgs;
-          if (!cur || cur.epoch !== scanGen || cur.rootsKey !== activeRootsKey) break;
+          if (!cur || stale(cur)) break;
           const [{ allIds, incomplete }, rootMap] = await Promise.all([
             discoverSkillIds(host, cur.opencodeText),
             statRootsMap(host, cur.roots),
           ]);
-          if (cur.epoch !== scanGen || cur.rootsKey !== activeRootsKey) continue;
-          const entry: SkillIndexCache = {
-            v: 1,
-            rootsKey: cur.rootsKey,
-            rootStamps: formatRootStamps(cur.roots, rootMap),
-            allIds,
-            ...(cur.home ? { home: cur.home } : {}),
-            scannedAt: Date.now(),
-          };
-          idCache = entry;
+          if (stale(cur)) continue;
           const publishedAtSeq = loadSeq;
-          if (!incomplete) {
-            await writeSkillIndexCache(host, entry);
-            if (cur.epoch !== scanGen || cur.rootsKey !== activeRootsKey) continue;
-          }
+          const entry = await saveSkillIndexCache(incomplete ? {} : host, { ...cur, rootMap, allIds });
+          if (stale(cur)) continue;
+          idCache = entry;
           if (!sameIds(baselineIds, allIds)) {
             baselineIds = allIds;
             if (onRevalidated && loadSeq === publishedAtSeq) {
@@ -288,7 +257,7 @@ export function createStatusLoader(
                 home: cur.home,
                 cachedIds: allIds,
               });
-              if (cur.epoch === scanGen && cur.rootsKey === activeRootsKey && loadSeq === publishedAtSeq) {
+              if (!stale(cur) && loadSeq === publishedAtSeq) {
                 onRevalidated(fresh);
               }
             }
@@ -303,14 +272,11 @@ export function createStatusLoader(
   }
 
   return {
-    invalidateScanAge(): void {
-      invalidScanAge = true;
-      if (idCache) idCache = { ...idCache, scannedAt: 0 };
-    },
     async load(dir: string | null, loadOpts?: StatusLoadOptions): Promise<SkillCounts> {
+      if (loadOpts?.forceImmediateScan) invalidScanAge = true;
       loadSeq++;
       latestDir = dir;
-      const optimisticDir = dir && !core.isChatsDir(dir) ? core.normalizeScopeDir(dir) : null;
+      const optimisticDir = core.normalizeScopeDir(dir);
       const [cached, bundlesText, opencodeText, initialRootMap, derivedHome, optimisticProjText] =
         await Promise.all([
           idCache ? Promise.resolve(idCache) : readSkillIndexCache(host),
@@ -321,9 +287,7 @@ export function createStatusLoader(
           optimisticDir !== null ? readProjectConfigSafe(host, optimisticDir, undefined) : Promise.resolve(undefined),
         ]);
 
-      const home = derivedHome ?? idCache?.home ?? cached?.home ?? (dir ? homeFromDirs([dir]) : undefined);
-      const homeOpt = home ? { home } : {};
-      const normDir = core.normalizeScopeDir(dir, homeOpt);
+      const { home, homeOpt, normDir } = scopeOf(dir, derivedHome ?? idCache?.home ?? cached?.home);
       const projectOpencodeText =
         normDir === null
           ? undefined
@@ -354,7 +318,8 @@ export function createStatusLoader(
 
       if (effectiveCached && effectiveCached.rootsKey === rootsKey) {
         const nextCached =
-          invalidScanAge || loadOpts?.forceImmediateScan ? { ...effectiveCached, scannedAt: 0 } : effectiveCached;
+          invalidScanAge ? { ...effectiveCached, scannedAt: 0 } : effectiveCached;
+        const forceImmediateScan = invalidScanAge;
         invalidScanAge = false;
         idCache = nextCached;
         const immediate = countsFromState(state, nextCached.allIds, opencodeText, {
@@ -364,28 +329,22 @@ export function createStatusLoader(
         });
         const stampsChanged = nextCached.rootStamps !== rootStamps;
         const staleAge =
-          Boolean(loadOpts?.forceImmediateScan) ||
+          forceImmediateScan ||
           (Boolean(loadOpts?.forceScan) && Date.now() - nextCached.scannedAt >= revalidateAfterMs);
         if (stampsChanged || staleAge) {
-          startBackgroundScan(nextCached.allIds, roots, rootsKey, opencodeText, home, scanGen);
+          startBackgroundScan(nextCached.allIds, { roots, rootsKey, opencodeText, home, epoch: scanGen });
         }
         return immediate;
       }
 
-      invalidScanAge = false;
       const myScanGen = ++scanGen;
       const { allIds, incomplete } = await discoverSkillIds(host, opencodeText);
       if (myScanGen === scanGen && rootsKey === activeRootsKey) {
-        const entry: SkillIndexCache = {
-          v: 1,
-          rootsKey,
-          rootStamps,
-          allIds,
-          ...(home ? { home } : {}),
-          scannedAt: Date.now(),
-        };
-        idCache = entry;
-        if (!incomplete) void writeSkillIndexCache(host, entry);
+        const entry = await saveSkillIndexCache(incomplete ? {} : host, { roots, rootsKey, rootMap, allIds, home });
+        if (myScanGen === scanGen && rootsKey === activeRootsKey) {
+          idCache = entry;
+          invalidScanAge = false;
+        }
       }
       return countsFromState(state, allIds, opencodeText, { projectDir: normDir, home, projectOpencodeText });
     },
@@ -426,6 +385,26 @@ export function createStatusRefresher(
   };
 }
 
+/** Wire load completion (including errors) to the matching directory's cached paint. */
+export function createCachedStatusRefresher(
+  painter: ReturnType<typeof createCachedStatusPainter>,
+  read: (ticket: number) => Promise<SkillCounts>,
+  onError: (e: unknown) => void,
+) {
+  let ticket = 0;
+  const refresh = createStatusRefresher(
+    () => {
+      ticket = painter.ticket();
+      return read(ticket);
+    },
+    (c) => { void painter.fresh(ticket, c); },
+    (e) => {
+      if (painter.settle(ticket)) onError(e);
+    },
+  );
+  return { refresh, ticket: () => ticket };
+}
+
 /** "35 live / 212 installed" */
 export const liveLine = (c: SkillCounts) => `${c.live} live / ${c.installed} installed`;
 
@@ -443,6 +422,8 @@ export function formatTokens(n: number) {
   return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
 }
 
+export const tokensLabel = (chars: number) => `~${formatTokens(tokensOf(chars))} tokens`;
+
 export const TOKENS_TITLE = 'Estimated tokens the live skills add to every prompt (skill list only)';
 
 /** Remixicon `stack` (the extension's manifest icon), drawn like the host's Work Status row icons. */
@@ -450,23 +431,17 @@ export const STACK_ICON_SVG =
   '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="currentColor" d="M20.083 15.2l1.202.721a.5.5 0 0 1 0 .858l-8.77 5.262a1 1 0 0 1-1.03 0l-8.77-5.262a.5.5 0 0 1 0-.858l1.202-.721L12 20.05l8.083-4.85zm0-4.7l1.202.721a.5.5 0 0 1 0 .858L12 17.65l-9.285-5.571a.5.5 0 0 1 0-.858l1.202-.721L12 15.35l8.083-4.85zm-7.569-9.191l8.771 5.262a.5.5 0 0 1 0 .858L12 13 2.715 7.429a.5.5 0 0 1 0-.858l8.77-5.262a1 1 0 0 1 1.03 0zM12 3.332L5.887 7 12 10.668 18.113 7 12 3.332z"/></svg>';
 
 /** Work Status: one muted row with an icon, live/installed counts and estimated tokens. */
-export function renderMeterHeader(c: SkillCounts) {
-  const wrap = document.createElement('div');
-  wrap.className = 'skm skm-compact';
-  const top = document.createElement('div');
-  top.className = 'skm-top';
-  const left = document.createElement('span');
-  left.className = 'skm-left';
-  const n = Object.assign(document.createElement('span'), { className: 'skm-live-n', textContent: String(c.live) });
-  const w = Object.assign(document.createElement('span'), { className: 'skm-live-w', textContent: 'live' });
-  const rest = Object.assign(document.createElement('span'), { className: 'skm-rest', textContent: `/ ${c.installed}` });
-  left.append(n, rest, w);
-  const right = Object.assign(document.createElement('span'), {
-    className: 'skm-tokens', title: TOKENS_TITLE, textContent: `~${formatTokens(tokensOf(c.chars))} tokens`,
-  });
-  const icon = Object.assign(document.createElement('span'), { className: 'skm-icon', innerHTML: STACK_ICON_SVG });
+export function renderMeterHeader(c: LastCounts): HTMLDivElement {
+  const wrap = el('div', 'skm');
+  const top = el('div', 'skm-top');
+  const left = el('span', 'skm-left');
+  left.append(el('span', 'skm-live-n', String(c.live)), el('span', 'skm-rest', `/ ${c.installed}`), el('span', 'skm-live-w', 'live'));
+  const right = el('span', 'skm-tokens', tokensLabel(c.chars));
+  right.title = TOKENS_TITLE;
+  const icon = el('span', 'skm-icon');
+  icon.innerHTML = STACK_ICON_SVG;
   icon.setAttribute('aria-hidden', 'true');
   top.append(icon, left, right);
   wrap.append(top);
-  return { wrap };
+  return wrap;
 }

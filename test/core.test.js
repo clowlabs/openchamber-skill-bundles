@@ -63,6 +63,35 @@ test("effectiveMode", () => {
   assert.equal(core.effectiveMode(s, "opencode"), "auto");
 });
 
+test("scope normalization catches invalid home and falls back to global mode", () => {
+  const opts = { home: "/home/../bad", projectDir: "/project" };
+  assert.equal(core.normalizeScopeDir(opts.projectDir, opts), null);
+  assert.equal(core.normalizeScopeDir("/home/u/project//.", { home: "/home/u" }), "~/project");
+  const bundle = { id: "a", enabled: false, skills: ["x"], projects: ["/project"] };
+  assert.equal(core.isBundleActive(bundle, opts), false);
+  assert.equal(core.effectiveMode(S({ bundles: [bundle] }), "x", opts), "off");
+});
+
+test("bulk mode lookups preserve invalid/inherited overrides and builtin called modes", () => {
+  const state = base();
+  state.overrides = Object.assign(Object.create({ z: "auto" }), {
+    x: "invalid", y: "called", opencode: "called", report: "off",
+  });
+  const ids = ["x", "y", "z", "opencode", "report"];
+  assert.deepEqual(core.summary(state, ids), { on: 3, auto: 2, called: 1, chars: 2 * core.CHARS_PER_SKILL });
+  const permissions = JSON.parse(core.applyPermissions("{}", state, ids)).permissions;
+  assert.deepEqual(permissions.filter((r) => r.effect === "allow").map((r) => r.resource), ["opencode", "x", "y"]);
+  const md = "---\nname: example\n---\nbody\n";
+  const plan = core.syncPlan(state, ids, Object.fromEntries(ids.map((id) => [id, md])));
+  assert.deepEqual(plan.skillEdits.map((edit) => edit.id), ["y"]);
+  const next = core.setOverride(core.setOverride(state, "x", "off"), "z", "auto");
+  const changed = JSON.parse(core.applyPermissions('{"permissions":[]}', next, ids, { prevState: state })).permissions;
+  assert.deepEqual(changed, [
+    { action: "skill", resource: "x", effect: "deny" },
+    { action: "skill", resource: "z", effect: "allow" },
+  ]);
+});
+
 test("groups: stored order then __unbundled", () => {
   const g = core.groups(base(), ["z", "w", "x", "v", "y"]);
   assert.deepEqual(g.map((x) => x.id), ["a", "b", "__unbundled"]);

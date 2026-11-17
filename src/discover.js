@@ -10,7 +10,7 @@ export const SKILL_FILE = "SKILL.md";
 // OpenCode's FSUtil.ignoredDirectories plus hidden entries.
 const IGNORED = ["node_modules", ".git", ".venv", "venv", "__pycache__"];
 export const skipName = (name) => name.startsWith(".") || IGNORED.includes(name);
-const join = (a, b) => (!a ? b : b ? `${a.replace(/\/+$/, "")}/${b}` : a);
+export const join = (a, b) => (!a ? b : b ? `${a.replace(/\/+$/, "")}/${b}` : a);
 
 /**
  * A config `skills` entry as a root, or null when it is not a global local source. Like OpenCode,

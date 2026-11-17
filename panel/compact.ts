@@ -2,7 +2,7 @@
 import { mountBadge, mountBanner, mountSwitch } from '@openchamber/sdk/ui';
 import * as core from '../src/core.js';
 import type { Bundle } from '../src/core.js';
-import { el, isAltClick, isMenuKey, onAltOrContext, openAtAnchor, rovingKey, type Disposable } from './dom';
+import { el, isAltClick, isMenuKey, noBundlesBanner, onAltOrContext, openAtAnchor, plural, pluralNoun, rovingKey, SAVING_BADGE, type Disposable } from './dom';
 import {
   S,
   activeProjectDir,
@@ -17,7 +17,7 @@ import {
 } from './io';
 import { openProjectsMenu } from './projects';
 import { openSendMenu } from './send';
-import { countsFromState, formatTokens, TOKENS_TITLE, tokensOf } from '../status/counts';
+import { countsFromState, TOKENS_TITLE, tokensLabel } from '../status/counts';
 
 let mounts: Disposable[] = [];
 /** Bundle id whose row has keyboard focus, kept across re-renders. */
@@ -36,8 +36,6 @@ type CompactFocus = {
   skillBtn: string | null;
   skillRow: string | null;
 };
-
-const skillCount = (n: number) => `${n} skill${n === 1 ? '' : 's'}`;
 
 function isSkillDisabled(id: string): boolean {
   const ov = S.state?.overrides;
@@ -64,15 +62,19 @@ function describeBundleScope(b: Bundle, projDir: string | null) {
   if (projDir != null) {
     if (b.enabled) rowSuffix = excludedHere && !inProj ? ' · off in this project' : ' · global';
     else if (inProj) rowSuffix = otherCount ? ` · this project +${otherCount}` : ' · this project';
-    else if (otherCount > 0) rowSuffix = ` · ${otherCount} other project${otherCount > 1 ? 's' : ''}`;
+    else if (otherCount > 0) rowSuffix = ` · ${plural(otherCount, 'other project')}`;
     else rowSuffix = '';
   } else if (b.enabled) {
-    rowSuffix = otherCount ? ` · global · +${otherCount} project${otherCount > 1 ? 's' : ''}` : ' · global';
+    rowSuffix = otherCount ? ` · global · +${plural(otherCount, 'project')}` : ' · global';
   } else {
-    rowSuffix = otherCount ? ` · +${otherCount} project${otherCount > 1 ? 's' : ''}` : '';
+    rowSuffix = otherCount ? ` · +${plural(otherCount, 'project')}` : '';
   }
-  const openStatus = b.enabled ? (excludedHere && !inProj ? 'off in this project' : 'global') : inProj ? 'this project' : 'off';
-  return { on, inProj, excludedHere, otherCount, rowSuffix, openStatus };
+  let openStatus: string;
+  if (b.enabled && excludedHere && !inProj) openStatus = 'off in this project';
+  else if (b.enabled) openStatus = 'global';
+  else if (inProj) openStatus = 'this project';
+  else openStatus = 'off';
+  return { on, otherCount, rowSuffix, openStatus };
 }
 
 function captureFocus(root: HTMLElement): CompactFocus {
@@ -120,11 +122,7 @@ export function renderCompact(root: HTMLElement) {
   if (!state) {
     const b = el('div');
     root.appendChild(b);
-    mounts.push(mountBanner(b, {
-      tone: 'info', title: 'No bundles yet',
-      body: 'skill-bundles.json does not exist. Nothing has been changed.',
-      action: { label: 'Create from defaults', onClick: seedDefaults },
-    }));
+    mounts.push(mountBanner(b, noBundlesBanner(seedDefaults)));
     return;
   }
 
@@ -136,7 +134,7 @@ export function renderCompact(root: HTMLElement) {
   const ids = state.bundles.map((b) => b.id);
   const stop = focusId && ids.includes(focusId) ? focusId : ids[0];
 
-  for (const b of state.bundles) {
+  for (const [i, b] of state.bundles.entries()) {
     const scope = describeBundleScope(b, projDir);
     const row = el('div', `sb-c-row${scope.on ? ' on' : ''}`);
     row.dataset.id = b.id;
@@ -144,7 +142,7 @@ export function renderCompact(root: HTMLElement) {
     const disabledPart = disabledCount > 0 ? ` · ${disabledCount} disabled` : '';
     row.setAttribute('role', 'option');
     row.setAttribute('aria-selected', 'false');
-    row.setAttribute('aria-label', `${b.name}, ${scope.on ? 'on' : 'off'}, ${skillCount(b.skills.length)}${disabledCount > 0 ? `, ${disabledCount} disabled` : ''}${scope.rowSuffix}`);
+    row.setAttribute('aria-label', `${b.name}, ${scope.on ? 'on' : 'off'}, ${plural(b.skills.length, 'skill')}${disabledCount > 0 ? `, ${disabledCount} disabled` : ''}${scope.rowSuffix}`);
     row.title = 'Show the skills in this bundle (Alt-click or right-click for projects & global)';
     row.tabIndex = b.id === stop ? 0 : -1;
     const text = el('div', 'sb-c-text');
@@ -153,7 +151,7 @@ export function renderCompact(root: HTMLElement) {
     chev.setAttribute('aria-hidden', 'true');
     name.append(el('span', 'sb-c-name-text', b.name), chev);
     text.appendChild(name);
-    const m = el('span', 'sb-c-meta', `${skillCount(b.skills.length)}${disabledPart}`);
+    const m = el('span', 'sb-c-meta', `${plural(b.skills.length, 'skill')}${disabledPart}`);
     if (scope.rowSuffix) m.appendChild(el('span', 'sb-c-proj', scope.rowSuffix));
     text.appendChild(m);
     row.appendChild(text);
@@ -168,7 +166,7 @@ export function renderCompact(root: HTMLElement) {
     row.addEventListener('focus', () => { focusId = b.id; });
     row.addEventListener('keydown', (e) => {
       if (e.target !== row) return;
-      if (rovingKey(e, rows, rows.indexOf(row))) return;
+      if (rovingKey(e, rows, i)) return;
       if (isMenuKey(e, true)) {
         e.preventDefault();
         openAtAnchor(row, (x, y) => openProjectsMenu(b.id, x, y, row));
@@ -199,15 +197,15 @@ function renderHeader(root: HTMLElement, head: HTMLElement, projDir: string | nu
   const counts = el('span', 'sb-c-counts', `${c.live} / ${c.installed}`);
   counts.title = `${c.live} of ${c.installed} skills live`;
   counts.setAttribute('aria-label', counts.title);
-  const tokens = el('span', 'sb-c-tokens', `~${formatTokens(tokensOf(c.chars))} tokens`);
+  const tokens = el('span', 'sb-c-tokens', tokensLabel(c.chars));
   tokens.title = TOKENS_TITLE;
   const back = open ? el('button', 'sb-c-back', 'Go Back') : null;
   if (back) {
     back.type = 'button';
     back.setAttribute('aria-keyshortcuts', 'Escape');
     back.addEventListener('click', () => closeBundle(root));
+    header.appendChild(back);
   }
-  if (back) header.appendChild(back);
   header.append(counts, tokens);
   head.appendChild(header);
   if (pending()) busyBadge(header);
@@ -234,11 +232,9 @@ function renderBundle(root: HTMLElement, b: Bundle, projDir: string | null, focu
   text.appendChild(h);
   const disabledCount = disabledCountOf(b);
   const disabledPart = disabledCount > 0 ? ` · ${disabledCount} disabled` : '';
-  const m = el('span', 'sb-c-meta', `${skillCount(b.skills.length)} · ${scope.openStatus}${disabledPart}`);
+  const m = el('span', 'sb-c-meta', `${plural(b.skills.length, 'skill')} · ${scope.openStatus}${disabledPart}`);
   if (scope.otherCount > 0) {
-    const label = projDir != null
-      ? ` · +${scope.otherCount} other project${scope.otherCount > 1 ? 's' : ''}`
-      : ` · +${scope.otherCount} project${scope.otherCount > 1 ? 's' : ''}`;
+    const label = ` · +${scope.otherCount} ${pluralNoun(scope.otherCount, projDir != null ? 'other project' : 'project')}`;
     m.appendChild(el('span', 'sb-c-proj', label));
   }
   text.appendChild(m);
@@ -351,7 +347,7 @@ function closeBundle(root: HTMLElement) {
 function busyBadge(at: HTMLElement) {
   const s = el('span', 'sb-c-busy');
   at.insertBefore(s, at.querySelector('.sb-c-tokens'));
-  mounts.push(mountBadge(s, { label: 'Saving…', tone: 'neutral' }));
+  mounts.push(mountBadge(s, SAVING_BADGE));
 }
 
 /** While a save is queued: only the Saving… badge, so the row being clicked isn't replaced. */

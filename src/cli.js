@@ -261,12 +261,16 @@ const realTarget = (p) => fsSafe.realTarget(io, p);
 // Physical identity of a project dir: realpath when it exists, else the expanded path.
 function physicalDir(env, dir) {
   const p = env.expand(dir);
+  if (env.physicalDirs.has(p)) return env.physicalDirs.get(p);
+  let real;
   try {
-    return io.realpath(p);
+    real = io.realpath(p);
   } catch (e) {
-    if (e.code === "ENOENT") return path.resolve(p);
-    throw new CliError(`${dir}: ${e.code === "ELOOP" ? "symlink cycle" : e.message}`);
+    if (e.code !== "ENOENT") throw new CliError(`${dir}: ${e.code === "ELOOP" ? "symlink cycle" : e.message}`);
+    real = path.resolve(p);
   }
+  env.physicalDirs.set(p, real);
+  return real;
 }
 
 function storedProjectDirs(state) {
@@ -394,9 +398,8 @@ function need(pos, n, usage) {
 function bundleLine(g, state) {
   const on = g.skills.filter((id) => core.effectiveMode(state, id) !== "off").length;
   const flag = g.synthetic ? "   " : g.enabled ? "on " : "off";
-  const b = state.bundles.find((x) => x.id === g.id);
-  const n = b?.projects?.length ?? 0;
-  const e = b?.excludedProjects?.length ?? 0;
+  const n = g.projects?.length ?? 0;
+  const e = g.excludedProjects?.length ?? 0;
   const parts = [];
   if (n) parts.push(`+${n} project${n === 1 ? "" : "s"}`);
   if (e) parts.push(`-${e} project${e === 1 ? "" : "s"}`);
@@ -442,6 +445,7 @@ function main(argv, homeDefault) {
 }
 
 function run(env, opts, pos, cmd) {
+  env = { ...env, physicalDirs: new Map() };
   const ctx = loadAll(env);
   let state = ctx.state;
   const dry = opts.dryRun ? " (dry run)" : "";

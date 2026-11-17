@@ -429,6 +429,25 @@ test("toggleBundle with a held CLI lock writes nothing and shows the lock toast"
   expect(toasts.map((t) => t.message)).toContain("CLI is writing — try again");
 });
 
+test("Page toggleBundle with an explicit value clears bundle overrides and can be undone", async () => {
+  put(core.BUNDLES_PATH, core.serializeBundles({
+    ...io.S.state,
+    overrides: { alpha: "called", beta: "off", opencode: "off" },
+  }));
+  await io.load();
+  io.toggleBundle("b", true);
+  await settle();
+  const saved = core.parseBundles(read(core.BUNDLES_PATH));
+  expect(saved.bundles[0].enabled).toBe(true);
+  expect(saved.overrides).toEqual({ opencode: "off" });
+  expect(io.undoLabel()).toBe("toggle bundle");
+  await io.undo();
+  await settle();
+  const restored = core.parseBundles(read(core.BUNDLES_PATH));
+  expect(restored.bundles[0].enabled).toBe(false);
+  expect(restored.overrides).toEqual({ alpha: "called", beta: "off", opencode: "off" });
+});
+
 test("panel lock: an orphaned panel lock past its TTL is reclaimed; a CLI lock is not", async () => {
   put(core.LOCK_PATH, core.panelLockRecord("orphan", Date.now() - core.PANEL_LOCK_TTL_MS - 5_000));
   // the file's mtime must be old too (classifyLock uses the later of time and mtime)

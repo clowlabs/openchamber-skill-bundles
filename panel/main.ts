@@ -12,19 +12,18 @@ import {
   mountTextField,
 } from '@openchamber/sdk/ui';
 import * as core from '../src/core.js';
-import type { Group, Mode } from '../src/core.js';
+import type { Bundle, Group, Mode } from '../src/core.js';
 import { closeSendMenu, initSend, openSendMenu } from './send';
 import { initPopup, isPopupOpen, refreshOpenMenus, setHomeSource } from './popup';
 import { openProjectsMenu } from './projects';
-import { deferRender, endDrag, initDrag, isDragging, onPillDown } from './drag';
+import { createDrag } from '../shared/panel/drag';
 import { renderDetail } from './detail';
 import { renderCompact, renderCompactBusy } from './compact';
-import { countsFromState } from '../status/counts';
-import { statsLine } from './stats';
-import { $, el, HAND_EDIT, isMenuKey, MODE_LABEL, onAltOrContext, openAtAnchor, rovingKey, UNBUNDLED, type Disposable } from './dom';
+import { countsFromState, liveLine, livePct, TOKENS_TITLE, tokensLabel } from '../status/counts';
+import { $, el, HAND_EDIT, isMenuKey, MODE_LABEL, noBundlesBanner, onAltOrContext, openAtAnchor, plural, pluralNoun, rovingKey, SAVING_BADGE, UNBUNDLED, type Disposable } from './dom';
 import { createEditGuard } from './edit-guard';
 import {
-  S, activeProjectDir, applyChange, bundlesOf, canUndo, checkDisk, commit, effectiveHome, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, startSync, toastError, undo, undoDepth, undoLabel,
+  S, activeProjectDir, applyChange, canUndo, checkDisk, commit, effectiveHome, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, startSync, toastError, toggleBundle, undo, undoDepth, undoLabel,
 } from './io';
 import { connectHost } from '@openchamber/sdk';
 
@@ -34,11 +33,15 @@ initPopup(host);
 setHomeSource(() => effectiveHome());
 host.onDirectory((dir) => {
   if (S.activeDir === dir) return;
+  const prevProjDir = activeProjectDir();
+  const prevHome = effectiveHome();
   S.activeDir = dir;
+  const nextProjDir = activeProjectDir();
+  if (prevProjDir === nextProjDir && prevHome === effectiveHome()) return;
   if (S.loaded) {
-    render();
-    const projDir = activeProjectDir();
-    if (projDir && !Object.hasOwn(S.projectTexts, core.projectConfigPath(projDir))) {
+    if (compact) render();
+    else refreshOpenMenus();
+    if (nextProjDir && !Object.hasOwn(S.projectTexts, core.projectConfigPath(nextProjDir))) {
       void checkDisk().catch(() => {});
     }
   }
@@ -80,9 +83,8 @@ function select(id: string) {
   renderDetail(V.selected);
 }
 
-function matches(id: string) {
-  if (!V.query) return true;
-  const q = V.query.toLowerCase();
+function matches(id: string, q: string) {
+  if (!q) return true;
   return id.toLowerCase().includes(q) || meta(id).description.toLowerCase().includes(q);
 }
 
@@ -95,11 +97,16 @@ function renderStats() {
   root.textContent = '';
   if (!S.loaded) return;
   const c = countsFromState(S.state, S.allIds, S.opencodeText);
-  root.appendChild(statsLine(c));
+  const text = c.fromOpencode
+    ? `${liveLine(c)} · from opencode.json`
+    : `${liveLine(c)} (${livePct(c)}%) · ${plural(c.bundlesOn?.length ?? 0, 'bundle')} on · ${tokensLabel(c.chars)}`;
+  const line = el('span', 'sb-stats-line', text);
+  line.title = `Live = skills agents can use (allowed in opencode.json). Installed = skill folders plus built-ins.\n${TOKENS_TITLE}`;
+  root.appendChild(line);
   if (pending()) {
     const span = el('span');
     root.appendChild(span);
-    statMounts.push(mountBadge(span, { label: 'Saving…', tone: 'neutral' }));
+    statMounts.push(mountBadge(span, SAVING_BADGE));
   }
 }
 
@@ -107,16 +114,12 @@ function renderBanner() {
   bannerMount?.dispose();
   bannerMount = null;
   if (S.loaded && !S.state) {
-    bannerMount = mountBanner($('banner'), {
-      tone: 'info', title: 'No bundles yet',
-      body: 'skill-bundles.json does not exist. Nothing has been changed.',
-      action: { label: 'Create from defaults', onClick: seedDefaults },
-    });
+    bannerMount = mountBanner($('banner'), noBundlesBanner(seedDefaults));
   }
   const unreach = $('unreachable');
   const n = S.loaded ? S.unreachable.length : 0;
   if (n > 0) {
-    unreach.textContent = `${n} skill location${n === 1 ? '' : 's'} couldn't be read, usually a skills folder from opencode.json or a symlink outside the folders this extension may open.${S.incomplete ? ' Until then on/off still works, but "when called", descriptions and sending to a project are blocked.' : ''} Hover for paths.`;
+    unreach.textContent = `${plural(n, 'skill location')} couldn't be read, usually a skills folder from opencode.json or a symlink outside the folders this extension may open.${S.incomplete ? ' Until then on/off still works, but "when called", descriptions and sending to a project are blocked.' : ''} Hover for paths.`;
     unreach.title = S.unreachable.map((u) => `${u.path} (${u.code})`).join('\n');
   } else {
     unreach.textContent = '';
@@ -126,19 +129,19 @@ function renderBanner() {
 
 // ---------- bundles view ----------
 
-function renderPill(id: string, from: string, parent: HTMLElement) {
+function renderPill(id: string, from: string, parent: HTMLElement, m: Mode) {
   const err = fmError(id);
-  const p = el('span', `sb-pill ${mode(id)}${id === V.selected ? ' sel' : ''}${err ? ' manual' : ''}`, id);
+  const p = el('span', `sb-pill ${m}${id === V.selected ? ' sel' : ''}${err ? ' manual' : ''}`, id);
   p.dataset.id = id;
   p.title = err ? `Manual edit needed: ${err}\n${HAND_EDIT}` : meta(id).description || id;
-  p.addEventListener('pointerdown', (e) => { if (S.loaded) onPillDown(e, id, from); });
+  p.addEventListener('pointerdown', (e) => { if (S.loaded) drag.onPointerDown(e, id, from); });
   p.tabIndex = 0;
   p.setAttribute('role', 'button');
   p.setAttribute('aria-haspopup', 'menu');
-  p.setAttribute('aria-label', `${id}, ${MODE_LABEL[mode(id)]}${err ? ', manual edit needed' : ''}`);
+  p.setAttribute('aria-label', `${id}, ${MODE_LABEL[m]}${err ? ', manual edit needed' : ''}`);
   p.addEventListener('contextmenu', (e) => {
     e.preventDefault();
-    if (isDragging()) { endDrag(false); return; }
+    if (drag.isDragging()) { drag.end(false); return; }
     openSendMenu(id, e.clientX, e.clientY, e.altKey, p, from);
   });
   p.addEventListener('keydown', (e) => {
@@ -157,12 +160,12 @@ function sendBlocked(id: string): string | null {
   return null;
 }
 
-function renderGroup(g: Group, root: HTMLElement) {
+function renderGroup(g: Group, root: HTMLElement, q: string, modeMap: Map<string, Mode>) {
   const box = el('div', 'sb-group');
   box.dataset.bundle = g.id;
   const head = el('div', 'sb-group-head');
   box.appendChild(head);
-  const visible = g.skills.filter(matches);
+  const visible = g.skills.filter((id) => matches(id, q));
   const busy = pending() > 0;
 
   if (V.renaming === g.id) {
@@ -192,12 +195,12 @@ function renderGroup(g: Group, root: HTMLElement) {
         let label: string;
         let tone: 'success' | 'info';
         if (g.enabled && exc.length > 0) {
-          label = `On · except ${exc.length} project${exc.length > 1 ? 's' : ''}`;
+          label = `On · except ${plural(exc.length, 'project')}`;
           tone = 'info';
         } else {
           label = g.enabled
-            ? `On · +${inc.length} project${inc.length > 1 ? 's' : ''}`
-            : `Off · ${inc.length} project${inc.length > 1 ? 's' : ''}`;
+            ? `On · +${inc.length} ${pluralNoun(inc.length, 'project')}`
+            : `Off · ${plural(inc.length, 'project')}`;
           tone = g.enabled ? 'success' : 'info';
         }
         const tips: string[] = [];
@@ -216,7 +219,7 @@ function renderGroup(g: Group, root: HTMLElement) {
       onAltOrContext(head, (x, y) => openProjectsMenu(g.id, x, y, pb), 'button, .oc-switch, a, input, label, .sb-pill, .oc-sdk', '.sb-pill');
       const sw = el('span'); head.appendChild(sw);
       // Page editor switch resets per-skill overrides (setBundleEnabled), unlike Rail / Global (setBundleGlobal) which preserves them.
-      groupMounts.push(mountSwitch(sw, { label: '', checked: g.enabled, onChange: (on) => commit((s) => core.setBundleEnabled(s, g.id, on), undefined, { label: 'toggle bundle' }) }));
+      groupMounts.push(mountSwitch(sw, { label: '', checked: g.enabled, onChange: (on) => toggleBundle(g.id, on) }));
       const m = el('span'); head.appendChild(m);
       groupMounts.push(mountMenu(m, {
         label: '⋯', variant: 'ghost', size: 'xs',
@@ -238,14 +241,13 @@ function renderGroup(g: Group, root: HTMLElement) {
   const pills = el('div', 'sb-pills');
   box.appendChild(pills);
   if (!visible.length) pills.appendChild(el('span', 'sb-empty-pills', V.query && g.skills.length ? 'No matches · drop here' : 'Drop skills here'));
-  for (const id of visible) renderPill(id, g.id, pills);
+  for (const id of visible) renderPill(id, g.id, pills, modeMap.get(id) ?? 'off');
   root.appendChild(box);
 }
 
 // ---------- all-skills view ----------
 
-function manualBadge(parent: HTMLElement, id: string) {
-  const err = fmError(id);
+function manualBadge(parent: HTMLElement, err: string | null) {
   if (!err) return;
   const s = el('span', 'sb-manual');
   s.title = err;
@@ -253,18 +255,18 @@ function manualBadge(parent: HTMLElement, id: string) {
   return mountBadge(s, { label: 'manual edit needed', tone: 'warning' });
 }
 
-function renderAll(root: HTMLElement) {
+function renderAll(root: HTMLElement, q: string, modeMap: Map<string, Mode>, bundlesMap: Map<string, Bundle[]>) {
   const list = el('div', 'sb-flat');
   root.appendChild(list);
-  const ids = S.allIds.filter(matches);
+  const ids = S.allIds.filter((id) => matches(id, q));
   if (!ids.length) groupMounts.push(mountEmpty(list, { title: 'No skills match' }));
   list.setAttribute('role', 'list');
   list.setAttribute('aria-label', 'All skills. Arrow keys move, A / C / O set the mode, menu key sends to a project.');
   const rows: HTMLElement[] = [];
   // Exactly one tab stop: the focused row, else the selected one, else the first visible.
   const tabStop = [V.focusedRow, V.selected].find((x) => x != null && ids.includes(x)) ?? ids[0];
-  for (const id of ids) {
-    const m = mode(id);
+  for (const [i, id] of ids.entries()) {
+    const m = modeMap.get(id) ?? 'off';
     const broken = fmError(id);
     const row = el('div', `sb-row${id === V.selected ? ' sel' : ''}`);
     row.dataset.id = id;
@@ -276,18 +278,18 @@ function renderAll(root: HTMLElement) {
     row.appendChild(el('span', `sb-dot ${m}`));
     row.appendChild(el('span', 'sb-row-id', id));
     const badges = el('span', 'sb-row-badges');
-    const mb = manualBadge(badges, id);
+    const mb = manualBadge(badges, broken);
     if (mb) groupMounts.push(mb);
-    for (const b of bundlesOf(id)) {
+    for (const b of bundlesMap.get(id) ?? []) {
       const s = el('span'); badges.appendChild(s);
       groupMounts.push(mountBadge(s, { label: b.name, tone: b.enabled ? 'primary' : 'neutral' }));
     }
     row.appendChild(badges);
-    row.appendChild(segmented(id));
+    row.appendChild(segmented(id, m, broken));
     row.addEventListener('click', () => { V.focusedRow = id; select(id); });
     row.addEventListener('focus', () => { V.focusedRow = id; });
     row.addEventListener('contextmenu', (e) => { e.preventDefault(); openSendMenu(id, e.clientX, e.clientY, e.altKey, row); });
-    row.addEventListener('keydown', (e) => onRowKey(e, id, rows));
+    row.addEventListener('keydown', (e) => onRowKey(e, id, rows, i));
     rows.push(row);
     list.appendChild(row);
   }
@@ -304,9 +306,8 @@ function setModeQuick(id: string, m: Mode) {
   commit((s) => core.setOverride(s, id, m), undefined, { label: 'set mode' });
 }
 
-function onRowKey(e: KeyboardEvent, id: string, rows: HTMLElement[]) {
+function onRowKey(e: KeyboardEvent, id: string, rows: HTMLElement[], i: number) {
   if (e.target !== e.currentTarget || e.ctrlKey || e.metaKey) return;
-  const i = rows.findIndex((r) => r.dataset.id === id);
   if (rovingKey(e, rows, i)) return;
   const k = e.key.toLowerCase();
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(id); }
@@ -319,9 +320,7 @@ function onRowKey(e: KeyboardEvent, id: string, rows: HTMLElement[]) {
 }
 
 /** Compact one-click Auto / Called / Off control for list rows. */
-function segmented(id: string) {
-  const broken = fmError(id);
-  const cur = mode(id);
+function segmented(id: string, cur: Mode, broken: string | null) {
   const g = el('span', `sb-seg${broken ? ' sb-disabled' : ''}`);
   g.setAttribute('role', 'radiogroup');
   g.setAttribute('aria-label', `How agents use ${id}`);
@@ -352,8 +351,26 @@ function renderGroups() {
   root.textContent = '';
   $('new-bundle').style.display = V.tab === 'bundles' && S.state ? '' : 'none';
   if (!S.state) return;
-  if (V.tab === 'all') return renderAll(root);
-  for (const g of core.groups(S.state, S.allIds)) renderGroup(g, root);
+  const q = V.query.toLowerCase();
+  const activeSkills = new Set<string>();
+  const bundlesMap = new Map<string, Bundle[]>();
+  for (const b of S.state.bundles) {
+    for (const id of b.skills) {
+      if (b.enabled) activeSkills.add(id);
+      const bundles = bundlesMap.get(id);
+      if (bundles) bundles.push(b);
+      else bundlesMap.set(id, [b]);
+    }
+  }
+  const modeMap = new Map<string, Mode>();
+  for (const id of new Set([...S.allIds, ...bundlesMap.keys()])) {
+    const ov = Object.hasOwn(S.state.overrides, id) ? S.state.overrides[id] : undefined;
+    let m: Mode = ov && (ov === 'auto' || ov === 'called' || ov === 'off') ? ov : activeSkills.has(id) ? 'auto' : 'off';
+    if (m === 'called' && core.isBuiltin(id)) m = 'auto';
+    modeMap.set(id, m);
+  }
+  if (V.tab === 'all') return renderAll(root, q, modeMap, bundlesMap);
+  for (const g of core.groups(S.state, S.allIds)) renderGroup(g, root, q, modeMap);
 }
 
 /** Stats and button state only: safe while a click is in flight. */
@@ -389,7 +406,7 @@ function render() {
     refreshOpenMenus();
     return;
   }
-  if (isDragging()) { deferRender(); renderLight(); return; }
+  if (drag.isDragging()) { drag.deferRender(); renderLight(); return; }
   editGuard.markRendered();
   const bundles = S.state?.bundles;
   if (V.renaming && !bundles?.some((b) => b.id === V.renaming)) { V.renaming = null; V.renameDraft = ''; }
@@ -438,7 +455,12 @@ hooks.onExternalSync = () => {
   editGuard.onExternalSync();
 };
 
-initDrag({
+const drag = createDrag({
+  zoneSelector: '.sb-group',
+  zoneKey: 'bundle',
+  dropClass: 'drop',
+  ghostClass: 'sb-ghost',
+  draggingClass: 'dragging',
   canDrag: (id) => !fmError(id),
   onDrop: (id, from, to, altKey) => {
     const copy = altKey && to !== UNBUNDLED;
@@ -608,7 +630,7 @@ function mountChrome() {
     if (e.key.toLowerCase() !== 'z') return;
     const target = e.target as HTMLElement | null;
     if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable || target.closest('[contenteditable]'))) return;
-    if (isPopupOpen() || isDragging() || !canUndo() || pending() > 0) return;
+    if (isPopupOpen() || drag.isDragging() || !canUndo() || pending() > 0) return;
     e.preventDefault();
     requestUndo();
   });

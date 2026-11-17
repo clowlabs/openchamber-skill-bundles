@@ -120,7 +120,7 @@ describe("last-counts first paint", () => {
       const paints = [];
       const p = cache.createCachedStatusPainter(fx.host, (c) => paints.push(c.live));
       const selected = p.select(null);
-      const refresh = cache.createCachedStatusRefresher(p, async () => {
+      const { refresh } = counts.createCachedStatusRefresher(p, async () => {
         throw new Error("load failed");
       }, () => paints.push("error"));
       if (!cacheFirst) await refresh();
@@ -289,6 +289,10 @@ describe("last-counts first paint", () => {
 });
 
 describe("renderMeterHeader", () => {
+  test("static placeholder uses the shared stack icon", () => {
+    const html = fs.readFileSync(new URL("../status/index.html", import.meta.url), "utf8");
+    expect(html).toContain(counts.STACK_ICON_SVG);
+  });
   const withDom = (fn) => {
     const saved = Object.getOwnPropertyDescriptor(globalThis, "document");
     const make = () => {
@@ -319,8 +323,8 @@ describe("renderMeterHeader", () => {
 
   test("Work Status is one line with no meter bar", () => {
     withDom(() => {
-      const { wrap } = counts.renderMeterHeader(c);
-      expect(wrap.className).toBe("skm skm-compact");
+      const wrap = counts.renderMeterHeader(c);
+      expect(wrap.className).toBe("skm");
       expect(wrap.children.map((x) => x.className)).toEqual(["skm-top"]);
       const top = wrap.children[0];
       expect(top.children.map((x) => x.className)).toEqual(["skm-icon", "skm-left", "skm-tokens"]);
@@ -814,43 +818,52 @@ describe("status/cache & createStatusLoader", () => {
     expect(storedAfter.allIds).toEqual(["alpha", "beta", "gamma", ...core.BUILTIN_SKILLS].sort());
   });
 
-  test("forceImmediateScan revalidates even when root mtime and revalidateAfterMs are fresh", async () => {
-    fs.mkdirSync(fx.real("~/.config/opencode/skills/nested"), { recursive: true });
-    const loader = counts.createStatusLoader(fx.host, { revalidateAfterMs: 60_000 });
-    await loader.load(null);
-    await new Promise((r) => setTimeout(r, 10));
+  for (const failFirst of [false, true]) {
+    test(`forceImmediateScan revalidates fresh roots${failFirst ? " after a failed load" : ""}`, async () => {
+      fs.mkdirSync(fx.real("~/.config/opencode/skills/nested"), { recursive: true });
+      const loader = counts.createStatusLoader(fx.host, { revalidateAfterMs: 60_000 });
+      await loader.load(null);
+      await new Promise((r) => setTimeout(r, 10));
 
-    let listDirCalls = 0;
-    const spiedHost = {
-      ...fx.host,
-      listDir: async (p) => {
-        listDirCalls++;
-        return fx.host.listDir(p);
-      },
-    };
+      let listDirCalls = 0;
+      const spiedHost = {
+        ...fx.host,
+        listDir: async (p) => {
+          listDirCalls++;
+          return fx.host.listDir(p);
+        },
+      };
 
-    let revalidated = null;
-    const done = new Promise((r) => {
-      revalidated = r;
+      let revalidated = null;
+      const done = new Promise((r) => {
+        revalidated = r;
+      });
+      const warmLoader = counts.createStatusLoader(spiedHost, {
+        revalidateAfterMs: 60_000,
+        onRevalidated: (c) => revalidated(c),
+      });
+
+      // Add a skill under an already-existing subfolder so top-level root size and mtime stay unchanged
+      fx.put("~/.config/opencode/skills/nested/delta/SKILL.md", skillMd("Delta"));
+
+      // Ordinary forceScan within 60s window does NOT scan when rootStamps match
+      await warmLoader.load(null, { forceScan: true });
+      expect(listDirCalls).toBe(0);
+
+      // forceImmediateScan (e.g. { full: true } ping) DOES scan immediately in background
+      if (failFirst) {
+        fx.failOn = (p, op) => op === "read" && p.endsWith("skill-bundles.json");
+        await expect(warmLoader.load(null, { forceImmediateScan: true })).rejects.toThrow();
+        fx.failOn = () => false;
+        await warmLoader.load(null);
+      } else {
+        await warmLoader.load(null, { forceImmediateScan: true });
+      }
+      const fresh = await done;
+      expect(listDirCalls).toBeGreaterThan(0);
+      expect(fresh.installed).toBe(3 + core.BUILTIN_SKILLS.length);
     });
-    const warmLoader = counts.createStatusLoader(spiedHost, {
-      revalidateAfterMs: 60_000,
-      onRevalidated: (c) => revalidated(c),
-    });
-
-    // Add a skill under an already-existing subfolder so top-level root size and mtime stay unchanged
-    fx.put("~/.config/opencode/skills/nested/delta/SKILL.md", skillMd("Delta"));
-
-    // Ordinary forceScan within 60s window does NOT scan when rootStamps match
-    await warmLoader.load(null, { forceScan: true });
-    expect(listDirCalls).toBe(0);
-
-    // forceImmediateScan (e.g. { full: true } ping) DOES scan immediately in background
-    await warmLoader.load(null, { forceScan: true, forceImmediateScan: true });
-    const fresh = await done;
-    expect(listDirCalls).toBeGreaterThan(0);
-    expect(fresh.installed).toBe(3 + core.BUILTIN_SKILLS.length);
-  });
+  }
 
   test("incomplete discovery (DENIED on a skill root) is NOT persisted to host.storage", async () => {
     fx.failOn = (p, op) => op === "list" && p.includes(".claude/skills");

@@ -208,10 +208,8 @@ function normalizeScopeWithHome(dir, h) {
 
 /** Normalized project dir when `dir` is a real project scope (not null, chats dir, "~", "/", or invalid); else null. */
 export function normalizeScopeDir(dir, { home } = {}) {
-  if (!dir || isChatsDir(dir)) return null;
   try {
-    const d = normalizeDir(dir, home);
-    return d === "~" || d === "/" ? null : d;
+    return normalizeScopeWithHome(dir, normalizeHome(home));
   } catch {
     return null;
   }
@@ -283,8 +281,8 @@ export function effectiveMode(state, id, opts) {
   return effectiveModeInScope(state, id, scopeDir, h);
 }
 
-// Counts over allIds; `chars` estimates prompt size (only auto skills are advertised).
-export function summary(state, allIds, opts) {
+// Precompute bundle membership once for callers looking up many skills.
+function modeLookup(state, opts) {
   const { scopeDir, h } = resolveScope(opts);
   const activeSkills = new Set();
   for (const b of state.bundles) {
@@ -292,11 +290,20 @@ export function summary(state, allIds, opts) {
       for (const s of b.skills) activeSkills.add(s);
     }
   }
-  let auto = 0, called = 0;
-  for (const id of allIds) {
+  return (id) => {
     const ov = hasOwn(state.overrides, id) && MODES.includes(state.overrides[id]) ? state.overrides[id] : undefined;
     let m = ov ?? (activeSkills.has(id) ? "auto" : "off");
     if (m === "called" && isBuiltin(id)) m = "auto";
+    return m;
+  };
+}
+
+// Counts over allIds; `chars` estimates prompt size (only auto skills are advertised).
+export function summary(state, allIds, opts) {
+  const mode = modeLookup(state, opts);
+  let auto = 0, called = 0;
+  for (const id of allIds) {
+    const m = mode(id);
     if (m === "auto") auto++;
     else if (m === "called") called++;
   }
@@ -418,22 +425,24 @@ export function applyPermissions(opencodeText, state, allIds, { prevState = null
   }
   const existing = cfg.permissions ?? [];
   const ids = uniq([...allIds, ...BUILTIN_SKILLS]).sort();
+  const mode = modeLookup(state);
   if (prevState) {
+    const prevMode = modeLookup(prevState);
     // Ids the bundles mention count too: an undiscovered skill can still be switched on or off.
     ids.push(...stateIds(prevState), ...stateIds(state));
     ids.splice(0, ids.length, ...uniq(ids).sort());
     // Discovery was incomplete, so rules may cover skills we could not see. Keep every rule in
     // order and only restate the ids whose mode this change actually flips (last rule wins).
-    const changed = ids.filter((id) => (effectiveMode(prevState, id) === "off") !== (effectiveMode(state, id) === "off"));
+    const changed = ids.filter((id) => (prevMode(id) === "off") !== (mode(id) === "off"));
     if (!changed.length) return opencodeText;
     const set = new Set(changed);
     const keep = (r) => !(r && r.action === "skill" && set.has(r.resource));
-    const add = changed.map((id) => ({ action: "skill", resource: id, effect: effectiveMode(state, id) === "off" ? "deny" : "allow" }));
+    const add = changed.map((id) => ({ action: "skill", resource: id, effect: mode(id) === "off" ? "deny" : "allow" }));
     return spliceTopLevelArray(opencodeText, "permissions", { keep, add, label: "opencode.json" });
   }
   const kept = existing.filter((r) => !(r && r.action === "skill"));
   const allows = ids
-    .filter((id) => effectiveMode(state, id) !== "off")
+    .filter((id) => mode(id) !== "off")
     .map((id) => ({ action: "skill", resource: id, effect: "allow" }));
   const permissions = [...kept, { action: "skill", resource: "*", effect: "deny" }, ...allows];
   return replaceTopLevelValue(opencodeText, "permissions", permissions, { label: "opencode.json" });
@@ -511,10 +520,11 @@ export function syncPlan(state, allIds, skillMds, unreadable = []) {
   const skillEdits = [];
   const skipped = [];
   const blind = new Set(unreadable);
+  const lookup = modeLookup(state);
   for (const id of uniq(allIds)) {
     if (isBuiltin(id)) continue;
     const text = hasOwn(skillMds, id) ? skillMds[id] : undefined;
-    const mode = effectiveMode(state, id);
+    const mode = lookup(id);
     if (typeof text !== "string") {
       // Found but unreadable: "called" needs an edit we cannot make; "auto" may hide an opt-out.
       if (blind.has(id) && mode === "called") throw Object.assign(new Error(`${id}: SKILL.md could not be read, so it cannot be set to "when called"`), { id });
@@ -863,4 +873,3 @@ export function applyProjectPermissions(text, skillIds, { denyIds = [] } = {}) {
   // Keep non-skill entries byte-for-byte; only our rules are freshly rendered.
   return spliceTopLevelArray(text, "permissions", { keep: (r) => !(r && r.action === "skill"), add: rules, label: "opencode.json" });
 }
-

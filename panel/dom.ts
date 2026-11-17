@@ -6,6 +6,15 @@ export type Disposable = { dispose: () => void };
 export const UNBUNDLED = core.UNBUNDLED_ID;
 export const HAND_EDIT = 'Edit SKILL.md by hand first';
 export const MODE_LABEL: Record<Mode, string> = { auto: 'Automatically', called: 'When called', off: 'Off' };
+export const pluralNoun = (n: number, word: string, suffix = 's') => `${word}${n === 1 ? '' : suffix}`;
+export const plural = (n: number, word: string, suffix = 's') => `${n} ${pluralNoun(n, word, suffix)}`;
+export const SAVING_BADGE = { label: 'Saving…', tone: 'neutral' } as const;
+export const noBundlesBanner = (onClick: () => void) => ({
+  tone: 'info' as const,
+  title: 'No bundles yet',
+  body: 'skill-bundles.json does not exist. Nothing has been changed.',
+  action: { label: 'Create from defaults', onClick },
+});
 
 export function $(id: string): HTMLElement {
   const n = document.getElementById(id);

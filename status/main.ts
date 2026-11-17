@@ -5,8 +5,9 @@ import { connectHost } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
 import { errText } from '../shared/panel/host';
 import { listenChanges } from '../panel/sync';
-import { createStatusLoader, renderMeterHeader, type SkillCounts } from './counts';
-import { createCachedStatusPainter, createCachedStatusRefresher } from './cache';
+import { $, el } from '../panel/dom';
+import { createStatusLoader, createCachedStatusRefresher, renderMeterHeader } from './counts';
+import { createCachedStatusPainter, type LastCounts } from './cache';
 
 const host = connectHost();
 let currentDir: string | null = null;
@@ -17,7 +18,7 @@ let needImmediateScan = false;
 function requestRefresh(fast = false, immediateScan = false) {
   if (!fast) needFull = true;
   if (immediateScan) needImmediateScan = true;
-  void refresh();
+  void refresher.refresh();
 }
 
 host.onDirectory((dir) => {
@@ -30,41 +31,36 @@ host.onDirectory((dir) => {
 });
 
 const REFRESH_MS = 30_000;
-function $(id: string): HTMLElement {
-  const el = document.getElementById(id);
-  if (!el) throw new Error(`Missing #${id}`);
-  return el;
-}
 const fit = () => void host.setHeight(Math.ceil(document.body.scrollHeight));
 
-function paint(c: SkillCounts) {
-  const { wrap } = renderMeterHeader(c);
-  $('head').replaceChildren(wrap);
+let lastPainted: LastCounts | null = null;
+function paint(c: LastCounts) {
+  if (lastPainted && lastPainted.live === c.live && lastPainted.installed === c.installed && lastPainted.chars === c.chars) return;
+  lastPainted = { live: c.live, installed: c.installed, chars: c.chars };
+  $('head').replaceChildren(renderMeterHeader(c));
   $('section').setAttribute('aria-label', `Skills: ${c.live} live of ${c.installed} installed. Open Skill Bundles`);
   fit();
 }
 
 const cachedPainter = createCachedStatusPainter(host, paint);
-let loadTicket = 0;
 const loader = createStatusLoader(host, {
-  onRevalidated: (c) => { void cachedPainter.fresh(loadTicket, c); },
+  onRevalidated: (c) => { void cachedPainter.fresh(refresher.ticket(), c); },
 });
 
-const refresh = createCachedStatusRefresher(
+const refresher = createCachedStatusRefresher(
   cachedPainter,
-  async (ticket) => {
+  async () => {
     const forceScan = needFull;
     const forceImmediateScan = needImmediateScan;
     needFull = false;
     needImmediateScan = false;
-    loadTicket = ticket;
-    if (forceImmediateScan) loader.invalidateScanAge();
-    return loader.load(currentDir, { forceScan: forceScan || forceImmediateScan, forceImmediateScan });
+    return loader.load(currentDir, { forceScan, forceImmediateScan });
   },
   (e) => {
+    lastPainted = null;
     $('head').replaceChildren(
-      Object.assign(document.createElement('div'), { className: 'err', textContent: "Couldn't count skills" }),
-      Object.assign(document.createElement('div'), { className: 'skm-sub', textContent: errText(e) }),
+      el('div', 'err', "Couldn't count skills"),
+      el('div', 'skm-sub', errText(e)),
     );
     $('section').setAttribute('aria-label', `Skills: couldn't count skills (${errText(e)}). Open Skill Bundles`);
     fit();

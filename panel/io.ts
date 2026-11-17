@@ -1,5 +1,5 @@
 // Files, the CLI lock, the write queue and the frontmatter cache.
-import { HostRequestError, type HostClient } from '@openchamber/sdk';
+import type { HostClient } from '@openchamber/sdk';
 import * as core from '../src/core.js';
 import type { Bundle, ChangePlan, PlanError, State } from '../src/core.js';
 import type { SkillRef } from '../src/discover.js';
@@ -7,14 +7,16 @@ import { skillRoots } from '../src/discover.js';
 import seed from '../data/default-bundles.json';
 import { discoverSkills, type Unreachable } from './discover';
 import { broadcastChange, listenChanges } from './sync';
-import { parseSkillRules } from '../status/counts';
-import { formatRootStamps, statFileStamp, writeSkillIndexCache } from '../status/cache';
-import { errorCode, errText as hostErrText, isUnreadable, pool, readOptional as readOpt } from '../shared/panel/host';
+import { parseSkillRules, sameIds } from '../status/counts';
+import { saveSkillIndexCache, statFileStamp } from '../status/cache';
+import { errorCode, errText, isUnreadable, pool, readOptional as readOpt } from '../shared/panel/host';
 import { createQueue } from '../shared/panel/queue';
 import { createPanelLock, LockedError, statMtimeMs, type PanelLock } from '../shared/panel/panel-lock';
 import { backupOnce, runTxn, type TxnWrite } from '../shared/panel/txn';
 import { capText, fitList } from '../shared/panel/toast';
-import { deriveHomeFromHost, homeFromDirs as sharedHomeFromDirs } from '../shared/panel/projects';
+import { deriveHomeFromHost, homeFromDirs } from '../shared/panel/projects';
+export { errText } from '../shared/panel/host';
+export { homeFromDirs } from '../shared/panel/projects';
 
 /** The host client; main sets it at boot, tests pass a fake. */
 export let host: HostClient;
@@ -112,9 +114,6 @@ export const homeOpt = () => {
   return h ? { home: h } : {};
 };
 
-/** Home dir from OpenChamber's project dirs (see shared/panel/projects). */
-export const homeFromDirs = (dirs: string[]) => sharedHomeFromDirs(dirs);
-
 export function sameProjectDir(a: string, b: string): boolean {
   return core.sameProjectDir(a, b, homeOpt());
 }
@@ -137,10 +136,6 @@ export const skillPath = (id: string) => S.skillPaths[id] ?? `${core.SKILLS_DIR}
 export const mode = (id: string) => (S.state ? core.effectiveMode(S.state, id) : 'off');
 export const bundlesOf = (id: string) => (S.state ? S.state.bundles.filter((b) => b.skills.includes(id)) : []);
 
-export function errText(e: unknown) {
-  if (e instanceof HostRequestError) return `${e.code}: ${e.message}`;
-  return hostErrText(e);
-}
 export function toastError(e: unknown, what: string) {
   void host.toast({ kind: 'error', message: `${what}: ${errText(e)}`, copy: true, dismiss: true });
 }
@@ -351,7 +346,7 @@ async function scanSkills(opencodeText: string, reuse?: SkillScanReuse) {
   const skillPaths: Record<string, string> = Object.create(null);
   for (const id of discoveredIds) skillPaths[id] = skills[id].path;
   const sortedSkillPaths = Object.values(skillPaths).sort();
-  const skillStamps = await readStampsMap(sortedSkillPaths);
+  const skillStamps: Record<string, string> = reuse ? await readStampsMap(sortedSkillPaths) : Object.create(null);
 
   const incomplete = unreachable.length > 0;
   const unreadable: string[] = [];
@@ -359,7 +354,8 @@ async function scanSkills(opencodeText: string, reuse?: SkillScanReuse) {
   const unreadablePrev = reuse ? new Set(reuse.prevUnreadable) : null;
   await pool(discoveredIds, 32, async (id) => {
     const p = skillPaths[id];
-    const st = skillStamps[p];
+    const st = reuse ? skillStamps[p] : await statStamp(p);
+    if (!reuse) skillStamps[p] = st;
     if (
       reuse &&
       unreadablePrev &&
@@ -482,13 +478,12 @@ export async function load(onLoaded?: () => void) {
             lastDiskStamp = combineStamp(opencodeText, postConfigStamps, scan.skillPaths, nextSkillStamps, nextState);
             if (!scan.incomplete) {
               const home = effectiveHome();
-              void writeSkillIndexCache(host, {
-                v: 1,
+              void saveSkillIndexCache(host, {
+                roots,
                 rootsKey: JSON.stringify(roots),
-                rootStamps: formatRootStamps(roots, postConfigStamps),
+                rootMap: postConfigStamps,
                 allIds: scan.allIds,
-                ...(home ? { home } : {}),
-                scannedAt: Date.now(),
+                home,
               });
             }
           } else {
@@ -553,7 +548,7 @@ function sameProjectRules(prev: State, next: State, dir: string): boolean {
   if (!core.projectTargets(prev, hOpt).includes(dir)) return false;
   const a = core.projectRuleSet(prev, dir, hOpt);
   const b = core.projectRuleSet(next, dir, hOpt);
-  return sameArr(a.allowIds, b.allowIds) && sameArr(a.denyIds, b.denyIds);
+  return sameIds(a.allowIds, b.allowIds) && sameIds(a.denyIds, b.denyIds);
 }
 
 /** Text of `<dir>/.opencode/opencode.json` for every dir the next state touches (missing → null). */
@@ -774,18 +769,22 @@ export function saveDescription(id: string, text: string) {
       apply(S.skillMds[id]); // refuse early, before taking the lock
       const p = skillPath(id);
       let lockedSkillStamp = '';
+      let written = false;
       await withLock(async () => {
         // Apply to the file as it is now, so a CLI mode change since load survives.
         const fresh = await readOptional(p);
         if (fresh == null) throw new StaleError(`${p} disappeared`);
         if (fresh !== S.skillMds[id]) setMd(id, fresh);
         const next = apply(fresh);
-        if (next !== fresh) await host.writeFile(p, next);
+        if (next !== fresh) {
+          await host.writeFile(p, next);
+          written = true;
+          lockedSkillStamp = await statStamp(p);
+        }
         setMd(id, next);
-        lockedSkillStamp = await statStamp(p);
       });
-      await recordOwnWrite({}, { [p]: lockedSkillStamp });
-      broadcastChange({ full: true });
+      await recordOwnWrite({}, written ? { [p]: lockedSkillStamp } : {});
+      if (written) broadcastChange({ full: true });
     } catch (e) {
       if (e instanceof RefusedError && S.descDraft?.id === id) S.descDraft = null;
       await reloadAfter(e);
@@ -808,9 +807,6 @@ export function seedDefaults() {
 }
 
 // ---------- background sync ----------
-
-const sameArr = (a: readonly string[], b: readonly string[]) =>
-  a.length === b.length && a.every((v, i) => v === b[i]);
 
 function sameRec<V>(a: Record<string, V>, b: Record<string, V>): boolean {
   const ak = Object.keys(a);
@@ -1030,13 +1026,12 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
   if (needsFull && !nextIncomplete) {
     const roots = skillRoots(opencodeText);
     const home = effectiveHome();
-    void writeSkillIndexCache(host, {
-      v: 1,
+    void saveSkillIndexCache(host, {
+      roots,
       rootsKey: JSON.stringify(roots),
-      rootStamps: formatRootStamps(roots, nextCfgStamps),
+      rootMap: nextCfgStamps,
       allIds: nextAllIds,
-      ...(home ? { home } : {}),
-      scannedAt: Date.now(),
+      home,
     });
   }
   if (needsFull && postSkillStamps) {
@@ -1050,10 +1045,10 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
   const changed =
     configChanged ||
     projectChanged ||
-    !sameArr(nextAllIds, S.allIds) ||
+    !sameIds(nextAllIds, S.allIds) ||
     !sameRec(nextSkillPaths, S.skillPaths) ||
     nextIncomplete !== S.incomplete ||
-    !sameArr(nextUnreadable, S.unreadable) ||
+    !sameIds(nextUnreadable, S.unreadable) ||
     !sameUnreach(nextUnreachable, S.unreachable) ||
     !sameRec(nextMds, S.skillMds);
 

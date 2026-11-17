@@ -2,7 +2,7 @@
 import { mountBanner, mountButton, mountEmpty, mountSelect, mountTabs, mountTextField } from '@openchamber/sdk/ui';
 import * as core from '../src/core.js';
 import type { Mode } from '../src/core.js';
-import { $, el, HAND_EDIT, UNBUNDLED, type Disposable } from './dom';
+import { $, el, HAND_EDIT, pluralNoun, UNBUNDLED, type Disposable } from './dom';
 import { shortDir } from './popup';
 import { S, bundlesOf, commit, fmError, homeOpt, meta, mode, orderBundles, saveDescription, skillPath } from './io';
 
@@ -118,7 +118,7 @@ export function renderDetail(selected: string | null) {
     mounts.push(mountButton(c, { label: 'Clear override', variant: 'ghost', size: 'xs', disabled: !!broken, onClick: () => commit((s) => core.setOverride(s, id, null), undefined, { label: 'clear override' }) }));
     const bundleMode: Mode = mine.some((b) => b.enabled) ? 'auto' : 'off';
     if (bundleMode !== mode(id)) {
-      const label = mine.length ? `its bundle${mine.length > 1 ? 's' : ''} (${mine.map((b) => b.name).join(', ')})` : 'being unbundled';
+      const label = mine.length ? `its ${pluralNoun(mine.length, 'bundle')} (${mine.map((b) => b.name).join(', ')})` : 'being unbundled';
       root.appendChild(el('div', 'sb-note', `Overrides ${label}, which would make it ${bundleMode === 'auto' ? 'automatic' : 'off'}.`));
     }
   }

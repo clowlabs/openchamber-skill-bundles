@@ -3,11 +3,13 @@
 import type { JsonValue } from '@openchamber/sdk';
 import * as core from '../src/core.js';
 import { errorCode, pool, type FileHost } from '../shared/panel/host';
-import { createStatusRefresher, type SkillCounts } from './counts';
+import type { SkillCounts } from './counts';
 
 export const SKILL_COUNTS_KEY = 'skill-counts-v1';
-type LastCounts = Pick<SkillCounts, 'live' | 'installed' | 'chars'>;
+export type LastCounts = Pick<SkillCounts, 'live' | 'installed' | 'chars'>;
 type CountsEntry = { directory: string; counts: LastCounts };
+const MAX_COUNT_SCOPES = 20;
+const pickCounts = (c: LastCounts): LastCounts => ({ live: c.live, installed: c.installed, chars: c.chars });
 
 /** Array order is oldest to newest; only the three displayed numbers are persisted. */
 export function parseLastCountsCache(raw: unknown): CountsEntry[] {
@@ -21,9 +23,9 @@ export function parseLastCountsCache(raw: unknown): CountsEntry[] {
     if (!c || ![c.live, c.installed, c.chars].every((n) => Number.isSafeInteger(n) && n >= 0)
       || c.live > c.installed) continue;
     if (entries.some((e) => e.directory === entry.directory)) continue;
-    entries.push({ directory: entry.directory, counts: { live: c.live, installed: c.installed, chars: c.chars } });
+    entries.push({ directory: entry.directory, counts: pickCounts(c) });
   }
-  return entries.slice(-20);
+  return entries.slice(-MAX_COUNT_SCOPES);
 }
 
 async function readLastCountsCache(host: StorageHost): Promise<CountsEntry[] | null> {
@@ -38,7 +40,7 @@ const sameCounts = (a: LastCounts, b: LastCounts) =>
   a.live === b.live && a.installed === b.installed && a.chars === b.chars;
 
 /** Directory epochs protect both cached and fresh paints, including A → B → A switches. */
-export function createCachedStatusPainter(host: StorageHost, paint: (c: SkillCounts) => void) {
+export function createCachedStatusPainter(host: StorageHost, paint: (c: LastCounts) => void) {
   let epoch = 0;
   let directory = '';
   let settled = false;
@@ -55,14 +57,15 @@ export function createCachedStatusPainter(host: StorageHost, paint: (c: SkillCou
       return readLastCountsCache(host).then((entries) => {
         const cached = entries?.find((e) => e.directory === key);
         if (cached && ticket === epoch && !settled) {
-          paint({ ...cached.counts, bundlesOn: [], fromOpencode: false });
+          paint(cached.counts);
         }
       });
     },
     ticket: () => epoch,
-    isCurrent: (ticket: number) => ticket === epoch,
-    settle(ticket: number) {
-      if (ticket === epoch) settled = true;
+    settle(ticket: number): boolean {
+      if (ticket !== epoch) return false;
+      settled = true;
+      return true;
     },
     fresh(ticket: number, c: SkillCounts): Promise<void> {
       if (ticket !== epoch) return Promise.resolve();
@@ -70,7 +73,7 @@ export function createCachedStatusPainter(host: StorageHost, paint: (c: SkillCou
       paint(c);
       if (!host.storage) return Promise.resolve();
       const key = scopeKey();
-      const value = { live: c.live, installed: c.installed, chars: c.chars };
+      const value = pickCounts(c);
       // Serialize read/modify/write operations in this frame, so rapid paints cannot lose entries.
       // Across windows this is best-effort: a lost entry only misses an instant paint until next boot.
       writes = writes.then(async () => {
@@ -80,33 +83,12 @@ export function createCachedStatusPainter(host: StorageHost, paint: (c: SkillCou
         if (previous && sameCounts(previous.counts, value)) {
           return;
         }
-        const next = [...entries.filter((e) => e.directory !== key), { directory: key, counts: value }].slice(-20);
+        const next = [...entries.filter((e) => e.directory !== key), { directory: key, counts: value }].slice(-MAX_COUNT_SCOPES);
         await host.storage?.set(SKILL_COUNTS_KEY, { v: 1, entries: next });
       }).catch(() => { /* A cache failure must never affect the live meter. */ });
       return writes;
     },
   };
-}
-
-/** Wire load completion (including errors) to the matching directory's cached paint. */
-export function createCachedStatusRefresher(
-  painter: ReturnType<typeof createCachedStatusPainter>,
-  read: (ticket: number) => Promise<SkillCounts>,
-  onError: (e: unknown) => void,
-) {
-  let ticket = 0;
-  return createStatusRefresher(
-    () => {
-      ticket = painter.ticket();
-      return read(ticket);
-    },
-    (c) => { void painter.fresh(ticket, c); },
-    (e) => {
-      if (!painter.isCurrent(ticket)) return;
-      painter.settle(ticket);
-      onError(e);
-    },
-  );
 }
 
 export const SKILL_INDEX_KEY = 'skill-index-v1';
@@ -183,4 +165,23 @@ export async function writeSkillIndexCache(host: StorageHost, entry: SkillIndexC
   } catch {
     // Storage failures are non-fatal; live discovery still works.
   }
+}
+
+export async function saveSkillIndexCache(host: StorageHost, opts: {
+  roots: readonly string[];
+  rootsKey: string;
+  rootMap: Record<string, string>;
+  allIds: readonly string[];
+  home?: string;
+}): Promise<SkillIndexCache> {
+  const entry: SkillIndexCache = {
+    v: 1,
+    rootsKey: opts.rootsKey,
+    rootStamps: formatRootStamps(opts.roots, opts.rootMap),
+    allIds: [...opts.allIds],
+    ...(opts.home ? { home: opts.home } : {}),
+    scannedAt: Date.now(),
+  };
+  await writeSkillIndexCache(host, entry);
+  return entry;
 }

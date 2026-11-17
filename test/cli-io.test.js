@@ -68,6 +68,28 @@ test("io: runCli without injection behaves like the binary", () => {
   assert.equal(cli(h, ["nope"]).code, 1);
 });
 
+test("io: physical project lookups are cached per invocation only", () => {
+  const h = makeHome();
+  const project = path.join(h, "project");
+  fs.mkdirSync(path.join(project, ".opencode"), { recursive: true });
+  fs.writeFileSync(path.join(project, ".opencode/opencode.json"), "{}");
+  const state = JSON.parse(read(h, "skill-bundles.json"));
+  state.bundles[0].projects = ["~/project"];
+  fs.writeFileSync(path.join(oc(h), "skill-bundles.json"), JSON.stringify(state));
+  const io = createNodeIO();
+  const realpath = io.realpath;
+  let calls = 0;
+  io.realpath = (p) => {
+    if (p === project) calls++;
+    return realpath(p);
+  };
+  for (let invocation = 1; invocation <= 2; invocation++) {
+    const r = cli(h, ["on", state.bundles[0].id, "--project", project, "--dry-run"], io);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(calls, invocation);
+  }
+});
+
 // R6
 test("io: failure before renaming publishes nothing (backup, each temp)", () => {
   const cases = [
