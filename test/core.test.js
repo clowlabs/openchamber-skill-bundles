@@ -909,3 +909,146 @@ test("planChange: incomplete discovery keeps every rule and restates only flippe
   const q = perms(core.planChange({ ...prev, incomplete: false }, core.setBundleEnabled(st, "b", true), ["x", "y"]));
   assert.ok(!q.some((r) => r.resource === "ghost" || r.resource === "private-*"));
 });
+
+test("groups preserves projects when present and omits when absent", () => {
+  const st = S({
+    bundles: [
+      { id: "a", name: "A", enabled: false, skills: ["x"], projects: ["~/p1"] },
+      { id: "b", name: "B", enabled: true, skills: ["y"] },
+    ],
+  });
+  const g = core.groups(st, ["x", "y"]);
+  assert.deepEqual(g[0].projects, ["~/p1"]);
+  assert.equal("projects" in g[1], false);
+  assert.equal("projects" in g[2], false);
+});
+
+test("overrides[id] === 'off' excludes skill from projectsFor and projectSkills / planChange", () => {
+  const st0 = S({
+    bundles: [{ id: "a", name: "A", enabled: false, skills: ["x", "y"], projects: ["/proj"] }],
+    overrides: {},
+  });
+  assert.deepEqual(core.projectsFor(st0, "x"), ["/proj"]);
+  const prev0 = {
+    bundlesText: core.serializeBundles(st0),
+    opencodeText: '{"permissions":[]}\n',
+    skillMds: { x: "---\nname: x\n---\n", y: "---\nname: y\n---\n" },
+  };
+  const p0 = core.planChange(prev0, st0, ["x", "y"], { "/proj": null });
+  const pw0 = p0.writes.find((w) => w.kind === "project");
+  assert.deepEqual(JSON.parse(pw0.after).permissions.map((r) => r.resource), ["x", "y"]);
+
+  // Disable x via override: excluded from projectsFor and removed from project opencode.json
+  const st1 = core.setOverride(p0.state, "x", "off");
+  assert.deepEqual(core.projectsFor(st1, "x"), []);
+  assert.deepEqual(core.projectsFor(st1, "y"), ["/proj"]);
+  const p1 = core.planChange({ ...prev0, bundlesText: p0.writes.at(-1).after }, st1, ["x", "y"], { "/proj": pw0.after });
+  const pw1 = p1.writes.find((w) => w.kind === "project");
+  assert.deepEqual(JSON.parse(pw1.after).permissions.map((r) => r.resource), ["y"]);
+
+  // Clear override: restored to projectsFor and project opencode.json
+  const st2 = core.setOverride(p1.state, "x", null);
+  assert.deepEqual(core.projectsFor(st2, "x"), ["/proj"]);
+  const p2 = core.planChange({ ...prev0, bundlesText: p1.writes.at(-1).after }, st2, ["x", "y"], { "/proj": pw1.after });
+  const pw2 = p2.writes.find((w) => w.kind === "project");
+  assert.deepEqual(JSON.parse(pw2.after).permissions.map((r) => r.resource), ["x", "y"]);
+});
+
+test("effectiveMode and summary support projectDir scope", () => {
+  const home = "/home/u";
+  const st = S({
+    bundles: [
+      { id: "g", name: "G", enabled: true, skills: ["g1"] },
+      { id: "p", name: "P", enabled: false, skills: ["p1", "p2"], projects: ["~/proj-a"] },
+    ],
+    overrides: { p2: "off", c1: "called", opencode: "called" },
+  });
+  const all = ["g1", "p1", "p2", "c1", "opencode"];
+  // Global scope (no projectDir or chats dir): g1 (auto), opencode (auto), c1 (called)
+  assert.equal(core.effectiveMode(st, "p1"), "off");
+  assert.equal(core.effectiveMode(st, "p1", { projectDir: "/home/u/.config/openchamber/chats/123", home }), "off");
+  assert.deepEqual(core.summary(st, all), { on: 3, auto: 2, called: 1, chars: 2 * core.CHARS_PER_SKILL });
+
+  // Project A scope: p1 is auto, p2 stays off due to override
+  const optsA = { projectDir: "/home/u/proj-a", home };
+  assert.equal(core.effectiveMode(st, "g1", optsA), "auto");
+  assert.equal(core.effectiveMode(st, "p1", optsA), "auto");
+  assert.equal(core.effectiveMode(st, "p2", optsA), "off");
+  assert.equal(core.effectiveMode(st, "c1", optsA), "called");
+  assert.equal(core.effectiveMode(st, "opencode", optsA), "auto");
+  assert.deepEqual(core.summary(st, all, optsA), { on: 4, auto: 3, called: 1, chars: 3 * core.CHARS_PER_SKILL });
+
+  // Project B scope: p1 is off
+  const optsB = { projectDir: "/home/u/proj-b", home };
+  assert.equal(core.effectiveMode(st, "p1", optsB), "off");
+  assert.deepEqual(core.summary(st, all, optsB), { on: 3, auto: 2, called: 1, chars: 2 * core.CHARS_PER_SKILL });
+});
+
+test("setBundleGlobal toggles enabled without clearing overrides", () => {
+  const s0 = core.setOverride(core.setOverride(base(), "x", "off"), "y", "called");
+  const s1 = core.setBundleGlobal(s0, "a", false);
+  assert.equal(s1.bundles[0].enabled, false);
+  assert.deepEqual({ ...s1.overrides }, { x: "off", y: "called" });
+  const s2 = core.setBundleGlobal(s1, "a", true);
+  assert.equal(s2.bundles[0].enabled, true);
+  assert.deepEqual({ ...s2.overrides }, { x: "off", y: "called" });
+  assert.throws(() => core.setBundleGlobal(s0, "nope", true), /Unknown bundle/);
+});
+
+test("excludedProjects: round-trip, effectiveMode, summary, and planChange deny/allow rules", () => {
+  const home = "/home/u";
+  const st0 = core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [
+      { id: "g", name: "G", enabled: true, skills: ["g1", "shared"] },
+      { id: "p", name: "P", enabled: false, skills: ["shared", "p1"], projects: ["/home/u/proj-a"] },
+    ],
+    overrides: {},
+  }), { home });
+  assert.equal(core.serializeBundles(st0).includes("excludedProjects"), false);
+
+  // Exclude global bundle "g" in proj-a: g1 is denied in proj-a, shared stays allowed via bundle "p"
+  const st1 = core.excludeBundleProject(st0, "g", "/home/u/proj-a", { home });
+  assert.deepEqual(st1.bundles[0].excludedProjects, ["~/proj-a"]);
+  assert.equal(core.effectiveMode(st1, "g1", { projectDir: "/home/u/proj-a", home }), "off");
+  assert.equal(core.effectiveMode(st1, "shared", { projectDir: "/home/u/proj-a", home }), "auto");
+  assert.equal(core.effectiveMode(st1, "g1", { projectDir: "/home/u/proj-b", home }), "auto");
+  assert.deepEqual(core.summary(st1, ["g1", "shared", "p1"], { projectDir: "/home/u/proj-a", home }), {
+    on: 2, auto: 2, called: 0, chars: 2 * core.CHARS_PER_SKILL,
+  });
+
+  const prev = {
+    bundlesText: core.serializeBundles(st0),
+    opencodeText: core.applyPermissions('{"permissions":[]}\n', st0, ["g1", "shared", "p1"]),
+    skillMds: { g1: "---\nname: g1\n---\n", shared: "---\nname: shared\n---\n", p1: "---\nname: p1\n---\n" },
+  };
+  const plan1 = core.planChange(prev, st1, ["g1", "shared", "p1"], { "~/proj-a": null }, { home });
+  const pw1 = plan1.writes.find((w) => w.kind === "project");
+  assert.deepEqual(JSON.parse(pw1.after).permissions, [
+    { action: "skill", resource: "g1", effect: "deny" },
+    { action: "skill", resource: "p1", effect: "allow" },
+    { action: "skill", resource: "shared", effect: "allow" },
+  ]);
+
+  // includeBundleProject removes the exclusion and drops the deny rule
+  const st2 = core.includeBundleProject(plan1.state, "g", "/home/u/proj-a", { home });
+  assert.equal(st2.bundles[0].excludedProjects, undefined);
+  const plan2 = core.planChange({ ...prev, bundlesText: plan1.writes.at(-1).after }, st2, ["g1", "shared", "p1"], { "~/proj-a": pw1.after }, { home });
+  const pw2 = plan2.writes.find((w) => w.kind === "project");
+  assert.deepEqual(JSON.parse(pw2.after).permissions, [
+    { action: "skill", resource: "p1", effect: "allow" },
+    { action: "skill", resource: "shared", effect: "allow" },
+  ]);
+
+  // setBundleGlobal(..., false) clears excludedProjects
+  const st3 = core.setBundleGlobal(st1, "g", false);
+  assert.equal(st3.bundles[0].enabled, false);
+  assert.equal(st3.bundles[0].excludedProjects, undefined);
+
+  // setBundleEnabled(..., false) also clears excludedProjects, and excludeBundleProject on disabled bundle does not add excludedProjects
+  const st4 = core.setBundleEnabled(st1, "g", false);
+  assert.equal(st4.bundles[0].enabled, false);
+  assert.equal(st4.bundles[0].excludedProjects, undefined);
+  const st5 = core.excludeBundleProject(st4, "g", "/home/u/proj-a", { home });
+  assert.equal(st5.bundles[0].excludedProjects, undefined);
+});

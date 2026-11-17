@@ -93,7 +93,7 @@ html, body { margin: 0; background: var(--oc-bg); color: var(--oc-fg); font-fami
 .sb-proj-btn { border: 1px solid var(--oc-border); background: none; color: var(--oc-muted); font: inherit; font-size: 11px; padding: 1px 7px; border-radius: 6px; cursor: pointer; display: inline-flex; gap: 4px; align-items: center; }
 .sb-proj-btn:hover { color: var(--oc-fg); background: var(--oc-hover); }
 .sb-proj-count { background: var(--oc-primary); color: var(--oc-primary-fg, #fff); border-radius: 999px; padding: 0 5px; font-size: 10px; line-height: 14px; }
-.sb-proj { min-width: 280px; }
+.sb-proj { min-width: min(280px, calc(100vw - 8px)); }
 .sb-proj-row { display: grid; grid-template-columns: 16px auto 1fr; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 5px; font-size: 12px; cursor: pointer; }
 .sb-proj-row:hover { background: var(--oc-hover); }
 .sb-proj-check { margin: 0; }
@@ -131,15 +131,21 @@ body.sb-compact #app { display: none; }
 .sb-c-title { display: flex; align-items: center; gap: 8px; padding: 0 8px 8px; border-bottom: 1px solid var(--oc-border); }
 .sb-c-title-name { margin: 0; font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sb-c-skills { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
-.sb-c-skill { display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; border-bottom: 1px solid var(--oc-border); }
+.sb-c-skill { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-bottom: 1px solid var(--oc-border); }
 .sb-c-skill:last-child { border-bottom: 0; }
+.sb-c-skill:focus-visible { outline: 2px solid var(--oc-focus, var(--oc-primary)); outline-offset: -2px; border-radius: 6px; }
+.sb-c-skill-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sb-c-skill.is-disabled .sb-c-skill-main { opacity: .55; }
 .sb-c-skill-id { font-family: var(--oc-mono, monospace); font-size: 12px; overflow-wrap: anywhere; }
 .sb-c-skill-desc { font-size: 11px; color: var(--oc-muted); overflow-wrap: anywhere; }
+.sb-c-disable-pill { border: 1px solid var(--oc-border); background: none; color: var(--oc-muted); font: inherit; font-size: 11px; line-height: 1.4; padding: 2px 8px; border-radius: 999px; flex: none; cursor: pointer; }
+.sb-c-disable-pill:hover { color: var(--oc-fg); background: var(--oc-hover); }
+.sb-c-disable-pill:focus-visible { outline: 2px solid var(--oc-focus, var(--oc-primary)); outline-offset: 2px; }
+.sb-c-disable-pill.is-disabled { border-color: var(--oc-error, var(--oc-border)); color: var(--oc-error-text, var(--oc-fg)); background: var(--oc-hover); }
 .sb-c-meta { font-size: 11px; color: var(--oc-muted); }
 .sb-c-proj { color: var(--oc-muted); opacity: .85; }
 .sb-c-switch { flex: none; }
-.sb-c-empty, .sb-c-hint { color: var(--oc-muted); font-size: 11px; }
-.sb-c-hint { border-top: 1px solid var(--oc-border); padding-top: 6px; }
+.sb-c-empty { color: var(--oc-muted); font-size: 11px; }
 
 /* SDK secondary/ghost buttons ship with a transparent border and blend into the panel. */
 body .oc-sdk-btn[data-variant="secondary"],

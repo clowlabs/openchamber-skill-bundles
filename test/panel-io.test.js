@@ -697,6 +697,7 @@ function installMenuDom() {
       return false;
     }
     setAttribute(k, v) { this.attrs[k] = String(v); }
+    removeAttribute(k) { delete this.attrs[k]; }
     getAttribute(k) { return this.attrs[k] ?? null; }
     hasAttribute(k) { return k in this.attrs; }
     append(...nodes) { for (const n of nodes) this.appendChild(n); }
@@ -724,10 +725,33 @@ function installMenuDom() {
     }
     addEventListener(t, fn) { (this.listeners[t] ??= new Set()).add(fn); }
     removeEventListener(t, fn) { this.listeners[t]?.delete(fn); }
-    dispatch(t, ev = {}) {
-      for (const fn of [...(this.listeners[t] ?? [])]) fn({ type: t, target: this, currentTarget: this, preventDefault() {}, stopPropagation() {}, ...ev });
+    closest(sel) {
+      const parts = sel.split(",").map((s) => s.trim()).filter(Boolean);
+      const matchOne = (el, s) => {
+        if (s.startsWith(".")) return el.classList.contains(s.slice(1));
+        return el.tag === s.toUpperCase();
+      };
+      for (let n = this; n; n = n.parent) {
+        if (parts.some((s) => matchOne(n, s))) return n;
+      }
+      return null;
     }
-    click(ev = {}) { this.dispatch("click", { altKey: false, ...ev }); }
+    dispatch(t, ev = {}) {
+      let stopped = false;
+      const event = {
+        type: t,
+        target: this,
+        currentTarget: this,
+        preventDefault() {},
+        stopPropagation() { stopped = true; },
+        ...ev,
+      };
+      for (const fn of [...(this.listeners[t] ?? [])]) fn(event);
+      if (!stopped && this.parent && typeof this.parent.dispatch === "function" && ev._noBubble !== true) {
+        this.parent.dispatch(t, { ...ev, target: event.target });
+      }
+    }
+    click(ev = {}) { this.dispatch("click", { altKey: false, detail: 1, ...ev }); }
     focus() { if (globalThis.document) globalThis.document.activeElement = this; }
     getBoundingClientRect() { return { left: 10, top: 10, width: 120, height: 80 }; }
     querySelectorAll(sel) {
@@ -1418,6 +1442,7 @@ test("compact renderCompact updates skill counts and open bundle list without st
     expect(root.querySelectorAll(".sb-c-skill-desc").map((e) => e.textContent)).toEqual(["Alpha", "Beta fresh"]);
     expect(focusCalls).toBe(0);
     expect(globalThis.document.activeElement).toBe(externalFocus);
+    globalThis.document.dispatchKey("keydown", { key: "Escape" });
   } finally {
     if (prevStyle) Object.defineProperty(globalThis, "HTMLStyleElement", prevStyle);
     else delete globalThis.HTMLStyleElement;
@@ -1675,6 +1700,418 @@ test("2. queued write waits for syncInFlight to commit fresh S.state and survive
   await settle();
   expect(writeRan).toBe(true);
   expect(io.S.state.bundles.find((b) => b.id === "b").enabled).toBe(false);
+});
+
+test("toggleBundleInScope scopes to active project dir and falls back to global when null or chats dir", async () => {
+  const projA = `${home}/work/proj-a`;
+  const projB = `${home}/work/proj-b`;
+  fs.mkdirSync(real(projA), { recursive: true });
+  fs.mkdirSync(real(projB), { recursive: true });
+
+  // Active project A: turning on adds projA to b.projects without turning global b.enabled on
+  io.S.activeDir = projA;
+  expect(io.activeProjectDir()).toBe("~/work/proj-a");
+  io.toggleBundleInScope("b", true);
+  await settle();
+  expect(io.S.state.bundles[0].enabled).toBe(false);
+  expect(io.S.state.bundles[0].projects).toEqual(["~/work/proj-a"]);
+  expect(JSON.parse(read(`${projA}/.opencode/opencode.json`)).permissions.map((r) => r.resource)).toEqual(["alpha", "beta"]);
+  expect(io.isBundleOnInScope(io.S.state.bundles[0])).toBe(true);
+
+  // Switching activeDir to projB shows bundle OFF there
+  io.S.activeDir = projB;
+  expect(io.activeProjectDir()).toBe("~/work/proj-b");
+  expect(io.isBundleOnInScope(io.S.state.bundles[0])).toBe(false);
+
+  // Turning off in projA removes projA
+  io.S.activeDir = projA;
+  io.toggleBundleInScope("b", false);
+  await settle();
+  expect(io.S.state.bundles[0].projects).toBeUndefined();
+  expect(JSON.parse(read(`${projA}/.opencode/opencode.json`)).permissions).toEqual([]);
+
+  // Null or chats dir falls back to global setBundleGlobal (preserving overrides)
+  io.commit((s) => core.setOverride(s, "alpha", "off"));
+  await settle();
+  io.S.activeDir = `${home}/.config/openchamber/chats/chat-1`;
+  expect(io.activeProjectDir()).toBeNull();
+  io.toggleBundleInScope("b", true);
+  await settle();
+  expect(io.S.state.bundles[0].enabled).toBe(true);
+  expect(io.S.state.overrides.alpha).toBe("off");
+});
+
+test("compact rail: no hints, Alt/right-click opens projects menu, Disable pill toggles override, Alt+click skill opens send menu", async () => {
+  const cleanupDom = installMenuDom();
+  const prevRender = io.hooks.render;
+  const prevStyle = Object.getOwnPropertyDescriptor(globalThis, "HTMLStyleElement");
+  let popup, send, projects;
+  try {
+    const projA = `${home}/work/proj-a`;
+    const projB = `${home}/work/proj-b`;
+    fs.mkdirSync(real(projA), { recursive: true });
+    fs.mkdirSync(real(projB), { recursive: true });
+    fx.projects = [
+      { id: "pa", name: "Proj A", directory: projA },
+      { id: "pb", name: "Proj B", directory: projB },
+    ];
+    put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [
+        { id: "b", name: "B", enabled: false, skills: ["alpha", "beta"], projects: [projA] },
+        { id: "c", name: "C", enabled: false, skills: [] },
+      ],
+      overrides: {},
+    }))));
+    await io.load();
+    io.S.activeDir = projA;
+
+    const NodeProto = globalThis.HTMLElement.prototype;
+    const origQsa = NodeProto.querySelectorAll;
+    NodeProto.querySelectorAll = function (sel) {
+      const out = origQsa.call(this, sel);
+      if (out.length) return out;
+      const walk = (n, pred) => {
+        for (const c of n.children) {
+          if (pred(c)) out.push(c);
+          walk(c, pred);
+        }
+      };
+      if (sel === ".sb-c-row") walk(this, (el) => el.classList.contains("sb-c-row"));
+      else if (sel === ".sb-c-switch") walk(this, (el) => el.classList.contains("sb-c-switch"));
+      else if (sel === ".sb-c-title") walk(this, (el) => el.classList.contains("sb-c-title"));
+      else if (sel === ".sb-c-title-name") walk(this, (el) => el.classList.contains("sb-c-title-name"));
+      else if (sel === ".sb-c-skill") walk(this, (el) => el.classList.contains("sb-c-skill"));
+      else if (sel === ".sb-c-disable-pill") walk(this, (el) => el.classList.contains("sb-c-disable-pill"));
+      else if (sel.startsWith('.sb-c-disable-pill[data-id="')) {
+        const id = sel.slice('.sb-c-disable-pill[data-id="'.length, -2);
+        walk(this, (el) => el.classList.contains("sb-c-disable-pill") && el.dataset.id === id);
+      } else if (sel.startsWith('.sb-c-skill[data-id="')) {
+        const id = sel.slice('.sb-c-skill[data-id="'.length, -2);
+        walk(this, (el) => el.classList.contains("sb-c-skill") && el.dataset.id === id);
+      }
+      else if (sel === ".sb-c-meta") walk(this, (el) => el.classList.contains("sb-c-meta"));
+      else if (sel === ".sb-c-hint") walk(this, (el) => el.classList.contains("sb-c-hint"));
+      else if (sel === "input.sb-proj-check") walk(this, (el) => el.tag === "INPUT" && el.classList.contains("sb-proj-check"));
+      else if (sel === "button, input, [tabindex]") walk(this, (el) => el.tag === "BUTTON" || el.tag === "INPUT" || "tabindex" in el.attrs);
+      return out;
+    };
+
+    globalThis.HTMLStyleElement = class extends globalThis.HTMLElement {};
+    globalThis.document.hasFocus = () => true;
+    globalThis.document.getElementById = () => null;
+    globalThis.document.head = globalThis.document.createElement("head");
+    globalThis.document.documentElement = globalThis.document.createElement("html");
+
+    popup = await import("../panel/popup.ts");
+    send = await import("../panel/send.ts");
+    projects = await import("../panel/projects.ts");
+    const compactMod = await import("../panel/compact.ts");
+
+    popup.initPopup(fx.host);
+    popup.setHomeSource(() => io.S.home);
+    send.initSend({
+      host: fx.host,
+      blockedReason: () => null,
+      bundleBlockedReason: () => null,
+      skillRef: (id) => io.S.skillRefs[id],
+      enqueue: io.enqueue,
+      markMoved: (id, dir) => io.applyChange((s) => core.markMovedToProject(s, id, dir)),
+      moveToBundle: (id, to, from, copy) => io.commit((s) => send.moveSkillToBundle(s, id, to, from, copy)),
+      toastError: io.toastError,
+    });
+
+    const root = globalThis.document.createElement("div");
+    globalThis.document.body.appendChild(root);
+    io.hooks.render = () => {
+      compactMod.renderCompact(root);
+      projects.refreshProjectsMenu();
+      send.refreshSendMenu();
+    };
+    compactMod.renderCompact(root);
+
+    // No footer hint in bundle list view
+    expect(root.querySelectorAll(".sb-c-hint")).toEqual([]);
+    const rowB = root.querySelectorAll(".sb-c-row")[0];
+    expect(rowB.classList.contains("on")).toBe(true);
+
+    // Alt + click on bundle row opens Projects menu (with Global row + current project first) without drilling in
+    rowB.click({ altKey: true });
+    await Promise.resolve();
+    const projMenu = globalThis.document.body.children.find((c) => c.classList.contains("sb-proj"));
+    expect(projMenu).toBeDefined();
+    expect(root.querySelectorAll(".sb-c-skill")).toEqual([]);
+    const checks = projMenu.querySelectorAll("input.sb-proj-check");
+    expect(checks.map((c) => c.dataset.dir)).toEqual(["__global", projA, projB]);
+    expect(checks[0].checked).toBe(false);
+    expect(checks[1].checked).toBe(true);
+    popup.closePopup();
+
+    // Right-click on bundle row also opens Projects menu without drilling in
+    rowB.dispatch("contextmenu", { clientX: 20, clientY: 20 });
+    expect(globalThis.document.body.children.some((c) => c.classList.contains("sb-proj"))).toBe(true);
+    expect(root.querySelectorAll(".sb-c-skill")).toEqual([]);
+    popup.closePopup();
+
+    // Clicking switch does not open Projects menu or drill in
+    const sw = rowB.querySelectorAll(".sb-c-switch")[0];
+    sw.click({ altKey: true });
+    expect(globalThis.document.body.children.some((c) => c.classList.contains("sb-proj"))).toBe(false);
+    expect(root.querySelectorAll(".sb-c-skill")).toEqual([]);
+
+    // Plain click drills into bundle "b"
+    rowB.click();
+    expect(root.querySelectorAll(".sb-c-hint")).toEqual([]);
+    const pills = root.querySelectorAll(".sb-c-disable-pill");
+    expect(pills.map((p) => p.textContent)).toEqual(["Disable", "Disable"]);
+
+    // Clicking Disable pill disables "alpha", removes it from projA opencode.json, and shows "Disabled"
+    pills[0].click();
+    await settle();
+    expect(io.S.state.overrides.alpha).toBe("off");
+    expect(JSON.parse(read(`${projA}/.opencode/opencode.json`)).permissions.map((r) => r.resource)).toEqual(["beta"]);
+    expect(root.querySelectorAll(".sb-c-disable-pill").map((p) => p.textContent)).toEqual(["Disabled", "Disable"]);
+
+    // Preserved across bundle toggle (off then on in projA)
+    io.toggleBundleInScope("b", false);
+    await settle();
+    io.toggleBundleInScope("b", true);
+    await settle();
+    expect(io.S.state.overrides.alpha).toBe("off");
+    expect(root.querySelectorAll(".sb-c-disable-pill").map((p) => p.textContent)).toEqual(["Disabled", "Disable"]);
+
+    // Clicking Disabled pill re-enables "alpha" and restores it to projA opencode.json
+    root.querySelectorAll(".sb-c-disable-pill")[0].click();
+    await settle();
+    expect(io.S.state.overrides.alpha).toBeUndefined();
+    expect(JSON.parse(read(`${projA}/.opencode/opencode.json`)).permissions.map((r) => r.resource)).toEqual(["alpha", "beta"]);
+    expect(root.querySelectorAll(".sb-c-disable-pill").map((p) => p.textContent)).toEqual(["Disable", "Disable"]);
+
+    // Alt + click on skill row opens Send menu; releasing Alt before clicking item moves (not duplicates)
+    const skillAlpha = root.querySelectorAll(".sb-c-skill")[0];
+    skillAlpha.click({ altKey: true });
+    const sendMenu = globalThis.document.body.children.find((c) => c.classList.contains("sb-ctx") && !c.classList.contains("sb-proj"));
+    expect(sendMenu).toBeDefined();
+    // Simulate pointer click after Alt was released outside the iframe (e.altKey === false)
+    sendMenu.querySelector('[data-bid="c"]').click({ altKey: false });
+    await settle();
+    expect(io.S.state.bundles.find((b) => b.id === "b").skills).toEqual(["beta"]);
+    expect(io.S.state.bundles.find((b) => b.id === "c").skills).toEqual(["alpha"]);
+
+    // Focus restoration on Disable/Disabled pill button + inner <button> of .sb-c-switch + Alt+Enter on open header
+    const backBtn = root.querySelectorAll("button, input, [tabindex]").find((e) => e.classList.contains("sb-c-back"));
+    backBtn.click();
+    const rowC = root.querySelectorAll(".sb-c-row")[1];
+    rowC.click();
+    const pillA = root.querySelectorAll(".sb-c-disable-pill")[0];
+    pillA.focus();
+    pillA.click();
+    await settle();
+    expect(toasts.filter((t) => t.kind === "error")).toEqual([]);
+    expect(globalThis.document.activeElement).toBe(root.querySelectorAll(".sb-c-disable-pill")[0]);
+
+    // Clicking inner <button> of .sb-c-switch toggles bundle "c" in projA without opening projects menu
+    const innerSwBtn = root.querySelectorAll(".sb-c-title .sb-c-switch button").length
+      ? root.querySelectorAll(".sb-c-title .sb-c-switch button")[0]
+      : root.querySelectorAll("button, input, [tabindex]").find((e) => e.closest(".sb-c-switch") && e.closest(".sb-c-title"));
+    expect(innerSwBtn).toBeDefined();
+    innerSwBtn.click();
+    await settle();
+    expect(io.S.state.bundles.find((b) => b.id === "c").projects).toEqual(["~/work/proj-a"]);
+    expect(globalThis.document.body.children.some((c) => c.classList.contains("sb-proj"))).toBe(false);
+
+    // Keyboard Alt+Enter on open bundle header opens Projects menu and closing restores focus to header
+    const header = root.querySelectorAll(".sb-c-title-name")[0];
+    expect(header).toBeDefined();
+    header.focus();
+    header.dispatch("keydown", { key: "Enter", altKey: true });
+    expect(globalThis.document.body.children.some((c) => c.classList.contains("sb-proj"))).toBe(true);
+    popup.closePopup();
+    expect(globalThis.document.activeElement).toBe(header);
+  } finally {
+    popup?.closePopup();
+    if (prevStyle) Object.defineProperty(globalThis, "HTMLStyleElement", prevStyle);
+    else delete globalThis.HTMLStyleElement;
+    io.hooks.render = prevRender;
+    cleanupDom();
+  }
+});
+
+test("regression: global bundle toggled off in Project A excludes only Project A, stays on in Project B, and restores on toggle ON", async () => {
+  const projA = `${home}/work/proj-a`;
+  const projB = `${home}/work/proj-b`;
+  fs.mkdirSync(real(projA), { recursive: true });
+  fs.mkdirSync(real(projB), { recursive: true });
+  put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [{ id: "b", name: "B", enabled: true, skills: ["alpha", "beta"] }],
+    overrides: {},
+  }))));
+  await io.load();
+
+  io.S.activeDir = projA;
+  io.toggleBundleInScope("b", false);
+  await settle();
+  expect(io.S.state.bundles[0].enabled).toBe(true);
+  expect(io.S.state.bundles[0].excludedProjects).toEqual(["~/work/proj-a"]);
+  expect(io.isBundleOnInScope(io.S.state.bundles[0])).toBe(false);
+  expect(JSON.parse(read(`${projA}/.opencode/opencode.json`)).permissions).toEqual([
+    { action: "skill", resource: "alpha", effect: "deny" },
+    { action: "skill", resource: "beta", effect: "deny" },
+  ]);
+
+  io.S.activeDir = projB;
+  expect(io.isBundleOnInScope(io.S.state.bundles[0])).toBe(true);
+
+  io.S.activeDir = projA;
+  io.toggleBundleInScope("b", true);
+  await settle();
+  expect(io.S.state.bundles[0].enabled).toBe(true);
+  expect(io.S.state.bundles[0].excludedProjects).toBeUndefined();
+  expect(JSON.parse(read(`${projA}/.opencode/opencode.json`)).permissions).toEqual([]);
+});
+
+test("regression: toggleBundleInScope captures project scope at invocation time even if activeDir changes before queue runs", async () => {
+  const projA = `${home}/work/proj-a`;
+  const projB = `${home}/work/proj-b`;
+  fs.mkdirSync(real(projA), { recursive: true });
+  fs.mkdirSync(real(projB), { recursive: true });
+
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  void io.enqueue(async () => { await gate; });
+
+  io.S.activeDir = projA;
+  io.toggleBundleInScope("b", true);
+  // User switches activeDir before the queued write executes
+  io.S.activeDir = projB;
+  release();
+  await settle();
+
+  expect(io.S.state.bundles[0].projects).toEqual(["~/work/proj-a"]);
+  expect(io.S.state.bundles[0].enabled).toBe(false);
+});
+
+test("regression: sameProjectDir works when S.home is undefined, and readCounts derives nonstandard home from listProjects", async () => {
+  io.S.home = undefined;
+  io.S.activeDir = "/home/u/work/a";
+  expect(io.sameProjectDir("/home/u/work/a", "~/work/a")).toBe(true);
+
+  const countsMod = await import("../status/counts.ts");
+  const { homeFromDirs } = await import("../shared/panel/projects.ts");
+  expect(homeFromDirs(["/srv/users/u/.config/openchamber/chats/c1", "/srv/users/u/work/app"])).toBe("/srv/users/u");
+  const countsFx = createFakeHost({
+    makeError: (code, msg) => new HostRequestError(code, msg),
+  });
+  const srvHome = countsFx.home;
+  const proj = `${srvHome}/work/app`;
+  try {
+    countsFx.put("~/.config/opencode/opencode.json", '{"permissions":[]}\n');
+    countsFx.put("~/.config/opencode/skills/alpha/SKILL.md", skillMd("Alpha"));
+    countsFx.put(`${proj}/.opencode/opencode.json`, JSON.stringify({ permissions: [{ action: "skill", resource: "alpha", effect: "allow" }] }) + "\n");
+    countsFx.put("~/.config/opencode/skill-bundles.json", core.serializeBundles(core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B", enabled: false, skills: ["alpha"], projects: ["~/work/app"] }],
+      overrides: {},
+    }))));
+    const derived = homeFromDirs([`${srvHome}/.config/openchamber/chats/c1`, proj]);
+    expect(derived).toBe(srvHome);
+    const res = await countsMod.readCounts(countsFx.host, { projectDir: proj, home: derived });
+    expect(res.bundlesOn).toEqual(["b"]);
+    expect(res.live).toBe(1);
+  } finally {
+    countsFx.cleanup();
+  }
+});
+
+test("regression: checkDisk detects external edits to managed project opencode.json", async () => {
+  const projA = `${home}/work/proj-a`;
+  fs.mkdirSync(real(projA), { recursive: true });
+  io.S.activeDir = projA;
+  io.toggleBundleInScope("b", true);
+  await settle();
+
+  let syncs = 0;
+  const prevSync = io.hooks.onExternalSync;
+  io.hooks.onExternalSync = () => { syncs++; prevSync(); };
+  try {
+    expect(await io.checkDisk()).toBe(false);
+    const pPath = `${projA}/.opencode/opencode.json`;
+    put(pPath, JSON.stringify({ permissions: [] }, null, 2) + "\n");
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(real(pPath), future, future);
+
+    expect(await io.checkDisk()).toBe(true);
+    expect(syncs).toBe(1);
+  } finally {
+    io.hooks.onExternalSync = prevSync;
+  }
+});
+
+test("regression: openSendMenu preserves Copy mode across Overwrite confirmation and supports keyboard Alt activation", async () => {
+  const cleanupDom = installMenuDom();
+  let send;
+  try {
+    const projA = `${home}/work/proj-a`;
+    fs.mkdirSync(real(projA), { recursive: true });
+    put(`${projA}/.opencode/skills/alpha/SKILL.md`, skillMd("Old Alpha"));
+    fx.projects = [{ id: "pa", name: "Proj A", directory: projA }];
+    put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B", enabled: true, skills: ["alpha"] }],
+      overrides: {},
+    }))));
+    await io.load();
+
+    const popup = await import("../panel/popup.ts");
+    send = await import("../panel/send.ts");
+    popup.initPopup(fx.host);
+    popup.setHomeSource(() => io.S.home);
+    send.initSend({
+      host: fx.host,
+      blockedReason: () => null,
+      bundleBlockedReason: () => null,
+      skillRef: (id) => io.S.skillRefs[id],
+      enqueue: io.enqueue,
+      markMoved: (id, dir) => io.applyChange((s) => core.markMovedToProject(s, id, dir)),
+      moveToBundle: (id, to, from, copy) => io.commit((s) => send.moveSkillToBundle(s, id, to, from, copy)),
+      toastError: io.toastError,
+    });
+
+    // Alt-click project -> Overwrite prompt -> release Alt -> click Overwrite: must Copy (not markMoved)
+    send.openSendMenu("alpha", 20, 20, true, null, "b");
+    await Promise.resolve();
+    const menu1 = globalThis.document.body.children.find((c) => c.classList.contains("sb-ctx"));
+    menu1.querySelector('[data-pid="pa"]').click({ altKey: true, detail: 1 });
+    await new Promise((r) => setTimeout(r, 15));
+    const overwriteBtn = menu1.querySelector('[data-confirm="yes"]');
+    expect(overwriteBtn).toBeDefined();
+    overwriteBtn.click({ altKey: false, detail: 1 });
+    await settle();
+    expect(io.S.state.overrides.alpha).toBeUndefined();
+    expect(read(`${projA}/.opencode/skills/alpha/SKILL.md`)).toBe(skillMd("Alpha"));
+
+    // Keyboard activation (detail: 0) with Alt held duplicates into another bundle
+    put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [
+        { id: "b", name: "B", enabled: false, skills: ["alpha"] },
+        { id: "c", name: "C", enabled: false, skills: [] },
+      ],
+      overrides: {},
+    }))));
+    await io.load();
+    send.openSendMenu("alpha", 20, 20, false, null, "b");
+    const menu2 = globalThis.document.body.children.find((c) => c.classList.contains("sb-ctx"));
+    globalThis.document.dispatchKey("keydown", { key: "Alt" });
+    menu2.querySelector('[data-bid="c"]').dispatch("click", { altKey: false, detail: 0 });
+    await settle();
+    expect(io.S.state.bundles.find((b) => b.id === "b").skills).toEqual(["alpha"]);
+    expect(io.S.state.bundles.find((b) => b.id === "c").skills).toEqual(["alpha"]);
+  } finally {
+    send?.closeSendMenu();
+    cleanupDom();
+  }
 });
 
 test("3. full:true hitting a held lock preserves full:true across a later full:false ping", async () => {
@@ -2164,6 +2601,286 @@ test("14. createEditGuard defers sync arriving mid-press between pointerdown and
 
     guard.dispose();
   } finally {
+    cleanupDom();
+  }
+});
+
+test("regression: unreadable project opencode.json does not break load, checkDisk, readCounts, or unrelated saves", async () => {
+  const lockedProj = `${home}/work/locked-proj`;
+  const otherProj = `${home}/work/other-proj`;
+  fs.mkdirSync(real(lockedProj), { recursive: true });
+  fs.mkdirSync(real(otherProj), { recursive: true });
+  put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [
+      { id: "b", name: "B", enabled: false, skills: ["alpha"], projects: [lockedProj] },
+      { id: "c", name: "C", enabled: false, skills: ["beta"] },
+    ],
+    overrides: {},
+  }))));
+
+  const h = fakeHost();
+  const origRead = h.readFile;
+  h.readFile = async (p) => {
+    if (p.includes("locked-proj") && p.endsWith(".opencode/opencode.json")) {
+      throw new HostRequestError("DENIED", "permission denied");
+    }
+    return origRead(p);
+  };
+  io.setHost(h);
+  await io.load();
+  expect(io.S.loaded).toBe(true);
+  expect(await io.checkDisk()).toBe(false);
+
+  const res = await counts.readCounts(h, { projectDir: lockedProj, home });
+  expect(res.bundlesOn).toEqual(["b"]);
+  expect(res.live).toBe(1);
+
+  // Unrelated bundle toggle still succeeds
+  io.S.activeDir = otherProj;
+  io.toggleBundleInScope("c", true);
+  await settle();
+  expect(io.S.state.bundles.find((b) => b.id === "c").projects).toEqual(["~/work/other-proj"]);
+});
+
+test("regression: external project opencode.json deny * drops rail meter and readCounts live count to 0", async () => {
+  const cleanupDom = installMenuDom();
+  const prevStyle = Object.getOwnPropertyDescriptor(globalThis, "HTMLStyleElement");
+  try {
+    const proj = `${home}/work/proj-a`;
+    fs.mkdirSync(real(proj), { recursive: true });
+    put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B", enabled: false, skills: ["alpha", "beta"], projects: [proj] }],
+      overrides: {},
+    }))));
+    await io.load();
+    io.S.activeDir = proj;
+
+    const NodeProto = globalThis.HTMLElement.prototype;
+    const origQsa = NodeProto.querySelectorAll;
+    NodeProto.querySelectorAll = function (sel) {
+      const out = origQsa.call(this, sel);
+      if (out.length) return out;
+      const walk = (n, pred) => {
+        for (const c of n.children) {
+          if (pred(c)) out.push(c);
+          walk(c, pred);
+        }
+      };
+      if (sel === ".skm-live-n") walk(this, (el) => el.classList.contains("skm-live-n"));
+      return out;
+    };
+    globalThis.HTMLStyleElement = class extends globalThis.HTMLElement {};
+    globalThis.document.hasFocus = () => true;
+    globalThis.document.getElementById = () => null;
+    globalThis.document.head = globalThis.document.createElement("head");
+    globalThis.document.documentElement = globalThis.document.createElement("html");
+
+    const compactMod = await import("../panel/compact.ts");
+    const root = globalThis.document.createElement("div");
+    globalThis.document.body.appendChild(root);
+
+    // Externally overwrite <proj>/.opencode/opencode.json to deny *
+    const pFile = `${proj}/.opencode/opencode.json`;
+    put(pFile, JSON.stringify({ permissions: [{ action: "skill", resource: "*", effect: "deny" }] }, null, 2) + "\n");
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(real(pFile), future, future);
+
+    expect(await io.checkDisk()).toBe(true);
+    const normProj = io.activeProjectDir();
+    const projCfg = core.projectConfigPath(normProj);
+    expect(counts.countsFromState(io.S.state, io.S.allIds, io.S.opencodeText, {
+      projectDir: proj,
+      home: io.effectiveHome(),
+      projectOpencodeText: io.S.projectTexts[projCfg],
+    }).live).toBe(0);
+    expect((await counts.readCounts(fx.host, { projectDir: proj, home })).live).toBe(0);
+
+    compactMod.renderCompact(root);
+    expect(root.querySelectorAll(".skm-live-n")[0].textContent).toBe("0");
+  } finally {
+    if (prevStyle) Object.defineProperty(globalThis, "HTMLStyleElement", prevStyle);
+    else delete globalThis.HTMLStyleElement;
+    cleanupDom();
+  }
+});
+
+test("regression: compact renderCompact uses effectiveHome() when S.home is undefined", async () => {
+  const cleanupDom = installMenuDom();
+  const prevStyle = Object.getOwnPropertyDescriptor(globalThis, "HTMLStyleElement");
+  try {
+    put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B", enabled: false, skills: ["alpha", "beta"], projects: ["/home/u/work/a"] }],
+      overrides: {},
+    }))));
+    await io.load();
+    io.S.home = undefined;
+    io.S.activeDir = "/home/u/work/a";
+
+    const NodeProto = globalThis.HTMLElement.prototype;
+    const origQsa = NodeProto.querySelectorAll;
+    NodeProto.querySelectorAll = function (sel) {
+      const out = origQsa.call(this, sel);
+      if (out.length) return out;
+      const walk = (n, pred) => {
+        for (const c of n.children) {
+          if (pred(c)) out.push(c);
+          walk(c, pred);
+        }
+      };
+      if (sel === ".sb-c-row") walk(this, (el) => el.classList.contains("sb-c-row"));
+      else if (sel === ".skm-live-n") walk(this, (el) => el.classList.contains("skm-live-n"));
+      return out;
+    };
+    globalThis.HTMLStyleElement = class extends globalThis.HTMLElement {};
+    globalThis.document.hasFocus = () => true;
+    globalThis.document.getElementById = () => null;
+    globalThis.document.head = globalThis.document.createElement("head");
+    globalThis.document.documentElement = globalThis.document.createElement("html");
+
+    const compactMod = await import("../panel/compact.ts");
+    const root = globalThis.document.createElement("div");
+    globalThis.document.body.appendChild(root);
+    compactMod.renderCompact(root);
+
+    expect(root.querySelectorAll(".sb-c-row")[0].classList.contains("on")).toBe(true);
+    expect(Number(root.querySelectorAll(".skm-live-n")[0].textContent)).toBeGreaterThan(0);
+  } finally {
+    if (prevStyle) Object.defineProperty(globalThis, "HTMLStyleElement", prevStyle);
+    else delete globalThis.HTMLStyleElement;
+    cleanupDom();
+  }
+});
+
+test("regression: disabling overlapping global bundle refuses with toast when excluded project file is unreadable", async () => {
+  const proj = `${home}/work/proj-a`;
+  fs.mkdirSync(real(proj), { recursive: true });
+  put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [
+      { id: "g", name: "G", enabled: true, skills: ["alpha"], excludedProjects: [proj] },
+      { id: "h", name: "H", enabled: true, skills: ["alpha"] },
+    ],
+    overrides: {},
+  }))));
+
+  const h = fakeHost();
+  const origRead = h.readFile;
+  h.readFile = async (p) => {
+    if (p.includes("proj-a") && p.endsWith(".opencode/opencode.json")) {
+      throw new HostRequestError("DENIED", "permission denied");
+    }
+    return origRead(p);
+  };
+  io.setHost(h);
+  await io.load();
+
+  let ok;
+  await io.enqueue(async () => {
+    ok = await io.applyChange((s) => core.setBundleGlobal(s, "h", false));
+  });
+  await settle();
+  expect(ok).toBe(false);
+  expect(toasts.some((t) => t.kind === "error" && /permission denied|Saving failed/i.test(t.message))).toBe(true);
+  expect(io.S.state.bundles.find((b) => b.id === "h").enabled).toBe(true);
+});
+
+test("regression: save() does not poison configStamps for unassigned activeDir project file edited before save", async () => {
+  const proj = `${home}/work/proj-a`;
+  fs.mkdirSync(real(proj), { recursive: true });
+  put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+    version: 1,
+    bundles: [{ id: "b", name: "B", enabled: true, skills: ["alpha", "beta"] }],
+    overrides: {},
+  }))));
+  await io.load();
+  io.S.activeDir = proj;
+
+  // Externally deny * in unassigned activeDir's project opencode.json
+  const pFile = `${proj}/.opencode/opencode.json`;
+  put(pFile, JSON.stringify({ permissions: [{ action: "skill", resource: "*", effect: "deny" }] }, null, 2) + "\n");
+  const future = new Date(Date.now() + 5000);
+  fs.utimesSync(real(pFile), future, future);
+
+  // Rename bundle b (triggers save() which does NOT read unassigned proj)
+  io.commit((s) => core.renameBundle(s, "b", "B Renamed"));
+  await settle();
+
+  // checkDisk() must still detect the external edit to proj/.opencode/opencode.json
+  expect(await io.checkDisk()).toBe(true);
+  const normProj = io.activeProjectDir();
+  const projCfg = core.projectConfigPath(normProj);
+  expect(counts.countsFromState(io.S.state, io.S.allIds, io.S.opencodeText, {
+    projectDir: proj,
+    home: io.effectiveHome(),
+    projectOpencodeText: io.S.projectTexts[projCfg],
+  }).live).toBe(0);
+});
+
+test("regression: missing or empty {} project opencode.json reports 0 live for project-only bundle", async () => {
+  const cleanupDom = installMenuDom();
+  const prevStyle = Object.getOwnPropertyDescriptor(globalThis, "HTMLStyleElement");
+  try {
+    const proj = `${home}/work/proj-a`;
+    fs.mkdirSync(real(proj), { recursive: true });
+    put(core.BUNDLES_PATH, core.serializeBundles(core.parseBundles(JSON.stringify({
+      version: 1,
+      bundles: [{ id: "b", name: "B", enabled: false, skills: ["alpha", "beta"] }],
+      overrides: {},
+    }))));
+    await io.load();
+    io.S.activeDir = proj;
+
+    const NodeProto = globalThis.HTMLElement.prototype;
+    const origQsa = NodeProto.querySelectorAll;
+    NodeProto.querySelectorAll = function (sel) {
+      const out = origQsa.call(this, sel);
+      if (out.length) return out;
+      const walk = (n, pred) => {
+        for (const c of n.children) {
+          if (pred(c)) out.push(c);
+          walk(c, pred);
+        }
+      };
+      if (sel === ".skm-live-n") walk(this, (el) => el.classList.contains("skm-live-n"));
+      return out;
+    };
+    globalThis.HTMLStyleElement = class extends globalThis.HTMLElement {};
+    globalThis.document.hasFocus = () => true;
+    globalThis.document.getElementById = () => null;
+    globalThis.document.head = globalThis.document.createElement("head");
+    globalThis.document.documentElement = globalThis.document.createElement("html");
+
+    const compactMod = await import("../panel/compact.ts");
+    const root = globalThis.document.createElement("div");
+    globalThis.document.body.appendChild(root);
+
+    // Enable project-only bundle b in proj (live = 2)
+    io.toggleBundleInScope("b", true);
+    await settle();
+    expect((await counts.readCounts(fx.host, { projectDir: proj, home })).live).toBe(2);
+
+    // Externally delete <proj>/.opencode/opencode.json -> 0 live
+    const pFile = `${proj}/.opencode/opencode.json`;
+    fs.unlinkSync(real(pFile));
+    expect(await io.checkDisk()).toBe(true);
+    expect((await counts.readCounts(fx.host, { projectDir: proj, home })).live).toBe(0);
+    compactMod.renderCompact(root);
+    expect(root.querySelectorAll(".skm-live-n")[0].textContent).toBe("0");
+
+    // Externally write '{}' -> 0 live
+    put(pFile, "{}\n");
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(real(pFile), future, future);
+    expect(await io.checkDisk()).toBe(true);
+    expect((await counts.readCounts(fx.host, { projectDir: proj, home })).live).toBe(0);
+    compactMod.renderCompact(root);
+    expect(root.querySelectorAll(".skm-live-n")[0].textContent).toBe("0");
+  } finally {
+    if (prevStyle) Object.defineProperty(globalThis, "HTMLStyleElement", prevStyle);
+    else delete globalThis.HTMLStyleElement;
     cleanupDom();
   }
 });

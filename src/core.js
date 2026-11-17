@@ -62,6 +62,8 @@ export function parseBundles(text, { home } = {}) {
     const out = { id: b.id, name: b.name || b.id, enabled: b.enabled === true, skills: uniq(skills) };
     const projects = parseDirList(b.projects, `${where}.projects`, home);
     if (projects) out.projects = projects;
+    const excludedProjects = parseDirList(b.excludedProjects, `${where}.excludedProjects`, home);
+    if (excludedProjects) out.excludedProjects = excludedProjects;
     return out;
   });
   const ov = raw.overrides ?? {};
@@ -85,6 +87,7 @@ export function serializeBundles(state) {
     bundles: state.bundles.map((b) => {
       const o = { id: b.id, name: b.name, enabled: !!b.enabled, skills: [...b.skills] };
       if (b.projects?.length) o.projects = dirList(b.projects);
+      if (b.excludedProjects?.length) o.excludedProjects = dirList(b.excludedProjects);
       return o;
     }),
     overrides: copyOverrides(state.overrides),
@@ -198,18 +201,37 @@ export function looksBinary(text) {
   return text.includes("\uFFFD") || text.includes("\0");
 }
 
-export function effectiveMode(state, id) {
+export function effectiveMode(state, id, opts) {
   const ov = hasOwn(state.overrides, id) && MODES.includes(state.overrides[id]) ? state.overrides[id] : undefined;
-  let mode = ov ?? (state.bundles.some((b) => b.enabled && b.skills.includes(id)) ? "auto" : "off");
+  let d = null;
+  if (opts?.projectDir && !isChatsDir(opts.projectDir)) {
+    try {
+      const norm = normalizeDir(opts.projectDir, opts.home);
+      if (norm !== "~" && norm !== "/") d = norm;
+    } catch {
+      d = null;
+    }
+  }
+  let mode;
+  if (ov !== undefined) {
+    mode = ov;
+  } else if (d !== null) {
+    const matchDir = (list) => (list ?? []).some((x) => normalizeDir(x, opts?.home) === d);
+    mode = state.bundles.some(
+      (b) => b.skills.includes(id) && (matchDir(b.projects) || (b.enabled && !matchDir(b.excludedProjects))),
+    ) ? "auto" : "off";
+  } else {
+    mode = state.bundles.some((b) => b.enabled && b.skills.includes(id)) ? "auto" : "off";
+  }
   if (mode === "called" && isBuiltin(id)) mode = "auto";
   return mode;
 }
 
 // Counts over allIds; `chars` estimates prompt size (only auto skills are advertised).
-export function summary(state, allIds) {
+export function summary(state, allIds, opts) {
   let auto = 0, called = 0;
   for (const id of allIds) {
-    const m = effectiveMode(state, id);
+    const m = effectiveMode(state, id, opts);
     if (m === "auto") auto++;
     else if (m === "called") called++;
   }
@@ -220,7 +242,14 @@ export function groups(state, allIds) {
   const inAny = new Set(state.bundles.flatMap((b) => b.skills));
   const unbundled = uniq(allIds.filter((id) => !inAny.has(id))).sort();
   return [
-    ...state.bundles.map((b) => ({ id: b.id, name: b.name, enabled: b.enabled, skills: [...b.skills] })),
+    ...state.bundles.map((b) => ({
+      id: b.id,
+      name: b.name,
+      enabled: b.enabled,
+      skills: [...b.skills],
+      ...(b.projects?.length ? { projects: [...b.projects] } : {}),
+      ...(b.excludedProjects?.length ? { excludedProjects: [...b.excludedProjects] } : {}),
+    })),
     { id: UNBUNDLED_ID, name: "Unbundled", enabled: false, skills: unbundled, synthetic: true },
   ];
 }
@@ -238,9 +267,27 @@ const mapBundle = (state, id, fn) => ({
 
 export function setBundleEnabled(state, bundleId, on) {
   const b = requireBundle(state, bundleId);
+  const flag = !!on;
   const overrides = copyOverrides(state.overrides);
   for (const s of b.skills) delete overrides[s];
-  return { ...mapBundle(state, bundleId, (x) => ({ ...x, enabled: !!on })), overrides };
+  return {
+    ...mapBundle(state, bundleId, (x) => {
+      const next = { ...x, enabled: flag };
+      if (!flag) delete next.excludedProjects;
+      return next;
+    }),
+    overrides,
+  };
+}
+
+export function setBundleGlobal(state, bundleId, on) {
+  requireBundle(state, bundleId);
+  const flag = !!on;
+  return mapBundle(state, bundleId, (x) => {
+    const next = { ...x, enabled: flag };
+    if (!flag) delete next.excludedProjects;
+    return next;
+  });
 }
 
 export function setOverride(state, id, mode) {
@@ -493,16 +540,19 @@ export function planChange(prev, next, allIds, projectTexts, { home } = {}) {
   for (const dir of projectTargets(next)) {
     if (!hasOwn(ptexts, dir)) throw tag(new Error(`project file for ${dir} was not read`), "project", dir);
     const before = ptexts[dir];
+    const { allowIds, denyIds } = projectRuleSet(next, dir);
     let after;
     try {
-      after = applyProjectPermissions(before, projectSkills(next, dir));
+      after = applyProjectPermissions(before, allowIds, { denyIds });
     } catch (e) {
       throw tag(new Error(`${projectConfigPath(dir)}: ${e.message}`), "project", dir);
     }
     if (after !== null && after !== before) {
       writes.push({ kind: "project", dir, path: projectConfigPath(dir), before, after });
     }
-    const inBundle = next.bundles.some((b) => (b.projects ?? []).includes(dir));
+    const inBundle = (allowIds.length > 0 || denyIds.length > 0) && next.bundles.some(
+      (b) => (b.projects ?? []).includes(dir) || (b.excludedProjects ?? []).includes(dir),
+    );
     if (inBundle && after !== null) managed.add(dir);
     else if (!inBundle) managed.delete(dir); // rules removed by this plan (or none were there)
   }
@@ -573,19 +623,31 @@ const withProjects = (b, dirs) => {
   return dirs.length ? { ...rest, projects: dirs } : rest;
 };
 
+const withExcluded = (b, dirs) => {
+  const { excludedProjects, ...rest } = b;
+  return dirs.length ? { ...rest, excludedProjects: dirs } : rest;
+};
+
+const isBundleActiveInDir = (b, d) => (b.projects ?? []).includes(d) || (b.enabled && !(b.excludedProjects ?? []).includes(d));
+
 /**
- * Every bundle's projects and managedProjects in canonical spelling (aliases merged, deduped).
+ * Every bundle's projects, excludedProjects and managedProjects in canonical spelling (aliases merged, deduped).
  * Returns `state` itself when nothing changes.
  */
 export function canonicalizeProjects(state, { home } = {}) {
   let changed = false;
   const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
   const bundles = state.bundles.map((b) => {
-    if (!b.projects) return b;
-    const list = dirList(b.projects, home);
-    if (same(list, b.projects)) return b;
-    changed = true;
-    return withProjects(b, list);
+    let cur = b;
+    if (cur.projects) {
+      const list = dirList(cur.projects, home);
+      if (!same(list, cur.projects)) { changed = true; cur = withProjects(cur, list); }
+    }
+    if (cur.excludedProjects) {
+      const list = dirList(cur.excludedProjects, home);
+      if (!same(list, cur.excludedProjects)) { changed = true; cur = withExcluded(cur, list); }
+    }
+    return cur;
   });
   let managed = state.managedProjects;
   if (managed) {
@@ -605,7 +667,12 @@ export function canonicalizeProjects(state, { home } = {}) {
  */
 export function mergeProjectDirs(state, aliases) {
   const to = (d) => (hasOwn(aliases, d) ? aliases[d] : d);
-  const bundles = state.bundles.map((b) => (b.projects ? withProjects(b, uniq(b.projects.map(to)).sort()) : b));
+  const bundles = state.bundles.map((b) => {
+    let cur = b;
+    if (cur.projects) cur = withProjects(cur, uniq(cur.projects.map(to)).sort());
+    if (cur.excludedProjects) cur = withExcluded(cur, uniq(cur.excludedProjects.map(to)).sort());
+    return cur;
+  });
   const out = { ...state, bundles };
   if (state.managedProjects) {
     const m = uniq(state.managedProjects.map(to)).sort();
@@ -623,7 +690,10 @@ export function setBundleProjects(state, bundleId, dirs, { home } = {}) {
 
 export function addBundleProject(state, bundleId, dir, opts = {}) {
   const b = requireBundle(state, bundleId);
-  return setBundleProjects(state, bundleId, [...(b.projects ?? []), dir], opts);
+  const d = normalizeDir(dir, opts.home);
+  const projects = dirList([...(b.projects ?? []), d], opts.home);
+  const excluded = dirList((b.excludedProjects ?? []).filter((x) => normalizeDir(x, opts.home) !== d), opts.home);
+  return mapBundle(state, bundleId, (x) => withExcluded(withProjects(x, projects), excluded));
 }
 
 export function removeBundleProject(state, bundleId, dir, opts = {}) {
@@ -632,33 +702,84 @@ export function removeBundleProject(state, bundleId, dir, opts = {}) {
   return setBundleProjects(state, bundleId, (b.projects ?? []).filter((x) => normalizeDir(x, opts.home) !== d), opts);
 }
 
+export function excludeBundleProject(state, bundleId, dir, opts = {}) {
+  const b = requireBundle(state, bundleId);
+  const d = normalizeDir(dir, opts.home);
+  const projects = dirList((b.projects ?? []).filter((x) => normalizeDir(x, opts.home) !== d), opts.home);
+  const excluded = b.enabled ? dirList([...(b.excludedProjects ?? []), d], opts.home) : [];
+  return mapBundle(state, bundleId, (x) => withExcluded(withProjects(x, projects), excluded));
+}
+
+export function includeBundleProject(state, bundleId, dir, opts = {}) {
+  const b = requireBundle(state, bundleId);
+  const d = normalizeDir(dir, opts.home);
+  const excluded = dirList((b.excludedProjects ?? []).filter((x) => normalizeDir(x, opts.home) !== d), opts.home);
+  const projects = b.enabled ? dirList(b.projects ?? [], opts.home) : dirList([...(b.projects ?? []), d], opts.home);
+  return mapBundle(state, bundleId, (x) => withExcluded(withProjects(x, projects), excluded));
+}
+
 /** Canonical project dirs where `skillId` is allowed (via any bundle that lists the dir), sorted. */
 export function projectsFor(state, skillId, opts = {}) {
+  if (hasOwn(state.overrides, skillId) && state.overrides[skillId] === "off") return [];
   const s = canonicalizeProjects(state, opts);
   return uniq(s.bundles.filter((b) => b.skills.includes(skillId)).flatMap((b) => b.projects ?? [])).sort();
 }
 
 /** Skill ids allowed in canonical `dir`, sorted (state must already be canonical). */
 function projectSkills(state, dir) {
-  return uniq(state.bundles.filter((b) => (b.projects ?? []).includes(dir)).flatMap((b) => b.skills)).sort();
+  return uniq(
+    state.bundles
+      .filter((b) => (b.projects ?? []).includes(dir))
+      .flatMap((b) => b.skills)
+      .filter((id) => !(hasOwn(state.overrides, id) && state.overrides[id] === "off")),
+  ).sort();
 }
 
-/** Canonical dirs whose project file must be (re)written: bundle projects ∪ managedProjects. Sorted. */
+/** Skill ids explicitly denied in canonical `dir` because every global bundle holding them excludes `dir`. */
+function projectDenySkills(state, dir) {
+  const candidateIds = uniq(
+    state.bundles
+      .filter((b) => b.enabled && (b.excludedProjects ?? []).includes(dir))
+      .flatMap((b) => b.skills),
+  );
+  return candidateIds.filter((id) => {
+    if (hasOwn(state.overrides, id)) return false;
+    if (effectiveMode(state, id) === "off") return false;
+    return !state.bundles.some((b) => b.skills.includes(id) && isBundleActiveInDir(b, dir));
+  }).sort();
+}
+
+/** Exact sorted allow and deny skill ids for `dir` (canonicalized with `opts.home`). */
+export function projectRuleSet(state, dir, opts = {}) {
+  const s = canonicalizeProjects(state, opts);
+  const d = normalizeDir(dir, opts.home);
+  return {
+    allowIds: projectSkills(s, d),
+    denyIds: projectDenySkills(s, d),
+  };
+}
+
+/** Canonical dirs whose project file must be (re)written: bundle projects ∪ excludedProjects ∪ managedProjects. Sorted. */
 export function projectTargets(state, opts = {}) {
   const s = canonicalizeProjects(state, opts);
-  return uniq([...s.bundles.flatMap((b) => b.projects ?? []), ...(s.managedProjects ?? [])]).sort();
+  return uniq([
+    ...s.bundles.flatMap((b) => b.projects ?? []),
+    ...s.bundles.flatMap((b) => b.excludedProjects ?? []),
+    ...(s.managedProjects ?? []),
+  ]).sort();
 }
 
 const NEW_PROJECT_FILE = (rules) => JSON.stringify({ $schema: "https://opencode.ai/config.json", permissions: rules }, null, 2) + "\n";
 
 /**
- * Pure: project opencode.json text with its skill rules replaced by one allow per id (no deny).
+ * Pure: project opencode.json text with its skill rules replaced by denies then allows.
  * null text = file missing; returns null when there is nothing to write.
  */
-export function applyProjectPermissions(text, skillIds) {
-  const ids = uniq(skillIds).sort();
-  const allows = ids.map((id) => ({ action: "skill", resource: id, effect: "allow" }));
-  if (text === null || text === undefined) return allows.length ? NEW_PROJECT_FILE(allows) : null;
+export function applyProjectPermissions(text, skillIds, { denyIds = [] } = {}) {
+  const denies = uniq(denyIds).sort().map((id) => ({ action: "skill", resource: id, effect: "deny" }));
+  const allows = uniq(skillIds).sort().map((id) => ({ action: "skill", resource: id, effect: "allow" }));
+  const rules = [...denies, ...allows];
+  if (text === null || text === undefined) return rules.length ? NEW_PROJECT_FILE(rules) : null;
   let cfg;
   try {
     cfg = JSON.parse(text);
@@ -671,8 +792,8 @@ export function applyProjectPermissions(text, skillIds) {
   }
   const existing = cfg.permissions ?? [];
   const hadSkill = existing.some((r) => r && r.action === "skill");
-  if (!allows.length && !hadSkill) return text; // nothing of ours to remove
-  // Keep non-skill entries byte-for-byte; only our allows are freshly rendered.
-  return spliceTopLevelArray(text, "permissions", { keep: (r) => !(r && r.action === "skill"), add: allows, label: "opencode.json" });
+  if (!rules.length && !hadSkill) return text; // nothing of ours to remove
+  // Keep non-skill entries byte-for-byte; only our rules are freshly rendered.
+  return spliceTopLevelArray(text, "permissions", { keep: (r) => !(r && r.action === "skill"), add: rules, label: "opencode.json" });
 }
 

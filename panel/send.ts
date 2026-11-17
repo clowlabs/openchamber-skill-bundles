@@ -169,7 +169,7 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
   let altDown = altAtOpen;
   let filter = '';
   let busy = false;
-  let confirmFor: string | null = null;
+  let confirmPending: { pid: string; move: boolean } | null = null;
   const dup = () => altDown;
   let staleFiles: string[] | null = []; // null = listing failed
 
@@ -182,6 +182,12 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
     onClose: () => { unwatch(); if (repaintOpen === paint) repaintOpen = null; },
   });
   const { menu, title, list, foot } = pop;
+  menu.addEventListener('pointermove', (e) => {
+    if (e.altKey !== altDown) {
+      altDown = e.altKey;
+      paint();
+    }
+  });
 
   const paintTitle = () => {
     title.textContent = `${dup() ? 'Duplicate' : 'Move'} ${id} to…`;
@@ -190,19 +196,18 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
     for (const b of list.querySelectorAll<HTMLElement>('.sb-ctx-icon')) b.textContent = dup() ? '⧉' : '→';
   };
 
-  const activateBundle = (to: string, alt: boolean) => {
+  const activateBundle = (to: string, copy: boolean) => {
     const bundleBlocked = (deps.bundleBlockedReason ?? defaultBundleBlocked)(id);
     if (busy || bundleBlocked) return;
-    const copy = Boolean(alt || dup());
     pop.close();
     const run = deps.moveToBundle ?? ((skillId, target, src, cp) => commit((s) => moveSkillToBundle(s, skillId, target, src, cp), undefined, { label: cp ? 'duplicate skill' : 'move skill' }));
     run(id, to, from, copy);
   };
 
-  const activate = async (p: Project, alt: boolean, overwrite = false) => {
+  const activate = async (p: Project, copy: boolean, overwrite = false) => {
     const blocked = deps.blockedReason(id);
     if (busy || blocked) return;
-    const move = !(alt || dup());
+    const move = !copy;
     busy = true;
     paint();
     try {
@@ -222,7 +227,7 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
           console.warn('skill-bundles: could not list existing files', e);
         }
         busy = false;
-        confirmFor = p.id;
+        confirmPending = { pid: p.id, move };
         paint();
         menu.querySelector<HTMLButtonElement>('.sb-ctx-confirm button')?.focus();
         return;
@@ -272,8 +277,14 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
         item.append(icon, name, meta);
         item.title = bundleBlocked ?? (b.synthetic ? 'Remove from bundle' : b.name);
         if (bundleBlocked || busy) { item.disabled = true; item.setAttribute('aria-disabled', 'true'); }
-        item.addEventListener('click', (e) => activateBundle(b.id, e.altKey));
-        item.addEventListener('dblclick', (e) => activateBundle(b.id, e.altKey));
+        item.addEventListener('click', (e) => {
+          const useAlt = e.detail > 0 ? e.altKey : Boolean(e.altKey || dup());
+          activateBundle(b.id, useAlt);
+        });
+        item.addEventListener('dblclick', (e) => {
+          const useAlt = e.detail > 0 ? e.altKey : Boolean(e.altKey || dup());
+          activateBundle(b.id, useAlt);
+        });
         list.appendChild(item);
       }
     }
@@ -290,7 +301,8 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
       list.appendChild(note(q && allBundles.length && status === 'No matching projects' ? 'No matching bundles or projects' : status));
     }
     for (const p of shown) {
-      if (confirmFor === p.id) {
+      if (confirmPending?.pid === p.id) {
+        const pendingMove = confirmPending.move;
         const c = document.createElement('div');
         c.className = 'sb-ctx-confirm';
         c.setAttribute('role', 'group');
@@ -312,8 +324,11 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
         const no = button('Cancel', 'sb-ctx-btn');
         yes.dataset.confirm = 'yes';
         no.dataset.confirm = 'no';
-        yes.addEventListener('click', (e) => { confirmFor = null; void activate(p, e.altKey, true); });
-        no.addEventListener('click', () => { confirmFor = null; paint(); focusProject(p.id); });
+        yes.addEventListener('click', () => {
+          confirmPending = null;
+          void activate(p, !pendingMove, true);
+        });
+        no.addEventListener('click', () => { confirmPending = null; paint(); focusProject(p.id); });
         c.append(yes, no);
         list.appendChild(c);
         continue;
@@ -334,8 +349,14 @@ export function openSendMenu(id: string, x: number, y: number, altAtOpen: boolea
       b.append(icon, name, dir);
       b.title = blocked ?? p.directory;
       if (blocked || busy) { b.disabled = true; b.setAttribute('aria-disabled', 'true'); }
-      b.addEventListener('click', (e) => void activate(p, e.altKey));
-      b.addEventListener('dblclick', (e) => void activate(p, e.altKey)); // guarded by `busy`/close
+      b.addEventListener('click', (e) => {
+        const useAlt = e.detail > 0 ? e.altKey : Boolean(e.altKey || dup());
+        void activate(p, useAlt);
+      });
+      b.addEventListener('dblclick', (e) => {
+        const useAlt = e.detail > 0 ? e.altKey : Boolean(e.altKey || dup());
+        void activate(p, useAlt);
+      }); // guarded by `busy`/close
       list.appendChild(b);
     }
     foot.textContent = bundleBlocked ?? (allBundles.length ? HINT : (blocked ?? HINT));

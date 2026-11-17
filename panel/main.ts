@@ -23,14 +23,25 @@ import { countsFromState, formatTokens, liveLine, livePct, TOKENS_TITLE, tokensO
 import { $, el, HAND_EDIT, MODE_LABEL, UNBUNDLED, type Disposable } from './dom';
 import { createEditGuard } from './edit-guard';
 import {
-  S, applyChange, bundlesOf, canUndo, commit, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, startSync, toastError, undo, undoDepth, undoLabel,
+  S, activeProjectDir, applyChange, bundlesOf, canUndo, checkDisk, commit, effectiveHome, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, startSync, toastError, undo, undoDepth, undoLabel,
 } from './io';
 import { connectHost } from '@openchamber/sdk';
 
 const host = connectHost();
 setHost(host);
 initPopup(host);
-setHomeSource(() => S.home);
+setHomeSource(() => effectiveHome());
+host.onDirectory((dir) => {
+  if (S.activeDir === dir) return;
+  S.activeDir = dir;
+  if (S.loaded) {
+    render();
+    const projDir = activeProjectDir();
+    if (projDir && !Object.hasOwn(S.projectTexts, core.projectConfigPath(projDir))) {
+      void checkDisk().catch(() => {});
+    }
+  }
+});
 
 /** View-only state. */
 const V = {
@@ -182,21 +193,42 @@ function renderGroup(g: Group, root: HTMLElement) {
     head.appendChild(el('span', 'sb-group-name', g.name));
     head.appendChild(el('span', 'sb-group-count', V.query ? `${visible.length}/${g.skills.length}` : `${g.skills.length}`));
     if (!g.synthetic) {
-      const n = g.projects?.length ?? 0;
-      if (n) {
+      const inc = g.projects ?? [];
+      const exc = g.excludedProjects ?? [];
+      const total = inc.length + exc.length;
+      if (total) {
         const badge = el('span');
         head.appendChild(badge);
-        const label = g.enabled ? `On · +${n} project${n > 1 ? 's' : ''}` : `Off · ${n} project${n > 1 ? 's' : ''}`;
-        badge.title = (g.projects ?? []).join('\n');
-        groupMounts.push(mountBadge(badge, { label, tone: g.enabled ? 'success' : 'info' }));
+        let label: string;
+        let tone: 'success' | 'info';
+        if (g.enabled && exc.length > 0) {
+          label = `On · except ${exc.length} project${exc.length > 1 ? 's' : ''}`;
+          tone = 'info';
+        } else {
+          label = g.enabled
+            ? `On · +${inc.length} project${inc.length > 1 ? 's' : ''}`
+            : `Off · ${inc.length} project${inc.length > 1 ? 's' : ''}`;
+          tone = g.enabled ? 'success' : 'info';
+        }
+        const tips: string[] = [];
+        if (inc.length) tips.push(...inc);
+        if (exc.length) tips.push(`Excluded:\n${exc.join('\n')}`);
+        badge.title = tips.join('\n');
+        groupMounts.push(mountBadge(badge, { label, tone }));
       }
       const pb = el('button', 'sb-proj-btn', 'Projects');
       pb.type = 'button';
       pb.setAttribute('aria-haspopup', 'dialog');
       pb.title = 'Turn this bundle on in specific projects';
-      if (n) pb.appendChild(el('span', 'sb-proj-count', String(n)));
+      if (total) pb.appendChild(el('span', 'sb-proj-count', String(total)));
       pb.addEventListener('click', () => { const r = pb.getBoundingClientRect(); openProjectsMenu(g.id, r.left, r.bottom, pb); });
       head.appendChild(pb);
+      head.addEventListener('click', (e) => {
+        if (!e.altKey) return;
+        if ((e.target as HTMLElement).closest('button, input, label, .sb-pill, .oc-sdk')) return;
+        e.preventDefault();
+        openProjectsMenu(g.id, e.clientX, e.clientY, pb);
+      });
       head.addEventListener('contextmenu', (e) => {
         if ((e.target as HTMLElement).closest('.sb-pill')) return;
         e.preventDefault();
@@ -377,7 +409,12 @@ function renderLight() {
 let compact = false;
 
 function render() {
-  if (compact) { renderCompact($('compact')); return; }
+  if (compact) {
+    renderCompact($('compact'));
+    refreshProjectsMenu();
+    refreshSendMenu();
+    return;
+  }
   if (isDragging()) { deferRender(); renderLight(); return; }
   editGuard.markRendered();
   const bundles = S.state?.bundles;
@@ -420,7 +457,15 @@ const editGuard = createEditGuard({
 
 hooks.render = render;
 hooks.renderLight = renderLight;
-hooks.onExternalSync = () => (compact ? renderCompact($('compact')) : editGuard.onExternalSync());
+hooks.onExternalSync = () => {
+  if (compact) {
+    renderCompact($('compact'));
+    refreshProjectsMenu();
+    refreshSendMenu();
+  } else {
+    editGuard.onExternalSync();
+  }
+};
 
 initDrag({
   canDrag: (id) => !fmError(id),

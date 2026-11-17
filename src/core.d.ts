@@ -7,6 +7,8 @@ export interface Bundle {
   skills: string[];
   /** v0.2: normalized project dirs (absolute or "~/…"), sorted; absent when none. */
   projects?: string[];
+  /** Normalized project dirs excluded while enabled globally; absent when none. */
+  excludedProjects?: string[];
 }
 
 export interface State {
@@ -66,9 +68,14 @@ export const UNBUNDLED_ID: "__unbundled";
 export const MODES: Mode[];
 export const CHARS_PER_SKILL: 180;
 
+export interface ScopeOption {
+  projectDir?: string | null;
+  home?: string;
+}
+
 export function isBuiltin(id: string): boolean;
 export function backupName(date?: Date): string;
-export function summary(state: State, allIds: string[]): Summary;
+export function summary(state: State, allIds: string[], opts?: ScopeOption): Summary;
 
 export interface HomeOption {
   /** Absolute home dir. When given, project dirs under it are stored as "~/…". */
@@ -78,9 +85,10 @@ export interface HomeOption {
 /** With opts.home, stored project-dir aliases are migrated to canonical form and deduped. */
 export function parseBundles(text: string, opts?: HomeOption): State;
 export function serializeBundles(state: State): string;
-export function effectiveMode(state: State, id: string): Mode;
+export function effectiveMode(state: State, id: string, opts?: ScopeOption): Mode;
 export function groups(state: State, allIds: string[]): Group[];
 export function setBundleEnabled(state: State, bundleId: string, on: boolean): State;
+export function setBundleGlobal(state: State, bundleId: string, on: boolean): State;
 export function setOverride(state: State, id: string, mode: Mode | null): State;
 export function moveSkill(
   state: State,
@@ -212,13 +220,16 @@ export function setBundleProjects(state: State, bundleId: string, dirs: string[]
 export function addBundleProject(state: State, bundleId: string, dir: string, opts?: HomeOption): State;
 /** Removes the dir under any spelling that canonicalizes to the same dir. */
 export function removeBundleProject(state: State, bundleId: string, dir: string, opts?: HomeOption): State;
+export function excludeBundleProject(state: State, bundleId: string, dir: string, opts?: HomeOption): State;
+export function includeBundleProject(state: State, bundleId: string, dir: string, opts?: HomeOption): State;
 /** Canonical project dirs where the skill is allowed (through any bundle listing the dir), sorted. */
-export function projectsFor(state: State, skillId: string, opts?: HomeOption): string[];
-/** Canonical dirs whose project file must be read and planned: bundle projects ∪ managedProjects, sorted. */
+export function projectsFor(state: State, skillId: string, opts?: ScopeOption): string[];
+export function projectRuleSet(state: State, dir: string, opts?: HomeOption): { allowIds: string[]; denyIds: string[] };
+/** Canonical dirs whose project file must be read and planned: bundle projects ∪ excludedProjects ∪ managedProjects, sorted. */
 export function projectTargets(state: State, opts?: HomeOption): string[];
 /** All stored project dirs in canonical form, aliases merged. Returns `state` itself if already canonical. */
 export function canonicalizeProjects(state: State, opts?: HomeOption): State;
 /** Rename dirs per `aliases` (dir → dir to keep), e.g. after an adapter finds two are one folder. */
 export function mergeProjectDirs(state: State, aliases: Record<string, string>): State;
-/** Pure. Replaces only skill rules with one allow per id (no deny). null in + no ids → null out. */
-export function applyProjectPermissions(text: string | null, skillIds: string[]): string | null;
+/** Pure. Replaces only skill rules with denies then allows. null in + no rules → null out. */
+export function applyProjectPermissions(text: string | null, skillIds: string[], opts?: { denyIds?: string[] }): string | null;

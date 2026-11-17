@@ -4,10 +4,32 @@
 import { connectHost } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
 import { errText } from '../shared/panel/host';
+import { homeFromDirs } from '../shared/panel/projects';
 import { listenChanges } from '../panel/sync';
 import { createStatusRefresher, readCounts, renderMeterHeader, type SkillCounts } from './counts';
 
 const host = connectHost();
+let currentDir: string | null = null;
+let home: string | undefined;
+let homeDerived = false;
+let mounted = false;
+
+async function deriveHome() {
+  if (homeDerived) return;
+  try {
+    const snap = await host.listProjects();
+    home = homeFromDirs(snap.projects.map((p) => p.directory));
+    homeDerived = snap.state === 'ready' || home != null;
+  } catch {
+    // best-effort: status works without listProjects permission
+  }
+}
+
+host.onDirectory((dir) => {
+  if (currentDir === dir) return;
+  currentDir = dir;
+  if (mounted) void refresh();
+});
 const REFRESH_MS = 30_000;
 const $ = (id: string) => document.getElementById(id)!;
 const fit = () => void host.setHeight(Math.ceil(document.body.scrollHeight));
@@ -28,7 +50,10 @@ function paint(c: SkillCounts) {
 }
 
 const refresh = createStatusRefresher(
-  () => readCounts(host),
+  async () => {
+    await deriveHome();
+    return readCounts(host, { projectDir: currentDir, home });
+  },
   paint,
   (e) => {
     $('head').replaceChildren(
@@ -45,7 +70,6 @@ const openPanel = () => {
   });
 };
 
-let mounted = false;
 host.onReady((ctx) => {
   applyHostReady(ctx, document.documentElement);
   if (mounted) return;

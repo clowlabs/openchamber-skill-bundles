@@ -25,6 +25,8 @@ export function setHost(h: HostClient) {
   queuedSync = null;
   deferredSync = null;
   clearLockRetry();
+  S.activeDir = null;
+  S.projectTexts = Object.create(null);
   host = h;
   lock = createPanelLock({
     host: h,
@@ -68,6 +70,10 @@ export const S = {
   descDraft: null as { id: string; value: string } | null,
   /** Bundle ids created in this session (newest first) so pickers surface them first. */
   createdBundles: [] as string[],
+  /** Active project directory from host.onDirectory, or null. */
+  activeDir: null as string | null,
+  /** Last read `<dir>/.opencode/opencode.json` contents keyed by config path. */
+  projectTexts: Object.create(null) as Record<string, string | null>,
 };
 
 export function noteCreatedBundle(id: string) {
@@ -95,11 +101,42 @@ export const hooks = {
   onExternalSync: () => hooks.render(),
 };
 
+/** Effective home dir: derived from projects, or inferred from S.activeDir. */
+export const effectiveHome = (): string | undefined =>
+  S.home ?? (S.activeDir ? homeFromDirs([S.activeDir]) : undefined);
+
 /** `{ home }` for every core call that takes it. */
-export const homeOpt = () => (S.home ? { home: S.home } : {});
+export const homeOpt = () => {
+  const h = effectiveHome();
+  return h ? { home: h } : {};
+};
 
 /** Home dir from OpenChamber's project dirs (see shared/panel/projects). */
 export const homeFromDirs = (dirs: string[]) => sharedHomeFromDirs(dirs);
+
+export function sameProjectDir(a: string, b: string): boolean {
+  try {
+    return core.normalizeProjectDir(a, homeOpt()) === core.normalizeProjectDir(b, homeOpt());
+  } catch {
+    return a === b;
+  }
+}
+
+export function activeProjectDir(): string | null {
+  if (!S.activeDir || core.isChatsDir(S.activeDir)) return null;
+  try {
+    const d = core.normalizeProjectDir(S.activeDir, homeOpt());
+    return d === '~' || d === '/' ? null : d;
+  } catch {
+    return null;
+  }
+}
+
+export function isBundleOnInScope(b: Bundle, projDir = activeProjectDir()): boolean {
+  if (!projDir) return b.enabled;
+  if ((b.projects ?? []).some((d) => sameProjectDir(d, projDir))) return true;
+  return b.enabled && !(b.excludedProjects ?? []).some((d) => sameProjectDir(d, projDir));
+}
 
 async function deriveHome() {
   if (S.homeDerived) return;
@@ -228,8 +265,14 @@ const statStamp = (p: string): Promise<string> =>
     (e) => `err:${errorCode(e) || 'ERR'}`,
   );
 
-function configStampPaths(opencodeText: string | null): string[] {
-  return [core.BUNDLES_PATH, core.OPENCODE_PATH, core.LOCK_PATH, ...skillRoots(opencodeText)];
+function projectConfigPaths(state: State | null, activeDir = activeProjectDir()): string[] {
+  const dirs = new Set<string>(state ? core.projectTargets(state, homeOpt()) : []);
+  if (activeDir) dirs.add(activeDir);
+  return [...dirs].sort().map(core.projectConfigPath);
+}
+
+function configStampPaths(opencodeText: string | null, state: State | null = S.state, activeDir = activeProjectDir()): string[] {
+  return [core.BUNDLES_PATH, core.OPENCODE_PATH, core.LOCK_PATH, ...skillRoots(opencodeText), ...projectConfigPaths(state, activeDir)];
 }
 
 async function readStampsMap(paths: readonly string[]): Promise<Record<string, string>> {
@@ -241,8 +284,27 @@ async function readStampsMap(paths: readonly string[]): Promise<Record<string, s
   return out;
 }
 
-function computeConfigStamp(opencodeText: string | null, stamps: Record<string, string>): string {
-  return configStampPaths(opencodeText).map((p) => `${p}=${stamps[p] ?? ''}`).join('|');
+async function readProjectTextsSafe(paths: readonly string[]): Promise<Record<string, string | null>> {
+  const out: Record<string, string | null> = Object.create(null);
+  await pool([...new Set(paths)], 8, async (p) => {
+    try {
+      out[p] = await readOptional(p);
+    } catch (e) {
+      const code = errorCode(e);
+      if (code !== 'DENIED' && code !== 'BAD_PATH' && code !== 'FILE_TOO_LARGE') throw e;
+      // Leave `p` omitted (undefined) to distinguish unreadable from missing-on-disk (null).
+    }
+  });
+  return out;
+}
+
+function computeConfigStamp(
+  opencodeText: string | null,
+  stamps: Record<string, string>,
+  state: State | null = S.state,
+  activeDir = activeProjectDir(),
+): string {
+  return configStampPaths(opencodeText, state, activeDir).map((p) => `${p}=${stamps[p] ?? ''}`).join('|');
 }
 
 function computeSkillsStamp(skillPaths: Record<string, string>, stamps: Record<string, string>): string {
@@ -255,16 +317,18 @@ function combineStamp(
   cfgStamps: Record<string, string>,
   skillPaths: Record<string, string>,
   skStamps: Record<string, string>,
+  state: State | null = S.state,
+  activeDir = activeProjectDir(),
 ): string {
-  return `${computeConfigStamp(opencodeText, cfgStamps)}||${computeSkillsStamp(skillPaths, skStamps)}`;
+  return `${computeConfigStamp(opencodeText, cfgStamps, state, activeDir)}||${computeSkillsStamp(skillPaths, skStamps)}`;
 }
 
 async function readDiskStamp(): Promise<string> {
   const [cfgStamps, freshSkillStamps] = await Promise.all([
-    readStampsMap(configStampPaths(S.opencodeText)),
+    readStampsMap(configStampPaths(S.opencodeText, S.state)),
     readStampsMap(Object.values(S.skillPaths).sort()),
   ]);
-  return combineStamp(S.opencodeText, cfgStamps, S.skillPaths, freshSkillStamps);
+  return combineStamp(S.opencodeText, cfgStamps, S.skillPaths, freshSkillStamps, S.state);
 }
 
 async function readReleasedLockStamp(): Promise<string> {
@@ -321,6 +385,10 @@ export async function load() {
       unreadable.push(id);
     }
   });
+  const nextState = bundlesText == null ? null : core.parseBundles(bundlesText, homeOpt());
+  const projPaths = projectConfigPaths(nextState);
+  const preProjStamps = await readStampsMap(projPaths);
+  const projTexts = await readProjectTextsSafe(projPaths);
   S.allIds = allIds;
   S.skillRefs = skills;
   S.skillPaths = skillPaths;
@@ -331,13 +399,14 @@ export async function load() {
   fm.clear();
   S.opencodeText = opencodeText;
   S.bundlesText = bundlesText;
-  S.state = bundlesText == null ? null : core.parseBundles(bundlesText, homeOpt());
+  S.state = nextState;
+  S.projectTexts = projTexts;
   S.loaded = true;
   if (myGen === gen) {
     try {
       const [held, postConfigStamps, postSkillStamps] = await Promise.all([
         isLockHeld(),
-        readStampsMap(configStampPaths(opencodeText)),
+        readStampsMap(configStampPaths(opencodeText, nextState)),
         readStampsMap(sortedSkillPaths),
       ]);
       if (myGen === gen) {
@@ -354,10 +423,11 @@ export async function load() {
         const cfgStable =
           !held &&
           [core.BUNDLES_PATH, core.OPENCODE_PATH, core.LOCK_PATH].every((p) => preConfigStamps[p] === postConfigStamps[p]) &&
-          roots.every((r) => preRootStamps[r] === postConfigStamps[r]);
+          roots.every((r) => preRootStamps[r] === postConfigStamps[r]) &&
+          projPaths.every((p) => preProjStamps[p] === postConfigStamps[p]);
         if (cfgStable && skillsStable) {
           configStamps = postConfigStamps;
-          lastDiskStamp = combineStamp(opencodeText, postConfigStamps, skillPaths, nextSkillStamps);
+          lastDiskStamp = combineStamp(opencodeText, postConfigStamps, skillPaths, nextSkillStamps, nextState);
         } else {
           configStamps = Object.create(null);
           lastDiskStamp = null;
@@ -407,25 +477,51 @@ async function refreshSkillMds(ids: string[]) {
   return changed;
 }
 
+function sameProjectRules(prev: State, next: State, dir: string, home?: string): boolean {
+  const hOpt = home ? { home } : {};
+  if (!core.projectTargets(prev, hOpt).includes(dir)) return false;
+  const a = core.projectRuleSet(prev, dir, hOpt);
+  const b = core.projectRuleSet(next, dir, hOpt);
+  return sameArr(a.allowIds, b.allowIds) && sameArr(a.denyIds, b.denyIds);
+}
+
 /** Text of `<dir>/.opencode/opencode.json` for every dir the next state touches (missing → null). */
-async function readProjectTexts(next: State): Promise<ProjectTexts> {
-  const out: ProjectTexts = {};
+async function readProjectTexts(next: State): Promise<{ texts: ProjectTexts; skippedUnreadable: Set<string> }> {
+  const texts: ProjectTexts = {};
+  const skippedUnreadable = new Set<string>();
+  const home = effectiveHome();
   await pool(core.projectTargets(next, homeOpt()), 8, async (dir) => {
-    out[dir] = await readOptional(core.projectConfigPath(dir));
+    try {
+      texts[dir] = await readOptional(core.projectConfigPath(dir));
+    } catch (e) {
+      const code = errorCode(e);
+      if (
+        (code === 'DENIED' || code === 'BAD_PATH' || code === 'FILE_TOO_LARGE') &&
+        S.state != null &&
+        sameProjectRules(S.state, next, dir, home)
+      ) {
+        texts[dir] = null;
+        skippedUnreadable.add(dir);
+        return;
+      }
+      throw e;
+    }
   });
-  return out;
+  return { texts, skippedUnreadable };
 }
 const sameTexts = (a: ProjectTexts, b: ProjectTexts) =>
   Object.keys(a).length === Object.keys(b).length && Object.keys(a).every((k) => k in b && a[k] === b[k]);
 
 async function save(next: State) {
   // Refuse early, before taking the lock (project files read now; re-read under the lock).
-  const projectTexts = await readProjectTexts(next);
+  const { texts: projectTexts, skippedUnreadable } = await readProjectTexts(next);
   const first = planFor(next, projectTexts);
-  const { writtenSkillIds, lockedCfgStamps, lockedSkillStamps } = await withLock(() => saveLocked(next, first, projectTexts));
+  const { writtenSkillIds, lockedCfgStamps, lockedSkillStamps } = await withLock(() =>
+    saveLocked(next, first, projectTexts, skippedUnreadable),
+  );
   try {
     const lockStamp = await readReleasedLockStamp();
-    configStamps = { ...lockedCfgStamps, [core.LOCK_PATH]: lockStamp };
+    configStamps = { ...configStamps, ...lockedCfgStamps, [core.LOCK_PATH]: lockStamp };
     for (const [p, st] of Object.entries(lockedSkillStamps)) skillFileStamps[p] = st;
     lastDiskStamp = combineStamp(S.opencodeText, configStamps, S.skillPaths, skillFileStamps);
   } catch {
@@ -435,9 +531,9 @@ async function save(next: State) {
 }
 
 // Order: core.PUBLISH_ORDER (SKILL.md, project files, opencode.json, skill-bundles.json last).
-async function saveLocked(next: State, first: ChangePlan, firstTexts: ProjectTexts) {
+async function saveLocked(next: State, first: ChangePlan, firstTexts: ProjectTexts, firstSkipped: Set<string>) {
   // Bundle files changed under us: abort and reload (the caller handles StaleError).
-  const [onDisk, bundlesOnDisk, projectTexts] = await Promise.all([
+  const [onDisk, bundlesOnDisk, { texts: projectTexts, skippedUnreadable }] = await Promise.all([
     host.readFile(core.OPENCODE_PATH), readOptional(core.BUNDLES_PATH), readProjectTexts(next),
   ]);
   if (onDisk.content !== S.opencodeText) throw new StaleError('opencode.json changed on disk');
@@ -445,12 +541,13 @@ async function saveLocked(next: State, first: ChangePlan, firstTexts: ProjectTex
 
   // SKILL.md and project-file changes merge: core only splices skill rules, so plan on the
   // text read under the lock.
-  let plan = sameTexts(firstTexts, projectTexts) ? first : planFor(next, projectTexts);
+  let plan = sameTexts(firstTexts, projectTexts) && firstSkipped.size === skippedUnreadable.size ? first : planFor(next, projectTexts);
   for (let i = 0; i < 5 && (await refreshSkillMds(skillIds(plan))); i++) plan = planFor(next, projectTexts);
 
   // plan.writes is in core.PUBLISH_ORDER. Project files are shared with the user: re-read and
   // merged right before writing, restored on failure only if still exactly what we wrote.
-  const writes: TxnWrite[] = plan.writes.map((w) => ({
+  const plannedWrites = plan.writes.filter((w) => !(w.kind === 'project' && w.dir && skippedUnreadable.has(w.dir)));
+  const writes: TxnWrite[] = plannedWrites.map((w) => ({
     path: w.path,
     before: w.before,
     after: w.after,
@@ -459,7 +556,10 @@ async function saveLocked(next: State, first: ChangePlan, firstTexts: ProjectTex
     } : {}),
     ...(w.kind === 'project' ? {
       shared: true,
-      merge: (fresh: string | null) => core.applyProjectPermissions(fresh, projectSkillIds(w.after)),
+      merge: (fresh: string | null) => {
+        const { allowIds, denyIds } = projectSkillRules(w.after);
+        return core.applyProjectPermissions(fresh, allowIds, { denyIds });
+      },
       neutralize: (wrote: string) => core.applyProjectPermissions(wrote, []),
     } : {}),
   }));
@@ -471,29 +571,45 @@ async function saveLocked(next: State, first: ChangePlan, firstTexts: ProjectTex
     }),
     onRestoreError: (path, r) => toastError(r, `Could not restore ${path}`),
   });
-  for (const w of plan.writes) {
+  const readOrWrittenProjectPaths: string[] = [];
+  const writtenByPath = new Map<string, string>();
+  for (const w of plannedWrites) {
     if (w.kind === 'skill' && w.id) setMd(w.id, w.after);
     else if (w.kind === 'opencode') S.opencodeText = w.after;
     else if (w.kind === 'bundles') S.bundlesText = w.after;
+    else if (w.kind === 'project') writtenByPath.set(w.path, w.after);
+  }
+  for (const dir of Object.keys(projectTexts)) {
+    if (skippedUnreadable.has(dir)) continue;
+    const p = core.projectConfigPath(dir);
+    S.projectTexts[p] = writtenByPath.has(p) ? (writtenByPath.get(p) ?? null) : projectTexts[dir];
+    readOrWrittenProjectPaths.push(p);
   }
   S.state = plan.state ?? next;
   toastSkipped(plan.skipped);
   const writtenSkillIds = skillIds(plan);
   const writtenPaths = [...new Set(writtenSkillIds.map((id) => skillPath(id)))];
   const [lockedCfgStamps, lockedSkillStamps] = await Promise.all([
-    readStampsMap([core.BUNDLES_PATH, core.OPENCODE_PATH, ...skillRoots(S.opencodeText)]),
+    readStampsMap([core.BUNDLES_PATH, core.OPENCODE_PATH, ...skillRoots(S.opencodeText), ...readOrWrittenProjectPaths]),
     readStampsMap(writtenPaths),
   ]);
   return { writtenSkillIds, lockedCfgStamps, lockedSkillStamps };
 }
 
-/** Skill ids allowed by a project file text we generated. */
-function projectSkillIds(text: string): string[] {
+/** Skill allow/deny ids from a project file text we generated. */
+function projectSkillRules(text: string): { allowIds: string[]; denyIds: string[] } {
   try {
-    const perms = (JSON.parse(text) as { permissions?: { action?: string; resource?: string }[] }).permissions ?? [];
-    return perms.filter((r) => r.action === 'skill' && typeof r.resource === 'string').map((r) => r.resource as string);
+    const perms = (JSON.parse(text) as { permissions?: { action?: string; resource?: string; effect?: string }[] }).permissions ?? [];
+    const allowIds: string[] = [];
+    const denyIds: string[] = [];
+    for (const r of perms) {
+      if (r.action !== 'skill' || typeof r.resource !== 'string') continue;
+      if (r.effect === 'deny') denyIds.push(r.resource);
+      else allowIds.push(r.resource);
+    }
+    return { allowIds, denyIds };
   } catch {
-    return [];
+    return { allowIds: [], denyIds: [] };
   }
 }
 
@@ -532,6 +648,30 @@ export function commit(fn: (s: State) => State, onAccepted?: () => void, opts?: 
 /** Turn a bundle on or off (flip when `on` is omitted) through the normal save path. */
 export function toggleBundle(bundleId: string, on?: boolean, onAccepted?: () => void) {
   commit((s) => flip(bundleId, on)(s), onAccepted, { label: 'toggle bundle' });
+}
+
+/** Turn a bundle on or off in the active project scope (or globally when no project is open). */
+export function toggleBundleInScope(bundleId: string, on?: boolean, onAccepted?: () => void) {
+  const projDir = activeProjectDir();
+  const home = effectiveHome();
+  const hOpt = home ? { home } : {};
+  commit((s) => {
+    const b = s.bundles.find((x) => x.id === bundleId);
+    if (!b) throw new Error(`Unknown bundle "${bundleId}"`);
+    if (projDir != null) {
+      const same = (d: string) => {
+        try { return core.normalizeProjectDir(d, hOpt) === projDir; } catch { return d === projDir; }
+      };
+      const curOn = (b.projects ?? []).some(same) || (b.enabled && !(b.excludedProjects ?? []).some(same));
+      const want = on ?? !curOn;
+      if (want) return core.includeBundleProject(s, bundleId, projDir, hOpt);
+      return b.enabled
+        ? core.excludeBundleProject(s, bundleId, projDir, hOpt)
+        : core.removeBundleProject(s, bundleId, projDir, hOpt);
+    }
+    const want = on ?? !b.enabled;
+    return core.setBundleGlobal(s, bundleId, want);
+  }, onAccepted, { label: 'toggle bundle' });
 }
 
 const flip = (bundleId: string, on?: boolean) => (s: State) => {
@@ -651,6 +791,12 @@ const sameRec = (a: Record<string, string>, b: Record<string, string>) => {
   return ak.length === bk.length && ak.every((k) => Object.hasOwn(b, k) && a[k] === b[k]);
 };
 
+const sameProjectConfigTexts = (a: Record<string, string | null>, b: Record<string, string | null>) => {
+  const ak = Object.keys(a);
+  const bk = Object.keys(b);
+  return ak.length === bk.length && ak.every((k) => Object.hasOwn(b, k) && a[k] === b[k]);
+};
+
 const sameUnreach = (a: readonly Unreachable[], b: readonly Unreachable[]) =>
   a.length === b.length && a.every((u, i) => u.path === b[i].path && u.code === b[i].code);
 
@@ -714,7 +860,7 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
   }
   if (myGen !== gen || !S.loaded || activeWrites > 0) return false;
 
-  const oldCfgPaths = configStampPaths(S.opencodeText);
+  const oldCfgPaths = configStampPaths(S.opencodeText, S.state);
   const preConfigStamps = await readStampsMap(oldCfgPaths);
   if (myGen !== gen || !S.loaded || activeWrites > 0) return false;
 
@@ -728,7 +874,8 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
     return false;
   }
 
-  const newCfgPaths = configStampPaths(opencodeText);
+  const nextState = bundlesText == null ? null : core.parseBundles(bundlesText, homeOpt());
+  const newCfgPaths = configStampPaths(opencodeText, nextState);
   const addedCfgPaths = newCfgPaths.filter((p) => !oldCfgPaths.includes(p));
   const preNewRootStamps = addedCfgPaths.length ? await readStampsMap(addedCfgPaths) : (Object.create(null) as Record<string, string>);
   if (myGen !== gen || !S.loaded) return false;
@@ -736,8 +883,12 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
     deferredSync = mergeSyncOpts(deferredSync, effectiveOpts);
     return false;
   }
-
-  const nextState = bundlesText == null ? null : core.parseBundles(bundlesText, homeOpt());
+  const nextProjectTexts = await readProjectTextsSafe(projectConfigPaths(nextState));
+  if (myGen !== gen || !S.loaded) return false;
+  if (activeWrites > 0) {
+    deferredSync = mergeSyncOpts(deferredSync, effectiveOpts);
+    return false;
+  }
   const needsFull =
     Boolean(effectiveOpts.full) ||
     JSON.stringify(skillRoots(opencodeText)) !== JSON.stringify(skillRoots(S.opencodeText)) ||
@@ -840,11 +991,13 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
   if (needsFull && postSkillStamps) {
     skillFileStamps = postSkillStamps;
   }
-  lastDiskStamp = combineStamp(opencodeText, configStamps, nextSkillPaths, skillFileStamps);
+  lastDiskStamp = combineStamp(opencodeText, configStamps, nextSkillPaths, skillFileStamps, nextState);
 
   const configChanged = opencodeText !== S.opencodeText || bundlesText !== S.bundlesText;
+  const projectChanged = !sameProjectConfigTexts(nextProjectTexts, S.projectTexts);
   const changed =
     configChanged ||
+    projectChanged ||
     !sameArr(nextAllIds, S.allIds) ||
     !sameRec(nextSkillPaths, S.skillPaths) ||
     nextIncomplete !== S.incomplete ||
@@ -872,6 +1025,7 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
   S.opencodeText = opencodeText;
   S.bundlesText = bundlesText;
   S.state = nextState;
+  S.projectTexts = nextProjectTexts;
 
   if (S.descDraft && prevMds[S.descDraft.id] !== S.skillMds[S.descDraft.id]) {
     if (S.skillMds[S.descDraft.id] != null && meta(S.descDraft.id).description === S.descDraft.value) {

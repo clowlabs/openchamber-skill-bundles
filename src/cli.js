@@ -273,7 +273,7 @@ function physicalDir(env, dir) {
 // the spelling listed first: stored spellings in bundle order, then managedProjects.
 function mergePhysicalAliases(env, state) {
   const order = [];
-  for (const d of [...state.bundles.flatMap((b) => b.projects ?? []), ...(state.managedProjects ?? [])]) {
+  for (const d of [...state.bundles.flatMap((b) => [...(b.projects ?? []), ...(b.excludedProjects ?? [])]), ...(state.managedProjects ?? [])]) {
     if (!order.includes(d)) order.push(d);
   }
   const first = new Map();
@@ -387,8 +387,13 @@ function need(pos, n, usage) {
 function bundleLine(g, state) {
   const on = g.skills.filter((id) => core.effectiveMode(state, id) !== "off").length;
   const flag = g.synthetic ? "   " : g.enabled ? "on " : "off";
-  const n = state.bundles.find((b) => b.id === g.id)?.projects?.length ?? 0;
-  const proj = n ? ` +${n} project${n === 1 ? "" : "s"}` : "";
+  const b = state.bundles.find((x) => x.id === g.id);
+  const n = b?.projects?.length ?? 0;
+  const e = b?.excludedProjects?.length ?? 0;
+  const parts = [];
+  if (n) parts.push(`+${n} project${n === 1 ? "" : "s"}`);
+  if (e) parts.push(`-${e} project${e === 1 ? "" : "s"}`);
+  const proj = parts.length ? ` ${parts.join(", ")}` : "";
   return `${flag}  ${g.id.padEnd(16)} ${`${on}/${g.skills.length} on`.padEnd(11)} ${g.name}${proj}`;
 }
 
@@ -487,14 +492,38 @@ function run(env, opts, pos, cmd) {
           }
           // an alias of a dir already stored is the same project: use the stored spelling
           const key = physicalDir(env, dir);
-          const stored = [...state.bundles.flatMap((b) => b.projects ?? []), ...(state.managedProjects ?? [])]
+          const stored = [...state.bundles.flatMap((b) => [...(b.projects ?? []), ...(b.excludedProjects ?? [])]), ...(state.managedProjects ?? [])]
             .find((d) => d !== dir && physicalDir(env, d) === key);
           if (stored) dir = stored;
-          for (const id of ids) state = cmd === "on" ? core.addBundleProject(state, id, dir, { home: env.home }) : core.removeBundleProject(state, id, dir, { home: env.home });
+          const unpinnedGlobal = [];
+          for (const id of ids) {
+            const b = state.bundles.find((x) => x.id === id);
+            const norm = core.normalizeProjectDir(dir, { home: env.home });
+            const hasProj = (list) => (list ?? []).some((x) => core.normalizeProjectDir(x, { home: env.home }) === norm);
+            if (cmd === "on") {
+              state = hasProj(b?.excludedProjects)
+                ? core.includeBundleProject(state, id, dir, { home: env.home })
+                : core.addBundleProject(state, id, dir, { home: env.home });
+            } else {
+              if (hasProj(b?.projects)) {
+                state = core.removeBundleProject(state, id, dir, { home: env.home });
+                if (b?.enabled) unpinnedGlobal.push(id);
+              } else if (b?.enabled) {
+                state = core.excludeBundleProject(state, id, dir, { home: env.home });
+              }
+            }
+          }
+          const msg = cmd === "on"
+            ? `allowed ${ids.join(", ")} in ${dir}`
+            : unpinnedGlobal.length === ids.length
+              ? `unpinned ${unpinnedGlobal.join(", ")} in ${dir} (still on globally; run 'skills off ${unpinnedGlobal[0]} --project ${dir}' again to exclude it here)`
+              : unpinnedGlobal.length
+                ? `stopped allowing ${ids.join(", ")} in ${dir}; unpinned ${unpinnedGlobal.join(", ")} (still on globally; run 'skills off <bundle> --project ${dir}' again to exclude it here)`
+                : `stopped allowing ${ids.join(", ")} in ${dir}`;
+          return mutate(state, msg);
         } catch (e) {
           throw new CliError(e.message);
         }
-        return mutate(state, `${cmd === "on" ? "allowed" : "stopped allowing"} ${ids.join(", ")} in ${dir}`);
       }
       for (const id of ids) state = core.setBundleEnabled(state, id, cmd === "on");
       return mutate(state, `${cmd === "on" ? "enabled" : "disabled"} ${ids.join(", ")}; ${totals(state, ctx.allIds)}`);
@@ -546,13 +575,16 @@ function run(env, opts, pos, cmd) {
       const bs = pos.length ? pos.map((r) => state.bundles.find((b) => b.id === resolveBundle(state, r))) : state.bundles;
       let any = false;
       for (const b of bs) {
-        if (!pos.length && !b.projects?.length) continue;
+        const inc = b.projects ?? [];
+        const exc = b.excludedProjects ?? [];
+        if (!pos.length && !inc.length && !exc.length) continue;
         any = true;
-        print(`${b.id}${b.projects?.length ? "" : " (no projects)"}`);
-        for (const d of b.projects ?? []) print(`  ${d}`);
+        print(`${b.id}${inc.length || exc.length ? "" : " (no projects)"}`);
+        for (const d of inc) print(`  ${d}`);
+        for (const d of exc) print(`  excluded: ${d}`);
       }
       if (!any) print("no bundle has projects");
-      const orphan = (state.managedProjects ?? []).filter((d) => !state.bundles.some((b) => (b.projects ?? []).includes(d)));
+      const orphan = (state.managedProjects ?? []).filter((d) => !state.bundles.some((b) => (b.projects ?? []).includes(d) || (b.excludedProjects ?? []).includes(d)));
       if (!pos.length && orphan.length) print(`pending rule removal: ${orphan.join(", ")} (run "skills sync")`);
       return 0;
     }

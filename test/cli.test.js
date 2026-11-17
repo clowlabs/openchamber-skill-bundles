@@ -933,3 +933,60 @@ test("D10 a SKILL.md directly in a ~/ source is named after the home folder", ()
   assert.equal(r.code, 0, r.err);
   assert.match(r.out, new RegExp(`\\b${path.basename(h)}\\b`));
 });
+
+test("CLI off/on --project on globally-enabled bundle writes deny rules and leaves bundle global", () => {
+  const h = makeHome();
+  const proj = path.join(h, "work/app");
+  fs.mkdirSync(proj, { recursive: true });
+  assert.equal(run(h, "on", "dev").code, 0);
+
+  // Exclude dev in proj: writes deny rules to project opencode.json, dev stays globally enabled
+  const rOff = run(h, "off", "dev", "--project", proj);
+  assert.equal(rOff.code, 0, rOff.err);
+  let s = json(h, "skill-bundles.json");
+  const devOff = s.bundles.find((b) => b.id === "dev");
+  assert.equal(devOff.enabled, true);
+  assert.deepEqual(devOff.excludedProjects, ["~/work/app"]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(proj, ".opencode/opencode.json"), "utf8")).permissions, [
+    { action: "skill", resource: "alpha", effect: "deny" },
+    { action: "skill", resource: "gamma", effect: "deny" },
+  ]);
+  assert.match(run(h, "list").out, /-1 project/);
+  assert.match(run(h, "projects").out, /excluded: ~\/work\/app/);
+
+  // Re-include dev in proj: removes exclusion and deny rules
+  const rOn = run(h, "on", "dev", "--project", proj);
+  assert.equal(rOn.code, 0, rOn.err);
+  s = json(h, "skill-bundles.json");
+  assert.equal(s.bundles.find((b) => b.id === "dev").excludedProjects, undefined);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(proj, ".opencode/opencode.json"), "utf8")).permissions, []);
+});
+
+test("CLI two-step off --project on pinned global bundle: unpins first with explicit note, second off excludes", () => {
+  const h = makeHome();
+  const proj = path.join(h, "work/app");
+  fs.mkdirSync(proj, { recursive: true });
+  // dev is globally enabled in makeHome(); pin it explicitly to proj
+  assert.equal(run(h, "on", "dev", "--project", proj).code, 0);
+  assert.deepEqual(json(h, "skill-bundles.json").bundles.find((b) => b.id === "dev").projects, ["~/work/app"]);
+
+  // First off: unpins dev in proj with explicit note, keeps dev globally enabled and without excludedProjects
+  const r1 = run(h, "off", "dev", "--project", proj);
+  assert.equal(r1.code, 0, r1.err);
+  assert.match(r1.out, /unpinned dev in .*still on globally; run 'skills off dev --project .*' again to exclude it here/);
+  const dev1 = json(h, "skill-bundles.json").bundles.find((b) => b.id === "dev");
+  assert.equal(dev1.enabled, true);
+  assert.equal(dev1.projects, undefined);
+  assert.equal(dev1.excludedProjects, undefined);
+
+  // Second off: excludes dev in proj and writes deny rules
+  const r2 = run(h, "off", "dev", "--project", proj);
+  assert.equal(r2.code, 0, r2.err);
+  assert.match(r2.out, /stopped allowing dev in/);
+  const dev2 = json(h, "skill-bundles.json").bundles.find((b) => b.id === "dev");
+  assert.equal(dev2.enabled, true);
+  assert.deepEqual(dev2.excludedProjects, ["~/work/app"]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(proj, ".opencode/opencode.json"), "utf8")).permissions, [
+    { action: "skill", resource: "alpha", effect: "deny" },
+  ]);
+});
