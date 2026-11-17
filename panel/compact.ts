@@ -17,7 +17,8 @@ import {
 } from './io';
 import { openProjectsMenu } from './projects';
 import { openSendMenu } from './send';
-import { countsFromState, renderMeterHeader } from '../status/counts';
+import { countsFromState } from '../status/counts';
+import { statsLine } from './stats';
 
 let mounts: Disposable[] = [];
 /** Bundle id whose row has keyboard focus, kept across re-renders. */
@@ -111,8 +112,13 @@ export function renderCompact(root: HTMLElement) {
   root.appendChild(head);
   const state = S.state;
   if (!S.loaded) return;
+  const projDir = activeProjectDir();
+  const open = openId ? state?.bundles.find((b) => b.id === openId) : undefined;
+  const back = renderHeader(root, head, projDir, Boolean(open));
+  if (open && back) return renderBundle(root, open, projDir, focus, back);
+  openId = null; // the open bundle was deleted elsewhere
+
   if (!state) {
-    openId = null;
     const b = el('div');
     root.appendChild(b);
     mounts.push(mountBanner(b, {
@@ -122,22 +128,6 @@ export function renderCompact(root: HTMLElement) {
     }));
     return;
   }
-
-  const projDir = activeProjectDir();
-  const open = openId ? state.bundles.find((b) => b.id === openId) : undefined;
-  if (open) return renderBundle(root, head, open, projDir, focus);
-  openId = null; // the open bundle was deleted elsewhere
-
-  const projCfgPath = projDir ? core.projectConfigPath(projDir) : null;
-  const projectOpencodeText = projCfgPath ? S.projectTexts[projCfgPath] : undefined;
-  const c = countsFromState(state, S.allIds, S.opencodeText, {
-    projectDir: projDir,
-    home: effectiveHome(),
-    projectOpencodeText,
-  });
-  const { wrap, left } = renderMeterHeader(c);
-  head.appendChild(wrap);
-  if (pending()) busyBadge(left);
 
   const list = el('div', 'sb-c-list');
   list.setAttribute('role', 'listbox');
@@ -199,17 +189,30 @@ export function renderCompact(root: HTMLElement) {
   if (focus.hadFocus) rows.find((r) => r.dataset.id === stop)?.focus();
 }
 
-/** One bundle's skills, with per-skill Disable pill and Alt/right-click send menu. */
-function renderBundle(root: HTMLElement, head: HTMLElement, b: Bundle, projDir: string | null, focus: CompactFocus) {
-  const bar = el('div', 'sb-c-back-bar');
-  const back = el('button', 'sb-c-back', '‹ All bundles');
-  back.type = 'button';
-  back.setAttribute('aria-keyshortcuts', 'Escape');
-  back.addEventListener('click', () => closeBundle(root));
-  bar.appendChild(back);
-  head.appendChild(bar);
-  if (pending()) busyBadge(bar);
+function renderHeader(root: HTMLElement, head: HTMLElement, projDir: string | null, open: boolean) {
+  const projCfgPath = projDir ? core.projectConfigPath(projDir) : null;
+  const c = countsFromState(S.state, S.allIds, S.opencodeText, {
+    projectDir: projDir,
+    home: effectiveHome(),
+    projectOpencodeText: projCfgPath ? S.projectTexts[projCfgPath] : undefined,
+  });
+  const header = el('header', 'sb-header');
+  const stats = el('div', 'sb-stats');
+  stats.appendChild(statsLine(c));
+  const back = open ? el('button', 'sb-c-back', 'Go Back') : null;
+  if (back) {
+    back.type = 'button';
+    back.setAttribute('aria-keyshortcuts', 'Escape');
+    back.addEventListener('click', () => closeBundle(root));
+  }
+  header.append(back ?? el('div', 'sb-title', 'Skill Bundles'), stats);
+  head.appendChild(header);
+  if (pending()) busyBadge(stats);
+  return back;
+}
 
+/** One bundle's skills, with per-skill Disable pill and Alt/right-click send menu. */
+function renderBundle(root: HTMLElement, b: Bundle, projDir: string | null, focus: CompactFocus, back: HTMLElement) {
   const scope = describeBundleScope(b, projDir);
   const title = el('div', 'sb-c-title');
   const text = el('div', 'sb-c-text');
@@ -350,7 +353,7 @@ function busyBadge(at: HTMLElement) {
 
 /** While a save is queued: only the Saving… badge, so the row being clicked isn't replaced. */
 export function renderCompactBusy() {
-  const left = document.querySelector<HTMLElement>('.sb-c-head .skm-left, .sb-c-head .sb-c-back-bar');
+  const left = document.querySelector<HTMLElement>('.sb-c-head .sb-stats');
   if (!left || left.querySelector('.sb-c-busy') || !pending()) return;
   busyBadge(left);
 }

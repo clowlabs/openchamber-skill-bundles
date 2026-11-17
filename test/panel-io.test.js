@@ -1831,6 +1831,16 @@ test("compact rail: no hints, Alt/right-click opens projects menu, Disable pill 
     compactMod.renderCompact(root);
 
     // No footer hint in bundle list view
+    const byClass = (node, name) => {
+      if (node.classList.contains(name)) return node;
+      for (const child of node.children) {
+        const found = byClass(child, name);
+        if (found) return found;
+      }
+      return null;
+    };
+    expect(byClass(root, "sb-title").textContent).toBe("Skill Bundles");
+    const listStats = byClass(root, "sb-stats-line").textContent;
     expect(root.querySelectorAll(".sb-c-hint")).toEqual([]);
     const rowB = root.querySelectorAll(".sb-c-row")[0];
     expect(rowB.classList.contains("on")).toBe(true);
@@ -1866,6 +1876,11 @@ test("compact rail: no hints, Alt/right-click opens projects menu, Disable pill 
 
     // Plain click drills into bundle "b"
     rowB.click();
+    expect(byClass(root, "sb-title")).toBeNull();
+    expect(byClass(root, "sb-c-back-bar")).toBeNull();
+    expect(byClass(root, "sb-c-back").textContent).toBe("Go Back");
+    expect(byClass(root, "sb-stats-line").textContent).toBe(listStats);
+    expect(root.textContent).not.toContain("All bundles");
     expect(root.querySelectorAll(".sb-c-hint")).toEqual([]);
     const pills = root.querySelectorAll(".sb-c-disable-pill");
     expect(pills.map((p) => p.textContent)).toEqual(["Disable", "Disable"]);
@@ -1906,6 +1921,8 @@ test("compact rail: no hints, Alt/right-click opens projects menu, Disable pill 
     // Focus restoration on Disable/Disabled pill button + inner <button> of .sb-c-switch + Alt+Enter on open header
     const backBtn = root.querySelectorAll("button, input, [tabindex]").find((e) => e.classList.contains("sb-c-back"));
     backBtn.click();
+    expect(byClass(root, "sb-title").textContent).toBe("Skill Bundles");
+    expect(byClass(root, "sb-stats-line")).not.toBeNull();
     const rowC = root.querySelectorAll(".sb-c-row")[1];
     rowC.click();
     const pillA = root.querySelectorAll(".sb-c-disable-pill")[0];
@@ -2673,7 +2690,7 @@ test("regression: external project opencode.json deny * drops rail meter and rea
           walk(c, pred);
         }
       };
-      if (sel === ".skm-live-n") walk(this, (el) => el.classList.contains("skm-live-n"));
+      if ([".sb-stats-line", ".sb-title", ".skm-meter"].includes(sel)) walk(this, (el) => el.classList.contains(sel.slice(1)));
       return out;
     };
     globalThis.HTMLStyleElement = class extends globalThis.HTMLElement {};
@@ -2703,7 +2720,23 @@ test("regression: external project opencode.json deny * drops rail meter and rea
     expect((await counts.readCounts(fx.host, { projectDir: proj, home })).live).toBe(0);
 
     compactMod.renderCompact(root);
-    expect(root.querySelectorAll(".skm-live-n")[0].textContent).toBe("0");
+    expect(root.querySelectorAll(".sb-title")[0].textContent).toBe("Skill Bundles");
+    expect(root.querySelectorAll(".sb-stats-line")[0].textContent).toBe(`0 live / ${io.S.allIds.length} installed (0%) · 1 bundle on · ~0 tokens`);
+    expect(root.querySelectorAll(".skm-meter")).toHaveLength(0);
+    expect(root.querySelectorAll(".sb-stats-line")[0].title).toBe(`Live = skills agents can use (allowed in opencode.json). Installed = skill folders plus built-ins.\n${counts.TOKENS_TITLE}`);
+
+    // Without bundles, keep the same header and count the active project's permissions.
+    io.S.state = null;
+    compactMod.renderCompact(root);
+    const fallback = counts.countsFromState(null, io.S.allIds, io.S.opencodeText, {
+      projectDir: proj,
+      home: io.effectiveHome(),
+      projectOpencodeText: io.S.projectTexts[projCfg],
+    });
+    expect(fallback.live).toBe(0);
+    expect(root.querySelectorAll(".sb-title")[0].textContent).toBe("Skill Bundles");
+    expect(root.querySelectorAll(".sb-stats-line")[0].textContent).toBe(`${counts.liveLine(fallback)} · from opencode.json`);
+    expect(root.querySelectorAll(".skm-meter")).toHaveLength(0);
   } finally {
     if (prevStyle) Object.defineProperty(globalThis, "HTMLStyleElement", prevStyle);
     else delete globalThis.HTMLStyleElement;
@@ -2736,7 +2769,7 @@ test("regression: compact renderCompact uses effectiveHome() when S.home is unde
         }
       };
       if (sel === ".sb-c-row") walk(this, (el) => el.classList.contains("sb-c-row"));
-      else if (sel === ".skm-live-n") walk(this, (el) => el.classList.contains("skm-live-n"));
+      else if ([".sb-stats-line", ".sb-title", ".skm-meter"].includes(sel)) walk(this, (el) => el.classList.contains(sel.slice(1)));
       return out;
     };
     globalThis.HTMLStyleElement = class extends globalThis.HTMLElement {};
@@ -2751,7 +2784,9 @@ test("regression: compact renderCompact uses effectiveHome() when S.home is unde
     compactMod.renderCompact(root);
 
     expect(root.querySelectorAll(".sb-c-row")[0].classList.contains("on")).toBe(true);
-    expect(Number(root.querySelectorAll(".skm-live-n")[0].textContent)).toBeGreaterThan(0);
+    expect(root.querySelectorAll(".sb-title")[0].textContent).toBe("Skill Bundles");
+    expect(root.querySelectorAll(".sb-stats-line")[0].textContent).toMatch(/^[1-9]\d* live \/ \d+ installed \(\d+%\) · 1 bundle on · ~[\d.]+k? tokens$/);
+    expect(root.querySelectorAll(".skm-meter")).toHaveLength(0);
   } finally {
     if (prevStyle) Object.defineProperty(globalThis, "HTMLStyleElement", prevStyle);
     else delete globalThis.HTMLStyleElement;
@@ -2849,7 +2884,7 @@ test("regression: missing or empty {} project opencode.json reports 0 live for p
           walk(c, pred);
         }
       };
-      if (sel === ".skm-live-n") walk(this, (el) => el.classList.contains("skm-live-n"));
+      if ([".sb-stats-line", ".sb-title", ".skm-meter"].includes(sel)) walk(this, (el) => el.classList.contains(sel.slice(1)));
       return out;
     };
     globalThis.HTMLStyleElement = class extends globalThis.HTMLElement {};
@@ -2873,7 +2908,9 @@ test("regression: missing or empty {} project opencode.json reports 0 live for p
     expect(await io.checkDisk()).toBe(true);
     expect((await counts.readCounts(fx.host, { projectDir: proj, home })).live).toBe(0);
     compactMod.renderCompact(root);
-    expect(root.querySelectorAll(".skm-live-n")[0].textContent).toBe("0");
+    expect(root.querySelectorAll(".sb-title")[0].textContent).toBe("Skill Bundles");
+    expect(root.querySelectorAll(".sb-stats-line")[0].textContent).toBe(`0 live / ${io.S.allIds.length} installed (0%) · 1 bundle on · ~0 tokens`);
+    expect(root.querySelectorAll(".skm-meter")).toHaveLength(0);
 
     // Externally write '{}' -> 0 live
     put(pFile, "{}\n");
@@ -2882,7 +2919,7 @@ test("regression: missing or empty {} project opencode.json reports 0 live for p
     expect(await io.checkDisk()).toBe(true);
     expect((await counts.readCounts(fx.host, { projectDir: proj, home })).live).toBe(0);
     compactMod.renderCompact(root);
-    expect(root.querySelectorAll(".skm-live-n")[0].textContent).toBe("0");
+    expect(root.querySelectorAll(".sb-stats-line")[0].textContent).toBe(`0 live / ${io.S.allIds.length} installed (0%) · 1 bundle on · ~0 tokens`);
   } finally {
     if (prevStyle) Object.defineProperty(globalThis, "HTMLStyleElement", prevStyle);
     else delete globalThis.HTMLStyleElement;

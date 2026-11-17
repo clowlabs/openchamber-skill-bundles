@@ -216,6 +216,17 @@ after the global ones, so a project `allow` beats the global `deny *`.
     managedProjects), printing a note; `on --project` reuses a stored spelling of the same folder.
   - `managedProjects` is carried in the plan's `state`: a dir is added when a write leaves rules in
     its file, and dropped once it is in no bundle (its rules are removed by that same plan).
+- Rail: both views share one header with the page's live/installed stats,
+  enabled bundle count, estimated tokens, and tooltip; rail counts use the active project.
+  The list shows the "Skill Bundles" title; an open bundle replaces it with a bordered "Go Back"
+  button (Escape also returns to the list and restores row focus), with no separate back row.
+  Without bundle state it shows the opencode.json stats above "No bundles yet".
+  The Saving… badge appears inside the stats area; the Work Status meter remains separate.
+- Work Status: on mount and directory changes, read last displayed counts from extension storage
+  in parallel with refresh. Cached counts paint only before a fresh result for that directory;
+  late results from a previous directory cannot paint. Persist changed live/installed/character
+  counts under `skill-counts-v1`, retaining at most 20 directories (oldest changed first to evict).
+  Missing, corrupt or unavailable storage never prevents live refresh.
 - Panel: bundle header "Projects…" control + header/row Alt-click or right-click → flush checklist of
   Global + OpenChamber projects (listProjects, skip chats dir) with filter;
   header badge "Off · N projects" / "On · +N projects"; skill detail lists its projects.

@@ -1,11 +1,12 @@
-// Work Status section: the skills meter (live / installed, est. tokens). Read-only: no writes, no
-// lock. The whole section is one button that opens the rail panel, where bundles are toggled.
+// Work Status section: the skills meter (live / installed, est. tokens). Only cached counts
+// are written. The whole section opens the rail panel, where bundles are toggled.
 // The frame only runs while the section is shown.
 import { connectHost } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
 import { errText } from '../shared/panel/host';
 import { listenChanges } from '../panel/sync';
 import { createStatusLoader, createStatusRefresher, renderMeterHeader, type SkillCounts } from './counts';
+import { createCachedStatusPainter } from './cache';
 
 const host = connectHost();
 let currentDir: string | null = null;
@@ -22,7 +23,10 @@ function requestRefresh(fast = false, immediateScan = false) {
 host.onDirectory((dir) => {
   if (currentDir === dir) return;
   currentDir = dir;
-  if (mounted) requestRefresh(true);
+  if (mounted) {
+    void cachedPainter.select(currentDir);
+    requestRefresh(true);
+  }
 });
 
 const REFRESH_MS = 30_000;
@@ -40,8 +44,10 @@ function paint(c: SkillCounts) {
   fit();
 }
 
+const cachedPainter = createCachedStatusPainter(host, paint);
+let loadTicket = 0;
 const loader = createStatusLoader(host, {
-  onRevalidated: (c) => paint(c),
+  onRevalidated: (c) => { void cachedPainter.fresh(loadTicket, c); },
 });
 
 const refresh = createStatusRefresher(
@@ -50,11 +56,16 @@ const refresh = createStatusRefresher(
     const forceImmediateScan = needImmediateScan;
     needFull = false;
     needImmediateScan = false;
+    const ticket = cachedPainter.ticket();
+    loadTicket = ticket;
     if (forceImmediateScan) loader.invalidateScanAge();
-    return loader.load(currentDir, { forceScan: forceScan || forceImmediateScan, forceImmediateScan });
+    const c = await loader.load(currentDir, { forceScan: forceScan || forceImmediateScan, forceImmediateScan });
+    void cachedPainter.fresh(ticket, c);
+    return c;
   },
-  paint,
+  () => {},
   (e) => {
+    if (!cachedPainter.isCurrent(loadTicket)) return;
     $('head').replaceChildren(
       Object.assign(document.createElement('div'), { className: 'err', textContent: "Couldn't count skills" }),
       Object.assign(document.createElement('div'), { className: 'skm-sub', textContent: errText(e) }),
@@ -82,6 +93,7 @@ host.onReady((ctx) => {
   section.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPanel(); }
   });
+  void cachedPainter.select(currentDir);
   requestRefresh(false);
   listenChanges(({ full }) => { requestRefresh(!full, full); });
   // The frame is unloaded when the section is collapsed, so this only runs while visible.

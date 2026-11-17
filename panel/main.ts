@@ -19,7 +19,8 @@ import { openProjectsMenu } from './projects';
 import { deferRender, endDrag, initDrag, isDragging, onPillDown } from './drag';
 import { renderDetail } from './detail';
 import { renderCompact, renderCompactBusy } from './compact';
-import { countsFromState, formatTokens, liveLine, livePct, TOKENS_TITLE, tokensOf } from '../status/counts';
+import { countsFromState } from '../status/counts';
+import { statsLine } from './stats';
 import { $, el, HAND_EDIT, isMenuKey, MODE_LABEL, onAltOrContext, openAtAnchor, rovingKey, UNBUNDLED, type Disposable } from './dom';
 import { createEditGuard } from './edit-guard';
 import {
@@ -94,13 +95,7 @@ function renderStats() {
   root.textContent = '';
   if (!S.loaded) return;
   const c = countsFromState(S.state, S.allIds, S.opencodeText);
-  const n = c.bundlesOn?.length ?? 0;
-  const text = S.state
-    ? `${c.live} live / ${c.installed} installed (${livePct(c)}%) · ${n} ${n === 1 ? 'bundle' : 'bundles'} on · ~${formatTokens(tokensOf(c.chars))} tokens`
-    : `${liveLine(c)} · from opencode.json`;
-  const line = el('span', 'sb-stats-line', text);
-  line.title = `Live = skills agents can use (allowed in opencode.json). Installed = skill folders plus built-ins.\n${TOKENS_TITLE}`;
-  root.appendChild(line);
+  root.appendChild(statsLine(c));
   if (pending()) {
     const span = el('span');
     root.appendChild(span);

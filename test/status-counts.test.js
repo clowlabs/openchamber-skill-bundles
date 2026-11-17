@@ -19,6 +19,124 @@ const { createFakeHost } = await import("../shared/test/fake-host.js");
 
 const skillMd = (desc) => `---\nname: x\ndescription: ${desc}\n---\nBody\n`;
 
+describe("last-counts first paint", () => {
+  let fx;
+  const old = { live: 2, installed: 10, chars: 400 };
+  const fresh = { live: 3, installed: 11, chars: 600, bundlesOn: [], fromOpencode: false };
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+  const seed = async (directory = "") => fx.host.storage.set(cache.SKILL_COUNTS_KEY, {
+    v: 1, entries: [{ directory, counts: old }],
+  });
+  beforeEach(() => { fx = createFakeHost(); });
+  afterEach(() => fx.cleanup());
+
+  test("cached counts paint while a slow load is pending", async () => {
+    await seed();
+    const painted = [];
+    const p = cache.createCachedStatusPainter(fx.host, (c) => painted.push(c));
+    const cached = p.select(null);
+    const ticket = p.ticket();
+    const load = deferred();
+    const refresh = load.promise.then((c) => p.fresh(ticket, c));
+    await cached;
+    expect(painted.map((c) => c.live)).toEqual([2]);
+    load.resolve(fresh);
+    await refresh;
+    expect(painted.map((c) => c.live)).toEqual([2, 3]);
+  });
+
+  test("late cache read cannot overwrite a fresh paint", async () => {
+    await seed();
+    const get = fx.host.storage.get;
+    const delayed = deferred();
+    let first = true;
+    fx.host.storage.get = (key) => {
+      if (!first) return get(key);
+      first = false;
+      return delayed.promise;
+    };
+    const painted = [];
+    const p = cache.createCachedStatusPainter(fx.host, (c) => painted.push(c.live));
+    const cached = p.select(null);
+    await p.fresh(p.ticket(), fresh);
+    delayed.resolve({ v: 1, entries: [{ directory: "", counts: old }] });
+    await cached;
+    expect(painted).toEqual([3]);
+  });
+
+  test("directory switch rejects old cached and fresh results, even after switching back", async () => {
+    const delayed = deferred();
+    const get = fx.host.storage.get;
+    let first = true;
+    fx.host.storage.get = (key) => {
+      if (!first) return get(key);
+      first = false;
+      return delayed.promise;
+    };
+    const a = `${fx.home}/a`;
+    const painted = [];
+    const p = cache.createCachedStatusPainter(fx.host, (c) => painted.push(c.live));
+    const cached = p.select(a);
+    const ticket = p.ticket();
+    await p.select(`${fx.home}/b`);
+    await p.select(a);
+    delayed.resolve({ v: 1, entries: [{ directory: a, counts: old }] });
+    await cached;
+    await p.fresh(ticket, fresh);
+    expect(painted).toEqual([]);
+  });
+
+  test("unchanged numbers skip writes, including across fresh frames", async () => {
+    await seed();
+    let writes = 0;
+    const set = fx.host.storage.set;
+    fx.host.storage.set = async (...args) => { writes++; return set(...args); };
+    const p = cache.createCachedStatusPainter(fx.host, () => {});
+    await p.select(null);
+    await p.fresh(p.ticket(), { ...fresh, ...old });
+    expect(writes).toBe(0);
+    await p.fresh(p.ticket(), fresh);
+    await p.fresh(p.ticket(), fresh);
+    expect(writes).toBe(1);
+  });
+
+  test("missing, corrupt, unavailable and failing storage are non-fatal", async () => {
+    const painted = [];
+    const p = cache.createCachedStatusPainter(fx.host, (c) => painted.push(c.live));
+    for (const raw of [undefined, null, {}, { v: 2, entries: [] },
+      { v: 1, entries: [{ directory: "", counts: { ...old, live: -1 } }] },
+      { v: 1, entries: [{ directory: "", counts: { ...old, chars: "400" } }] }]) {
+      if (raw !== undefined) await fx.host.storage.set(cache.SKILL_COUNTS_KEY, raw);
+      await p.select(null);
+    }
+    expect(painted).toEqual([]);
+    fx.host.storage.get = async () => { throw new Error("unavailable"); };
+    fx.host.storage.set = async () => { throw new Error("unavailable"); };
+    await p.select(null);
+    await p.fresh(p.ticket(), fresh);
+    const missing = cache.createCachedStatusPainter({}, () => {});
+    await missing.select(null);
+    await missing.fresh(missing.ticket(), fresh);
+    expect(painted).toEqual([3]);
+  });
+
+  test("retains at most 20 directories and drops the oldest changed entry", async () => {
+    const p = cache.createCachedStatusPainter(fx.host, () => {});
+    for (let i = 0; i < 22; i++) {
+      await p.select(`${fx.home}/${i}`);
+      await p.fresh(p.ticket(), fresh);
+    }
+    const entries = cache.parseLastCountsCache(await fx.host.storage.get(cache.SKILL_COUNTS_KEY));
+    expect(entries).toHaveLength(20);
+    expect(entries[0].directory).toBe(`${fx.home}/2`);
+    expect(entries[19].directory).toBe(`${fx.home}/21`);
+  });
+});
+
 describe("renderMeterHeader", () => {
   const withDom = (fn) => {
     const saved = Object.getOwnPropertyDescriptor(globalThis, "document");

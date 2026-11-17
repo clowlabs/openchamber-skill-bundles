@@ -120,8 +120,7 @@ body.sb-compact #app { display: none; }
 .sb-c-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sb-c-chev { flex: none; color: var(--oc-muted); }
 .sb-c-row:hover .sb-c-chev, .sb-c-row:focus-visible .sb-c-chev { color: inherit; }
-.sb-c-back-bar { display: flex; align-items: center; gap: 8px; }
-.sb-c-back { background: none; border: 0; padding: 2px 0; color: var(--oc-muted); font: inherit; font-size: 12px; cursor: pointer; }
+.sb-c-back { background: none; border: 1px solid var(--oc-border); padding: 2px 8px; border-radius: 5px; color: var(--oc-fg); font: inherit; font-size: 12px; cursor: pointer; }
 .sb-c-back:hover { color: inherit; }
 .sb-c-back:focus-visible { outline: 2px solid var(--oc-focus, var(--oc-primary)); outline-offset: 2px; border-radius: 4px; }
 .sb-c-title { display: flex; align-items: center; gap: 8px; padding: 0 8px 8px; border-bottom: 1px solid var(--oc-border); }
