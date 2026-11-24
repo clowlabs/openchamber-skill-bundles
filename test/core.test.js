@@ -72,6 +72,24 @@ test("scope normalization catches invalid home and falls back to global mode", (
   assert.equal(core.effectiveMode(S({ bundles: [bundle] }), "x", opts), "off");
 });
 
+test("Windows drive paths are absolute project dirs with one spelling", () => {
+  // "E:/x" is absolute on Windows; treating it as project-relative made every project unusable there.
+  assert.equal(core.normalizeProjectDir("E:/Coding/app"), "E:/Coding/app");
+  assert.equal(core.normalizeProjectDir("e:\\Coding\\app"), "E:/Coding/app");
+  assert.equal(core.normalizeProjectDir("E:/Coding//app/./"), "E:/Coding/app");
+  assert.equal(core.normalizeProjectDir("E:"), "E:/");
+  assert.equal(core.projectConfigPath("e:/Coding/app"), "E:/Coding/app/.opencode/opencode.json");
+  assert.equal(core.sameProjectDir("E:/Coding/app", "e:/Coding/app"), true);
+  assert.throws(() => core.normalizeProjectDir("E:/a/../b"), /must not contain/);
+  assert.throws(() => core.normalizeProjectDir("coding/app"), /must be absolute/);
+  // No `~` collapse without a usable home: the stored spelling stays absolute.
+  assert.equal(core.normalizeScopeDir("E:/Coding/app", { home: "C:/Users/u" }), "E:/Coding/app");
+  assert.equal(core.normalizeScopeDir("C:/Users/u/.config/openchamber/chats/1", { home: "C:/Users/u" }), null);
+  const state = core.parseBundles(JSON.stringify({ version: 1, bundles: [{ id: "a", name: "A", enabled: false, skills: ["x"], projects: ["e:/Coding/app"] }] }));
+  assert.deepEqual(state.bundles[0].projects, ["E:/Coding/app"]);
+  assert.equal(core.isBundleActive(state.bundles[0], { projectDir: "E:/Coding/app", home: "C:/Users/u" }), true);
+});
+
 test("bulk mode lookups preserve invalid/inherited overrides and builtin called modes", () => {
   const state = base();
   state.overrides = Object.assign(Object.create({ z: "auto" }), {
