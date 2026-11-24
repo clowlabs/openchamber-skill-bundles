@@ -31,9 +31,7 @@
         "entry": "panel/index.html"
       },
       "page": true,
-      "capabilities": [
-        "sessions"
-      ],
+      "capabilities": ["sessions", "files"],
       "filesystem": [
         "~/.config/opencode/skill-bundles.json",
         "~/.config/opencode/opencode.json",
