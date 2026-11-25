@@ -45,7 +45,7 @@ export function renderDetail(selected: string | null) {
   const fm = meta(id);
 
   root.appendChild(el('div', 'sb-d-id', id));
-  root.appendChild(el('div', 'sb-d-path', builtin ? 'Built-in skill (no SKILL.md)' : md == null ? `${skillPath(id)} (missing)` : skillPath(id)));
+  root.appendChild(el('div', 'sb-d-path', builtin ? 'Built-in skill (no SKILL.md)' : md == null && S.fresh ? `${skillPath(id)} (missing)` : skillPath(id)));
   const broken = fm.error;
   if (broken) {
     const b = el('div');

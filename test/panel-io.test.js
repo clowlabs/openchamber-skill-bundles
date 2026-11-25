@@ -3484,3 +3484,113 @@ test("regression: StaleError reloadAfter() inside enqueue verifies stamps so sub
   expect(await io.checkDisk()).toBe(false);
   expect(listDirCalls).toBe(0);
 });
+
+// ---------- cache-first boot (panel-index-v1) ----------
+
+/** A host that counts listDir calls and SKILL.md reads, on the shared fixture. */
+function countingHost() {
+  const h = fakeHost();
+  const c = { listDir: 0, skillReads: 0, projects: 0 };
+  const { listDir, readFile, listProjects } = h;
+  h.listDir = async (p) => { c.listDir++; return listDir(p); };
+  h.readFile = async (p) => { if (p.endsWith(".md")) c.skillReads++; return readFile(p); };
+  h.listProjects = async () => { c.projects++; return listProjects(); };
+  return { h, c };
+}
+
+/** Fresh panel state, as a newly opened frame has. */
+function resetPanel(h) {
+  io.setHost(h);
+  io.S.loaded = false;
+  io.S.state = null;
+  io.S.allIds = [];
+  io.S.skillMds = {};
+  io.S.skillPaths = Object.create(null);
+  io.S.homeDerived = false;
+  io.S.home = undefined;
+}
+
+test("cache-first load paints from panel-index-v1 with no folder walk, SKILL.md read or project list, then hydrates", async () => {
+  // beforeEach's full load stored the index.
+  const { h, c } = countingHost();
+  resetPanel(h);
+  let atPaint = null;
+  let paints = 0;
+  await io.load(() => {
+    paints++;
+    if (atPaint) return;
+    atPaint = { ...c, fresh: io.S.fresh, ids: [...io.S.allIds], desc: io.meta("alpha").description, path: io.skillPath("beta"), bundles: io.S.state?.bundles.map((b) => b.id) };
+  }, { cache: true });
+  expect(atPaint).toEqual({ listDir: 0, skillReads: 0, projects: 0, fresh: false, ids: io.S.allIds, desc: "Alpha", path: "~/.config/opencode/skills/beta/SKILL.md", bundles: ["b"] });
+  expect(paints).toBe(2);
+  expect(io.S.fresh).toBe(true);
+  expect(c.listDir).toBeGreaterThan(0);
+  expect(io.S.skillMds.alpha).toBe(skillMd("Alpha"));
+});
+
+test("cache-first load: a commit made on the index paint waits for the disk and plans on real SKILL.md text", async () => {
+  const { h } = countingHost();
+  resetPanel(h);
+  let queued = false;
+  await io.load(() => {
+    if (queued) return;
+    queued = true;
+    expect(io.S.fresh).toBe(false);
+    io.commit((s) => core.setOverride(core.setBundleEnabled(s, "b", true), "alpha", "called"));
+  }, { cache: true });
+  await settle();
+  expect(io.S.state.overrides.alpha).toBe("called");
+  expect(read("~/.config/opencode/skills/alpha/SKILL.md")).toContain("opencode/autoinvoke: false");
+  expect(read("~/.config/opencode/skills/alpha/SKILL.md")).toContain("description: Alpha");
+  expect(toasts.filter((t) => t.kind === "error")).toEqual([]);
+});
+
+test("cache-first load: an index for other skill roots is ignored, the panel loads from disk once", async () => {
+  put(core.OPENCODE_PATH, JSON.stringify({ $schema: "x", skills: ["~/extra/skills"], permissions: [] }, null, 2) + "\n");
+  put("~/extra/skills/delta/SKILL.md", skillMd("Delta"));
+  const { h } = countingHost();
+  resetPanel(h);
+  const seen = [];
+  await io.load(() => seen.push({ fresh: io.S.fresh, delta: io.S.allIds.includes("delta") }), { cache: true });
+  expect(seen).toEqual([{ fresh: true, delta: true }]);
+});
+
+test("cache-first load: syncFromDisk and checkDisk do nothing until the disk load lands", async () => {
+  const { h, c } = countingHost();
+  resetPanel(h);
+  const results = [];
+  const counted = h.listDir;
+  // A sync ping arriving while the disk load is walking folders (after it took its generation).
+  h.listDir = async (p) => {
+    if (!results.length && !io.S.fresh) results.push(io.syncFromDisk({ full: true }), io.checkDisk());
+    return counted(p);
+  };
+  await io.load(undefined, { cache: true });
+  expect(await Promise.all(results)).toEqual([false, false]);
+  expect(c.skillReads).toBe(2); // the disk load's own reads only, no second scan
+});
+
+test("cache-first load: a description edited on disk since the index shows after hydration and is stored for the next boot", async () => {
+  put("~/.config/opencode/skills/alpha/SKILL.md", skillMd("Alpha v2"));
+  const { h } = countingHost();
+  resetPanel(h);
+  const descs = [];
+  await io.load(() => descs.push(io.meta("alpha").description), { cache: true });
+  expect(descs).toEqual(["Alpha", "Alpha v2"]);
+  const { PANEL_INDEX_KEY } = await import("../panel/index-cache.ts");
+  await Promise.resolve();
+  const stored = await h.storage.get(PANEL_INDEX_KEY);
+  expect(stored.skills.find((s) => s.id === "alpha").description).toBe("Alpha v2");
+});
+
+test("parsePanelIndex: accepts a valid index and drops one with any malformed field", async () => {
+  const { parsePanelIndex } = await import("../panel/index-cache.ts");
+  const ok = { v: 1, rootsKey: "[]", home: "/h", allIds: ["a"], skills: [{ id: "a", root: "~/r", path: "~/r/a/SKILL.md", dir: "~/r/a", description: "d", autoinvoke: true, error: null }], unreachable: [], unreadable: [] };
+  expect(parsePanelIndex(ok)).toEqual(ok);
+  expect(parsePanelIndex({ ...ok, v: 2 })).toBeNull();
+  expect(parsePanelIndex({ ...ok, allIds: [1] })).toBeNull();
+  expect(parsePanelIndex({ ...ok, skills: [{ ...ok.skills[0], autoinvoke: "yes" }] })).toBeNull();
+  expect(parsePanelIndex({ ...ok, unreachable: [{ path: "x" }] })).toBeNull();
+  expect(parsePanelIndex(null)).toBeNull();
+  expect(parsePanelIndex([])).toBeNull();
+});

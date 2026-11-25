@@ -232,6 +232,15 @@ after the global ones, so a project `allow` beats the global `deny *`.
   writes may lose an entry, costing an instant paint until a later mount refreshes it.
   Malformed and duplicate entries are dropped individually. Missing or corrupt storage may be
   replaced; a failed read skips that write and retries on a later refresh. Storage never prevents live refresh.
+- Panel boot (rail and page) is cache-first. A complete disk scan stores `panel-index-v1` in
+  extension storage: the skill roots key, home, ids, each skill's ref (id, root, path, dir) and
+  frontmatter summary (description, autoinvoke, error), unreachable and unreadable lists. It is
+  written only when it changed and stays under 1.5M characters. On open, the panel reads the index
+  and both config files, and if the index's roots match `opencode.json` it paints right away with
+  no folder walk, SKILL.md read or project list (`S.fresh = false`). The normal disk load follows
+  and paints again (`S.fresh = true`). Until that load is done, queued writes wait (and fail if it
+  fails), sync and checkDisk do nothing, and sending a skill shows "Still loading.". A missing,
+  malformed or mismatched index means a plain disk load. Reloads after errors never use the index.
 - Panel: bundle header "Projects…" control + header/row Alt-click or right-click → flush checklist of
   Global + OpenChamber projects (listProjects, skip chats dir) with filter;
   header badge "Off · N projects" / "On · +N projects"; skill detail lists its projects.

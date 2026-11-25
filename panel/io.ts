@@ -9,6 +9,7 @@ import { discoverSkills, type Unreachable } from './discover';
 import { broadcastChange, listenChanges } from './sync';
 import { parseSkillRules, sameIds } from '../status/counts';
 import { saveSkillIndexCache, statFileStamp } from '../status/cache';
+import { readPanelIndex, serializePanelIndex, writePanelIndex, type IndexedMeta, type PanelIndex } from './index-cache';
 import { errorCode, errText, isUnreadable, pool, readOptional as readOpt } from '../shared/panel/host';
 import { createQueue } from '../shared/panel/queue';
 import { createPanelLock, LockedError, statMtimeMs, type PanelLock } from '../shared/panel/panel-lock';
@@ -56,6 +57,8 @@ let lock: PanelLock;
 export const S = {
   state: null as State | null,
   loaded: false,
+  /** False while painted from the stored index only: disk not read yet, so writes and syncs wait. */
+  fresh: false,
   allIds: [] as string[],
   skillRefs: Object.create(null) as Record<string, SkillRef>,
   skillPaths: Object.create(null) as Record<string, string>,
@@ -142,12 +145,18 @@ export function toastError(e: unknown, what: string) {
 
 // ---------- frontmatter cache ----------
 
-type Meta = { description: string; autoinvoke: boolean; error: string | null };
+type Meta = IndexedMeta;
 const EMPTY: Meta = { description: '', autoinvoke: true, error: null };
 const fm = new Map<string, Meta>();
+/** Frontmatter summaries from the stored index, used only until the disk load lands. */
+let indexedMeta = new Map<string, Meta>();
 
 export function meta(id: string): Meta {
   const md = S.skillMds[id];
+  if (md == null && !S.fresh) {
+    const m = indexedMeta.get(id);
+    if (m) return m;
+  }
   if (md == null) return S.unreadable.includes(id) ? { ...EMPTY, error: `${skillPath(id)} could not be read` } : EMPTY;
   let m = fm.get(id);
   if (!m) {
@@ -185,9 +194,15 @@ const queue = createQueue({
   },
   onError: (e) => toastError(e, 'Saving failed'),
 });
+/** A cache-painted boot still reading the disk; writes wait for it. */
+let hydrating: Promise<void> | null = null;
+
 export const enqueue: typeof queue.enqueue = (task) => {
   writeSeq++;
   return queue.enqueue(async () => {
+    if (hydrating) await hydrating.catch(() => {});
+    // Never plan a write on index data: SKILL.md texts and stamps come only from the disk load.
+    if (!S.fresh) throw new Error('skills are not loaded from disk yet');
     if (syncInFlight) await syncInFlight.catch(() => false);
     activeWrites++;
     try {
@@ -403,7 +418,99 @@ export const undoLabel = () => undoStack.at(-1)?.label ?? null;
 
 export type ChangeOpts = { label?: string; undoable?: boolean | 'clear' };
 
-export async function load(onLoaded?: () => void) {
+// ---------- stored index (cache-first boot) ----------
+
+let lastIndexText: string | null = null;
+
+function buildPanelIndex(roots: readonly string[]): PanelIndex {
+  const skills = Object.values(S.skillRefs)
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    .map((r) => {
+      const m = meta(r.id);
+      return { id: r.id, root: r.root, path: r.path, dir: r.dir, description: m.description, autoinvoke: m.autoinvoke, error: m.error };
+    });
+  const home = effectiveHome();
+  return {
+    v: 1,
+    rootsKey: JSON.stringify(roots),
+    ...(home ? { home } : {}),
+    allIds: [...S.allIds],
+    skills,
+    unreachable: S.unreachable.map((u) => ({ path: u.path, code: u.code })),
+    unreadable: [...S.unreadable],
+  };
+}
+
+/** Store what the next boot paints first; skipped when unchanged, incomplete or too large. */
+function savePanelIndex(roots: readonly string[]) {
+  if (S.incomplete || !S.fresh) return;
+  const text = serializePanelIndex(buildPanelIndex(roots));
+  if (!text || text === lastIndexText) return;
+  lastIndexText = text;
+  void writePanelIndex(host, text);
+}
+
+/** Paint state from the stored index plus the two config files: no folder walk, no SKILL.md. */
+async function paintFromIndex(): Promise<boolean> {
+  try {
+    const [index, opencodeText, bundlesText] = await Promise.all([
+      readPanelIndex(host),
+      host.readFile(core.OPENCODE_PATH).then((r) => r.content),
+      readOptional(core.BUNDLES_PATH),
+    ]);
+    if (!index || index.rootsKey !== JSON.stringify(skillRoots(opencodeText))) return false;
+    if (!S.homeDerived && S.home === undefined && index.home) S.home = index.home;
+    const state = bundlesText == null ? null : core.parseBundles(bundlesText, homeOpt());
+    const refs: Record<string, SkillRef> = Object.create(null);
+    const paths: Record<string, string> = Object.create(null);
+    const metas = new Map<string, Meta>();
+    for (const s of index.skills) {
+      refs[s.id] = { id: s.id, root: s.root, path: s.path, dir: s.dir };
+      paths[s.id] = s.path;
+      metas.set(s.id, { description: s.description, autoinvoke: s.autoinvoke, error: s.error });
+    }
+    S.allIds = index.allIds;
+    S.skillRefs = refs;
+    S.skillPaths = paths;
+    S.unreachable = index.unreachable;
+    S.incomplete = false; // only complete scans are stored
+    S.unreadable = index.unreadable;
+    S.skillMds = {};
+    fm.clear();
+    indexedMeta = metas;
+    S.opencodeText = opencodeText;
+    S.bundlesText = bundlesText;
+    S.state = state;
+    S.projectTexts = Object.create(null);
+    S.fresh = false;
+    S.loaded = true;
+    lastIndexText = serializePanelIndex(index);
+    return true;
+  } catch {
+    return false; // the disk load reports real errors
+  }
+}
+
+/**
+ * Load everything from disk. With `cache` on a first load, paint from the stored index first
+ * (onLoaded fires twice: index, then disk); writes and syncs wait for the disk.
+ */
+export async function load(onLoaded?: () => void, opts?: { cache?: boolean }) {
+  if (!opts?.cache || S.loaded) return loadFromDisk(onLoaded);
+  const myGen = gen;
+  const run = (async () => {
+    if ((await paintFromIndex()) && myGen === gen) onLoaded?.();
+    await loadFromDisk(onLoaded);
+  })();
+  hydrating = run;
+  try {
+    await run;
+  } finally {
+    if (hydrating === run) hydrating = null;
+  }
+}
+
+async function loadFromDisk(onLoaded?: () => void) {
   const myGen = ++gen;
   const loadWriteSeq = writeSeq;
   const loadSyncSeq = syncSeq;
@@ -445,6 +552,8 @@ export async function load(onLoaded?: () => void) {
   S.state = nextState;
   S.projectTexts = projTexts;
   S.loaded = true;
+  S.fresh = true;
+  indexedMeta = new Map();
   if (myGen === gen && writeSeq === loadWriteSeq && syncSeq === loadSyncSeq) {
     let activePost!: Promise<void>;
     activePost = (async () => {
@@ -485,6 +594,7 @@ export async function load(onLoaded?: () => void) {
                 allIds: scan.allIds,
                 home,
               });
+              savePanelIndex(roots);
             }
           } else {
             configStamps = Object.create(null);
@@ -1073,6 +1183,7 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
   S.bundlesText = bundlesText;
   S.state = nextState;
   S.projectTexts = nextProjectTexts;
+  if (needsFull) savePanelIndex(skillRoots(opencodeText));
 
   if (S.descDraft && prevMds[S.descDraft.id] !== S.skillMds[S.descDraft.id]) {
     if (S.skillMds[S.descDraft.id] != null && meta(S.descDraft.id).description === S.descDraft.value) {
@@ -1086,7 +1197,7 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
 
 /** Refresh panel state from disk without flashing the loading spinner or queuing a write. */
 export async function syncFromDisk(opts?: SyncOpts): Promise<boolean> {
-  if (!S.loaded) return false;
+  if (!S.loaded || !S.fresh) return false;
   if (activeWrites > 0) {
     deferredSync = mergeSyncOpts(deferredSync, opts);
     return false;
@@ -1126,7 +1237,7 @@ export async function syncFromDisk(opts?: SyncOpts): Promise<boolean> {
 /** Stat key files and sync from disk if anything changed externally. */
 export async function checkDisk(opts?: { includeSkills?: boolean }): Promise<boolean> {
   if (postLoadStamps) await postLoadStamps;
-  if (!S.loaded || activeWrites > 0) return false;
+  if (!S.loaded || !S.fresh || activeWrites > 0) return false;
   if (syncInFlight) return syncInFlight;
   if (lastDiskStamp === null) return syncFromDisk({ full: true });
 

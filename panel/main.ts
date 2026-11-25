@@ -152,6 +152,7 @@ function renderPill(id: string, from: string, parent: HTMLElement, m: Mode) {
 }
 
 function sendBlocked(id: string): string | null {
+  if (!S.fresh) return 'Still loading.';
   if (core.isBuiltin(id)) return 'Built-in skill: it has no folder to send.';
   if (S.skillMds[id] == null) return 'This skill has no SKILL.md to send.';
   if (S.incomplete) return "Some skill folders couldn't be read, so this may not be the copy OpenCode uses.";
@@ -642,11 +643,12 @@ async function boot() {
   const s = mountSpinner(spin, { label: 'Loading skills…' });
   let rendered = false;
   try {
+    // Paints from the stored index first (no folder walk), then again once the disk is read.
     await load(() => {
+      if (!rendered) s.dispose();
       rendered = true;
-      s.dispose();
       render();
-    });
+    }, { cache: true });
   } catch (e) {
     if (!rendered) s.dispose();
     // On the rail the editor (#app, which holds #banner) is hidden: mount where it shows.
