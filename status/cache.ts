@@ -116,6 +116,10 @@ export const statFileStamp = (host: Pick<FileHost, 'stat'>, path: string): Promi
     (e) => `err:${errorCode(e) || 'ERR'}`,
   );
 
+/** A stamp from a successful stat (not `err:…`): equal ones mean the file can be trusted unread. */
+export const isVerifiedStamp = (stamp: string | undefined): stamp is string =>
+  typeof stamp === 'string' && stamp !== '' && !stamp.startsWith('err:');
+
 export async function statRootsMap(
   host: Pick<FileHost, 'stat'>,
   roots: readonly string[],

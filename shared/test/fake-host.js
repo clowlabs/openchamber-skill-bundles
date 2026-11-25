@@ -12,6 +12,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+/** Largest serialized storage value the host accepts, in UTF-8 bytes. */
+export const STORAGE_VALUE_BYTES = 65_536;
+
 export class FakeHostError extends Error {
   constructor(code, message) {
     super(message);
@@ -129,6 +132,10 @@ export function createFakeHost(opts = {}) {
           return fx.storage.has(k) ? structuredClone(fx.storage.get(k)) : undefined;
         },
         async set(key, value, options) {
+          // Same per-value limit the SDK enforces (GUEST_STORAGE_VALUE_BYTES).
+          if (new TextEncoder().encode(JSON.stringify(value)).length > STORAGE_VALUE_BYTES) {
+            throw makeError("HOST_REJECTED", "Storage value exceeds 64 KiB.");
+          }
           const k = `${options?.scope ?? "instance"}:${key}`;
           fx.storage.set(k, structuredClone(value));
         },

@@ -3583,9 +3583,9 @@ test("cache-first load: a description edited on disk since the index shows after
   await io.load(() => descs.push(io.meta("alpha").description), { cache: true });
   expect(descs).toEqual(["Alpha", "Alpha v2"]);
   expect(c.skillReads).toBe(1); // only the edited file
-  const { PANEL_INDEX_KEY } = await import("../panel/index-cache.ts");
-  await Promise.resolve();
-  const stored = await h.storage.get(PANEL_INDEX_KEY);
+  const { readPanelIndex } = await import("../panel/index-cache.ts");
+  await new Promise((r) => setTimeout(r, 0)); // let the serialized index write land
+  const stored = await readPanelIndex(h);
   expect(stored.skills.find((s) => s.id === "alpha").description).toBe("Alpha v2");
 });
 
@@ -3698,4 +3698,92 @@ test("lazy: a live skill with neither text nor an unreadable record is never pla
   const st = io.S.state.overrides.alpha;
   if (st === "called") expect(core.readFrontmatter(read(p)).autoinvoke).toBe(false);
   expect(core.readFrontmatter(read(p)).autoinvoke === false || read(core.BUNDLES_PATH).includes('"called"') === false).toBe(true);
+});
+
+test("cache-first load: an index larger than one 64 KiB storage value is stored in parts and still paints with no walk", async () => {
+  const long = "Ünïcode-heavy description ".repeat(12);
+  for (let i = 0; i < 250; i++) put(`~/.config/opencode/skills/s${String(i).padStart(3, "0")}/SKILL.md`, skillMd(`${long}${i}`));
+  await io.load();
+  await new Promise((r) => setTimeout(r, 0)); // let the background index write land
+  const { h, c } = countingHost();
+  resetPanel(h);
+  let atPaint = null;
+  await io.load(() => { atPaint ??= { ...c, fresh: io.S.fresh, n: io.S.allIds.length, d: io.meta("s249").description }; }, { cache: true });
+  expect(atPaint).toEqual({ listDir: 0, skillReads: 0, projects: 0, fresh: false, n: io.S.allIds.length, d: core.readFrontmatter(skillMd(`${long}249`)).description });
+  expect(c.skillReads).toBe(0);
+  for (const [k, v] of fx.storage) expect(new TextEncoder().encode(JSON.stringify(v)).length).toBeLessThanOrEqual(65_536, k);
+});
+
+test("index: a full scan that only sees a new SKILL.md stamp (same text) still stores it, so the next open reads nothing", async () => {
+  const p = "~/.config/opencode/skills/alpha/SKILL.md";
+  const t = new Date(Date.now() + 5_000);
+  fs.utimesSync(real(p), t, t); // touched, text unchanged; beforeEach's load has alpha's text in memory
+  expect(await io.checkDisk()).toBe(false); // nothing visible changed
+  await new Promise((r) => setTimeout(r, 0));
+  await cacheBoot(); // asserts zero SKILL.md reads
+});
+
+test("lazy: a skill named like an Object.prototype key ('constructor') is read and edited, not taken as loaded", async () => {
+  const p = "~/.config/opencode/skills/constructor/SKILL.md";
+  put(p, skillMd("Ctor"));
+  await io.load();
+  await new Promise((r) => setTimeout(r, 0));
+  await cacheBoot();
+  io.commit((s) => core.setOverride(s, "constructor", "called"));
+  await settle();
+  expect(io.S.state.overrides.constructor).toBe("called");
+  expect(core.readFrontmatter(read(p)).autoinvoke).toBe(false);
+});
+
+test("cache-first load: the indexed home only shapes the preview; a failed project list leaves home unknown for saves", async () => {
+  const { h } = countingHost();
+  resetPanel(h);
+  h.listProjects = async () => { throw new HostRequestError("UNAVAILABLE", "projects down"); };
+  let previewHome;
+  await io.load(() => { previewHome ??= io.effectiveHome(); }, { cache: true });
+  expect(previewHome).toBe(home);
+  expect(io.S.fresh).toBe(true);
+  expect(io.S.home).toBeUndefined();
+});
+
+test("lazy: a full sync racing an on-demand read keeps that read's outcome for the file it kept unread", async () => {
+  const p = "~/.config/opencode/skills/alpha/SKILL.md";
+  const { h } = await cacheBoot();
+  const readFile = h.readFile;
+  let lockReads = -1;
+  h.readFile = async (x) => {
+    if (x === p) throw new HostRequestError("DENIED", "nope");
+    if (x === core.LOCK_PATH && lockReads >= 0 && ++lockReads === 2) await io.loadSkillMd("alpha"); // after the scan
+    return readFile(x);
+  };
+  lockReads = 0;
+  await io.syncFromDisk({ full: true });
+  lockReads = -1;
+  expect(io.S.unreadable).toContain("alpha");
+  expect(io.S.unreachable.some((u) => u.path === p && u.code === "DENIED")).toBe(true);
+});
+
+test("lazy: overlapping on-demand reads of one SKILL.md share a single host read", async () => {
+  const { c } = await cacheBoot();
+  const results = await Promise.all([io.loadSkillMd("beta"), io.loadSkillMd("beta"), io.loadSkillMd("beta")]);
+  expect(results).toEqual([true, true, true]);
+  expect(c.skillReads).toBe(1);
+});
+
+test("cache-first load: the disk parse never uses the indexed home, so project paths are not rewritten with a stale one", async () => {
+  const proj = `${home}/code/app`;
+  fs.mkdirSync(real(proj), { recursive: true });
+  // Absolute spelling on disk (as a CLI run without home detection would leave it).
+  put(core.BUNDLES_PATH, core.serializeBundles(core.addBundleProject(core.parseBundles(read(core.BUNDLES_PATH)), "b", proj)));
+  expect(read(core.BUNDLES_PATH)).toContain(proj);
+  await io.load(); // index stored with home known (chats dir)
+  await new Promise((r) => setTimeout(r, 0));
+  const { h } = countingHost();
+  resetPanel(h);
+  h.listProjects = async () => { throw new HostRequestError("UNAVAILABLE", "projects down"); };
+  await io.load(undefined, { cache: true });
+  expect(io.S.fresh).toBe(true);
+  expect(io.effectiveHome()).toBeUndefined();
+  // Without a verified home the stored spelling is kept as written on disk, not collapsed to ~/.
+  expect(io.S.state.bundles[0].projects).toEqual([proj]);
 });

@@ -4,7 +4,7 @@ import * as core from '../src/core.js';
 import type { Mode } from '../src/core.js';
 import { $, el, HAND_EDIT, pluralNoun, UNBUNDLED, type Disposable } from './dom';
 import { shortDir } from './popup';
-import { S, bundlesOf, commit, fmError, hasSkillMd, homeOpt, loadSkillMd, meta, mode, orderBundles, saveDescription, skillPath } from './io';
+import { S, bundlesOf, commit, fmError, hasSkillMd, homeOpt, loadSkillMd, meta, mode, orderBundles, saveDescription, skillPath, skillText } from './io';
 
 let mounts: Disposable[] = [];
 let disposing = false;
@@ -44,7 +44,7 @@ export function renderDetail(selected: string | null) {
   }
   const id = selected;
   const builtin = core.isBuiltin(id);
-  const md = S.skillMds[id];
+  const md = skillText(id);
   const fm = meta(id);
   // Texts are read on demand: fetch this one and redraw if the pane still shows it.
   const pendingMd = !builtin && md == null && hasSkillMd(id);

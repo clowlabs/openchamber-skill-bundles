@@ -232,10 +232,17 @@ after the global ones, so a project `allow` beats the global `deny *`.
   writes may lose an entry, costing an instant paint until a later mount refreshes it.
   Malformed and duplicate entries are dropped individually. Missing or corrupt storage may be
   replaced; a failed read skips that write and retries on a later refresh. Storage never prevents live refresh.
-- Panel boot (rail and page) is cache-first. A complete disk scan stores `panel-index-v1` in
-  extension storage: the skill roots key, home, ids, each skill's ref (id, root, path, dir) and
-  frontmatter summary (description, autoinvoke, error), unreachable and unreadable lists. It is
-  written only when it changed and stays under 1.5M characters. On open, the panel reads the index
+- Panel boot (rail and page) is cache-first. A complete disk scan stores an index in extension
+  storage: the skill roots key, home, ids, each skill's ref (id, root, path, dir) and frontmatter
+  summary (description, autoinvoke, error), unreachable and unreadable lists. The host refuses any
+  single value over 64 KiB of UTF-8, so the index is a manifest under `panel-index-v2` plus up to
+  16 parts of under 60 KB, keyed by a fresh generation. Parts are written first and the manifest
+  last, then the previous generation's parts and the old single-key `panel-index-v1` are deleted.
+  A reader takes the manifest's generation whole or not at all. Writes run one at a time, and a
+  snapshot counts as stored only once its write succeeds, so a failed write retries on the next
+  scan. A verified full scan saves even when nothing visible changed (a touched file's new
+  stamp). The indexed home only shapes the preview paint; saves use the home the disk load
+  derives. On open, the panel reads the index
   and both config files, and if the index's roots match `opencode.json` it paints right away with
   no folder walk, SKILL.md read or project list (`S.fresh = false`). The normal disk load follows
   and paints again (`S.fresh = true`). Until that load is done, queued writes wait (and fail if it
