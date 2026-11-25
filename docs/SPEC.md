@@ -241,6 +241,14 @@ after the global ones, so a project `allow` beats the global `deny *`.
   and paints again (`S.fresh = true`). Until that load is done, queued writes wait (and fail if it
   fails), sync and checkDisk do nothing, and sending a skill shows "Still loading.". A missing,
   malformed or mismatched index means a plain disk load. Reloads after errors never use the index.
+- SKILL.md texts are read on demand. Each indexed skill carries the stat stamp of the SKILL.md its
+  summary came from (unreadable skills are not indexed). Disk loads and full syncs still walk the
+  folders and stat every SKILL.md. A skill whose path and stamp match is kept unread ("lazy"), and
+  its summary serves descriptions, search and manual-edit checks. Text is read only for: every
+  skill a save leaves not off (the plan checks their frontmatter), a description edit, the skill
+  opened in the page's detail pane, and any file whose stamp changed. An on-demand read that fails
+  as unreadable records the skill as unreadable, like a scan. A vanished file is a stale-save
+  reload. A forced rescan (`pendingFullSync`) reads everything.
 - Panel: bundle header "Projects…" control + header/row Alt-click or right-click → flush checklist of
   Global + OpenChamber projects (listProjects, skip chats dir) with filter;
   header badge "Off · N projects" / "On · +N projects"; skill detail lists its projects.

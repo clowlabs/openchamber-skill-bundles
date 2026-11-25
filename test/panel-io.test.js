@@ -3525,7 +3525,9 @@ test("cache-first load paints from panel-index-v1 with no folder walk, SKILL.md 
   expect(paints).toBe(2);
   expect(io.S.fresh).toBe(true);
   expect(c.listDir).toBeGreaterThan(0);
-  expect(io.S.skillMds.alpha).toBe(skillMd("Alpha"));
+  // Unchanged since the index: verified by stat, never read.
+  expect(c.skillReads).toBe(0);
+  expect(io.meta("beta").description).toBe("Beta");
 });
 
 test("cache-first load: a commit made on the index paint waits for the disk and plans on real SKILL.md text", async () => {
@@ -3556,6 +3558,9 @@ test("cache-first load: an index for other skill roots is ignored, the panel loa
 });
 
 test("cache-first load: syncFromDisk and checkDisk do nothing until the disk load lands", async () => {
+  const base = countingHost();
+  resetPanel(base.h);
+  await io.load(undefined, { cache: true });
   const { h, c } = countingHost();
   resetPanel(h);
   const results = [];
@@ -3567,16 +3572,17 @@ test("cache-first load: syncFromDisk and checkDisk do nothing until the disk loa
   };
   await io.load(undefined, { cache: true });
   expect(await Promise.all(results)).toEqual([false, false]);
-  expect(c.skillReads).toBe(2); // the disk load's own reads only, no second scan
+  expect(c.listDir).toBe(base.c.listDir); // the disk load's own walk only, no second scan
 });
 
 test("cache-first load: a description edited on disk since the index shows after hydration and is stored for the next boot", async () => {
   put("~/.config/opencode/skills/alpha/SKILL.md", skillMd("Alpha v2"));
-  const { h } = countingHost();
+  const { h, c } = countingHost();
   resetPanel(h);
   const descs = [];
   await io.load(() => descs.push(io.meta("alpha").description), { cache: true });
   expect(descs).toEqual(["Alpha", "Alpha v2"]);
+  expect(c.skillReads).toBe(1); // only the edited file
   const { PANEL_INDEX_KEY } = await import("../panel/index-cache.ts");
   await Promise.resolve();
   const stored = await h.storage.get(PANEL_INDEX_KEY);
@@ -3585,12 +3591,111 @@ test("cache-first load: a description edited on disk since the index shows after
 
 test("parsePanelIndex: accepts a valid index and drops one with any malformed field", async () => {
   const { parsePanelIndex } = await import("../panel/index-cache.ts");
-  const ok = { v: 1, rootsKey: "[]", home: "/h", allIds: ["a"], skills: [{ id: "a", root: "~/r", path: "~/r/a/SKILL.md", dir: "~/r/a", description: "d", autoinvoke: true, error: null }], unreachable: [], unreadable: [] };
+  const ok = { v: 1, rootsKey: "[]", home: "/h", allIds: ["a"], skills: [{ id: "a", root: "~/r", path: "~/r/a/SKILL.md", dir: "~/r/a", description: "d", autoinvoke: true, error: null, stamp: "file:1:2" }], unreachable: [], unreadable: [] };
   expect(parsePanelIndex(ok)).toEqual(ok);
   expect(parsePanelIndex({ ...ok, v: 2 })).toBeNull();
   expect(parsePanelIndex({ ...ok, allIds: [1] })).toBeNull();
   expect(parsePanelIndex({ ...ok, skills: [{ ...ok.skills[0], autoinvoke: "yes" }] })).toBeNull();
   expect(parsePanelIndex({ ...ok, unreachable: [{ path: "x" }] })).toBeNull();
+  expect(parsePanelIndex({ ...ok, skills: [{ ...ok.skills[0], stamp: "err:DENIED" }] })).toBeNull();
   expect(parsePanelIndex(null)).toBeNull();
   expect(parsePanelIndex([])).toBeNull();
+});
+
+// ---------- lazy SKILL.md text (read only when needed) ----------
+
+/** Reopen the panel the way the rail does: cache-first, on a counting host. */
+async function cacheBoot() {
+  const { h, c } = countingHost();
+  resetPanel(h);
+  await io.load(undefined, { cache: true });
+  expect(c.skillReads).toBe(0);
+  return { h, c };
+}
+
+test("lazy: turning a bundle on reads its skills and removes a 'when called' opt-out from an unread SKILL.md", async () => {
+  const betaPath = "~/.config/opencode/skills/beta/SKILL.md";
+  put(betaPath, core.setAutoinvoke(skillMd("Beta"), false));
+  await io.load(); // re-index with beta's new stamp
+  await Promise.resolve();
+  const { c } = await cacheBoot();
+  io.commit((s) => core.setBundleEnabled(s, "b", true));
+  await settle();
+  expect(core.readFrontmatter(read(betaPath)).autoinvoke).toBe(true);
+  expect(c.skillReads).toBeGreaterThanOrEqual(2); // alpha + beta, both now live
+});
+
+test("lazy: a description edit on an unread skill is applied to its real text", async () => {
+  const p = "~/.config/opencode/skills/beta/SKILL.md";
+  await cacheBoot();
+  io.saveDescription("beta", "Beta edited");
+  await settle();
+  expect(read(p)).toBe(skillMd("Beta edited"));
+  expect(io.meta("beta").description).toBe("Beta edited");
+});
+
+test("lazy: an unread SKILL.md that became unreadable is reported, and 'when called' on it is refused", async () => {
+  const p = "~/.config/opencode/skills/alpha/SKILL.md";
+  const { h } = await cacheBoot();
+  const readFile = h.readFile;
+  h.readFile = async (x) => {
+    if (x === p) throw new HostRequestError("DENIED", "nope");
+    return readFile(x);
+  };
+  io.commit((s) => core.setOverride(s, "alpha", "called"));
+  await settle();
+  expect(io.S.unreadable).toContain("alpha");
+  expect(read(p)).toBe(skillMd("Alpha"));
+  expect(io.S.state.overrides.alpha).toBeUndefined();
+  expect(toasts.some((t) => t.kind === "error" && /alpha/.test(t.message))).toBe(true);
+});
+
+test("lazy: checkDisk after an external edit reads only the edited SKILL.md", async () => {
+  const { c } = await cacheBoot();
+  put("~/.config/opencode/skills/beta/SKILL.md", skillMd("Beta v2"));
+  const t = new Date(Date.now() + 5_000);
+  fs.utimesSync(real("~/.config/opencode/skills/beta/SKILL.md"), t, t);
+  expect(await io.checkDisk()).toBe(true);
+  expect(io.meta("beta").description).toBe("Beta v2");
+  expect(c.skillReads).toBe(1);
+  expect(io.meta("alpha").description).toBe("Alpha");
+});
+
+test("lazy: a non-full sync racing an on-demand read keeps its unreadable result, so 'when called' stays refused", async () => {
+  const p = "~/.config/opencode/skills/alpha/SKILL.md";
+  const { h } = await cacheBoot();
+  const readFile = h.readFile;
+  let lockReads = -1; // armed below
+  h.readFile = async (x) => {
+    if (x === p) throw new HostRequestError("DENIED", "nope");
+    if (x === core.LOCK_PATH && lockReads >= 0 && ++lockReads === 2) {
+      // The sync's post-read lock check: an on-demand read finishes (DENIED) right now.
+      await io.loadSkillMd("alpha");
+    }
+    return readFile(x);
+  };
+  // A config-only change, so the sync really applies its snapshot (not an early "unchanged" return).
+  put(core.BUNDLES_PATH, core.serializeBundles(core.renameBundle(io.S.state, "b", "B renamed")));
+  const t = new Date(Date.now() + 5_000);
+  fs.utimesSync(real(core.BUNDLES_PATH), t, t);
+  lockReads = 0;
+  expect(await io.syncFromDisk()).toBe(true);
+  lockReads = -1;
+  expect(io.S.state.bundles[0].name).toBe("B renamed");
+  expect(io.S.unreadable).toContain("alpha");
+  io.commit((s) => core.setOverride(s, "alpha", "called"));
+  await settle();
+  expect(io.S.state.overrides.alpha).toBeUndefined();
+  expect(read(p)).toBe(skillMd("Alpha"));
+});
+
+test("lazy: a live skill with neither text nor an unreadable record is never planned blind", async () => {
+  const p = "~/.config/opencode/skills/alpha/SKILL.md";
+  delete io.S.skillMds.alpha; // a state no path should reach: not loaded, not lazy, not unreadable
+  io.commit((s) => core.setOverride(s, "alpha", "called"));
+  await settle();
+  // Either refused or recovered by a reload, but never "called" without the SKILL.md edit.
+  const st = io.S.state.overrides.alpha;
+  if (st === "called") expect(core.readFrontmatter(read(p)).autoinvoke).toBe(false);
+  expect(core.readFrontmatter(read(p)).autoinvoke === false || read(core.BUNDLES_PATH).includes('"called"') === false).toBe(true);
 });

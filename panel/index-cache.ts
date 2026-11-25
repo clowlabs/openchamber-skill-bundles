@@ -11,7 +11,8 @@ export const PANEL_INDEX_KEY = 'panel-index-v1';
 export const MAX_PANEL_INDEX_CHARS = 1_500_000;
 
 export type IndexedMeta = { description: string; autoinvoke: boolean; error: string | null };
-export type IndexedSkill = SkillRef & IndexedMeta;
+/** `stamp` is the SKILL.md stat stamp the summary was read at; a different stamp means re-read. */
+export type IndexedSkill = SkillRef & IndexedMeta & { stamp: string };
 
 export type PanelIndex = {
   v: 1;
@@ -29,10 +30,11 @@ const isObj = (x: unknown): x is Record<string, unknown> => Boolean(x) && typeof
 
 function parseSkill(x: unknown): IndexedSkill | null {
   if (!isObj(x)) return null;
-  const { id, root, path, dir, description, autoinvoke, error } = x;
+  const { id, root, path, dir, description, autoinvoke, error, stamp } = x;
   if (!isStr(id) || !id || !isStr(root) || !isStr(path) || !(dir === null || isStr(dir))) return null;
+  if (!isStr(stamp) || !stamp || stamp.startsWith('err:')) return null;
   if (!isStr(description) || typeof autoinvoke !== 'boolean' || !(error === null || isStr(error))) return null;
-  return { id, root, path, dir, description, autoinvoke, error };
+  return { id, root, path, dir, description, autoinvoke, error, stamp };
 }
 
 /** A valid index, or null. All-or-nothing: one bad field drops the whole entry. */

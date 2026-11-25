@@ -4,10 +4,12 @@ import * as core from '../src/core.js';
 import type { Mode } from '../src/core.js';
 import { $, el, HAND_EDIT, pluralNoun, UNBUNDLED, type Disposable } from './dom';
 import { shortDir } from './popup';
-import { S, bundlesOf, commit, fmError, homeOpt, meta, mode, orderBundles, saveDescription, skillPath } from './io';
+import { S, bundlesOf, commit, fmError, hasSkillMd, homeOpt, loadSkillMd, meta, mode, orderBundles, saveDescription, skillPath } from './io';
 
 let mounts: Disposable[] = [];
 let disposing = false;
+/** Skill the pane currently shows, so a late SKILL.md read only redraws its own skill. */
+let shown: string | null = null;
 
 function modeTabs(root: HTMLElement, id: string) {
   const items = [
@@ -33,6 +35,7 @@ export function renderDetail(selected: string | null) {
   const root = $('detail');
   root.textContent = '';
   disposing = false;
+  shown = selected;
   const state = S.state;
   if (!state) return;
   if (!selected || !S.allIds.includes(selected)) {
@@ -43,9 +46,15 @@ export function renderDetail(selected: string | null) {
   const builtin = core.isBuiltin(id);
   const md = S.skillMds[id];
   const fm = meta(id);
+  // Texts are read on demand: fetch this one and redraw if the pane still shows it.
+  const pendingMd = !builtin && md == null && hasSkillMd(id);
+  if (pendingMd) void loadSkillMd(id).then((ok) => {
+    // Redraw once loaded, or once recorded unreadable; a vanished file waits for the next sync.
+    if (shown === id && (ok || !hasSkillMd(id))) renderDetail(id);
+  });
 
   root.appendChild(el('div', 'sb-d-id', id));
-  root.appendChild(el('div', 'sb-d-path', builtin ? 'Built-in skill (no SKILL.md)' : md == null && S.fresh ? `${skillPath(id)} (missing)` : skillPath(id)));
+  root.appendChild(el('div', 'sb-d-path', builtin ? 'Built-in skill (no SKILL.md)' : md == null && S.fresh && !pendingMd ? `${skillPath(id)} (missing)` : skillPath(id)));
   const broken = fm.error;
   if (broken) {
     const b = el('div');

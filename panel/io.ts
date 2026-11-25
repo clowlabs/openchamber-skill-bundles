@@ -31,6 +31,7 @@ export function setHost(h: HostClient) {
   clearLockRetry();
   S.activeDir = null;
   S.projectTexts = Object.create(null);
+  lazy = new Map();
   host = h;
   lock = createPanelLock({
     host: h,
@@ -148,14 +149,21 @@ export function toastError(e: unknown, what: string) {
 type Meta = IndexedMeta;
 const EMPTY: Meta = { description: '', autoinvoke: true, error: null };
 const fm = new Map<string, Meta>();
-/** Frontmatter summaries from the stored index, used only until the disk load lands. */
-let indexedMeta = new Map<string, Meta>();
+/**
+ * Skills whose SKILL.md text is not in memory but whose summary is known for the file at `stamp`
+ * (from the stored index, re-verified by stat on every scan). Text is read on demand: ensureMds.
+ */
+type LazySkill = { path: string; stamp: string; meta: Meta };
+let lazy = new Map<string, LazySkill>();
+
+/** True when the skill has a SKILL.md, loaded or not. */
+export const hasSkillMd = (id: string) => S.skillMds[id] != null || lazy.has(id);
 
 export function meta(id: string): Meta {
   const md = S.skillMds[id];
-  if (md == null && !S.fresh) {
-    const m = indexedMeta.get(id);
-    if (m) return m;
+  if (md == null) {
+    const l = lazy.get(id);
+    if (l) return l.meta;
   }
   if (md == null) return S.unreadable.includes(id) ? { ...EMPTY, error: `${skillPath(id)} could not be read` } : EMPTY;
   let m = fm.get(id);
@@ -175,7 +183,49 @@ export const fmError = (id: string) => meta(id).error;
 function setMd(id: string, text: string) {
   S.skillMds[id] = text;
   fm.delete(id);
+  lazy.delete(id);
 }
+
+/**
+ * Read the SKILL.md text of the given lazy skills. An unreadable file is recorded the way a scan
+ * records it (unreadable + unreachable); a vanished one is a StaleError. A sync that replaced the
+ * entry meanwhile wins: its snapshot is newer than this read.
+ */
+async function ensureMds(ids: readonly string[]) {
+  const todo = [...new Set(ids)].filter((id) => S.skillMds[id] == null && lazy.has(id));
+  await pool(todo, 8, async (id) => {
+    const entry = lazy.get(id);
+    if (!entry) return;
+    let text: string | null;
+    try {
+      text = await readOptional(entry.path);
+    } catch (e) {
+      if (!isUnreadable(e)) throw e;
+      if (lazy.get(id) !== entry) return;
+      lazy.delete(id);
+      fm.delete(id);
+      S.unreachable = [...S.unreachable, { path: entry.path, code: errorCode(e) }];
+      S.unreadable = [...S.unreadable, id].sort();
+      return;
+    }
+    if (lazy.get(id) !== entry) return;
+    if (text == null) throw new StaleError(`${entry.path} disappeared`);
+    setMd(id, text);
+  });
+}
+
+/** Load one skill's SKILL.md for display (detail pane). True once its text is in memory. */
+export async function loadSkillMd(id: string): Promise<boolean> {
+  try {
+    await ensureMds([id]);
+  } catch {
+    return false;
+  }
+  return S.skillMds[id] != null;
+}
+
+/** Skills a plan for `state` reads: every non-built-in skill that is not off. */
+const liveSkillIds = (state: State) => S.allIds.filter((id) => !core.isBuiltin(id) && core.effectiveMode(state, id) !== 'off');
 
 // ---------- write queue: every write runs here, one at a time, none dropped ----------
 
@@ -354,7 +404,8 @@ type SkillScanReuse = {
   prevStamps: Record<string, string>;
 };
 
-async function scanSkills(opencodeText: string, reuse?: SkillScanReuse) {
+/** `known`: lazy skills a matching stat stamp lets this scan keep unread. */
+async function scanSkills(opencodeText: string, reuse?: SkillScanReuse, known?: ReadonlyMap<string, LazySkill>) {
   const { skills, unreachable } = await discoverSkills(host, opencodeText);
   const discoveredIds = Object.keys(skills);
   const allIds = [...new Set([...discoveredIds, ...core.BUILTIN_SKILLS])].sort();
@@ -366,6 +417,7 @@ async function scanSkills(opencodeText: string, reuse?: SkillScanReuse) {
   const incomplete = unreachable.length > 0;
   const unreadable: string[] = [];
   const mds: Record<string, string> = {};
+  const nextLazy = new Map<string, LazySkill>();
   const unreadablePrev = reuse ? new Set(reuse.prevUnreadable) : null;
   await pool(discoveredIds, 32, async (id) => {
     const p = skillPaths[id];
@@ -381,6 +433,11 @@ async function scanSkills(opencodeText: string, reuse?: SkillScanReuse) {
       reuse.prevStamps[p] === st
     ) {
       mds[id] = reuse.prevMds[id];
+      return;
+    }
+    const k = known?.get(id);
+    if (k && k.path === p && st === k.stamp && !st.startsWith('err:')) {
+      nextLazy.set(id, k);
       return;
     }
     try {
@@ -403,6 +460,7 @@ async function scanSkills(opencodeText: string, reuse?: SkillScanReuse) {
     incomplete,
     unreadable,
     mds,
+    lazy: nextLazy,
     skillStamps,
   };
 }
@@ -422,13 +480,16 @@ export type ChangeOpts = { label?: string; undoable?: boolean | 'clear' };
 
 let lastIndexText: string | null = null;
 
-function buildPanelIndex(roots: readonly string[]): PanelIndex {
-  const skills = Object.values(S.skillRefs)
-    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-    .map((r) => {
-      const m = meta(r.id);
-      return { id: r.id, root: r.root, path: r.path, dir: r.dir, description: m.description, autoinvoke: m.autoinvoke, error: m.error };
-    });
+/** Null while any SKILL.md stamp is unverified: a summary must be pinned to the file it describes. */
+function buildPanelIndex(roots: readonly string[]): PanelIndex | null {
+  const skills: PanelIndex['skills'] = [];
+  for (const r of Object.values(S.skillRefs).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+    if (S.unreadable.includes(r.id)) continue; // no summary to pin; retried by every scan
+    const stamp = skillFileStamps[r.path];
+    if (!stamp || stamp.startsWith('err:')) return null;
+    const m = meta(r.id);
+    skills.push({ id: r.id, root: r.root, path: r.path, dir: r.dir, description: m.description, autoinvoke: m.autoinvoke, error: m.error, stamp });
+  }
   const home = effectiveHome();
   return {
     v: 1,
@@ -444,7 +505,8 @@ function buildPanelIndex(roots: readonly string[]): PanelIndex {
 /** Store what the next boot paints first; skipped when unchanged, incomplete or too large. */
 function savePanelIndex(roots: readonly string[]) {
   if (S.incomplete || !S.fresh) return;
-  const text = serializePanelIndex(buildPanelIndex(roots));
+  const index = buildPanelIndex(roots);
+  const text = index && serializePanelIndex(index);
   if (!text || text === lastIndexText) return;
   lastIndexText = text;
   void writePanelIndex(host, text);
@@ -463,11 +525,11 @@ async function paintFromIndex(): Promise<boolean> {
     const state = bundlesText == null ? null : core.parseBundles(bundlesText, homeOpt());
     const refs: Record<string, SkillRef> = Object.create(null);
     const paths: Record<string, string> = Object.create(null);
-    const metas = new Map<string, Meta>();
+    const known = new Map<string, LazySkill>();
     for (const s of index.skills) {
       refs[s.id] = { id: s.id, root: s.root, path: s.path, dir: s.dir };
       paths[s.id] = s.path;
-      metas.set(s.id, { description: s.description, autoinvoke: s.autoinvoke, error: s.error });
+      known.set(s.id, { path: s.path, stamp: s.stamp, meta: { description: s.description, autoinvoke: s.autoinvoke, error: s.error } });
     }
     S.allIds = index.allIds;
     S.skillRefs = refs;
@@ -477,7 +539,7 @@ async function paintFromIndex(): Promise<boolean> {
     S.unreadable = index.unreadable;
     S.skillMds = {};
     fm.clear();
-    indexedMeta = metas;
+    lazy = known;
     S.opencodeText = opencodeText;
     S.bundlesText = bundlesText;
     S.state = state;
@@ -532,7 +594,7 @@ async function loadFromDisk(onLoaded?: () => void) {
   const [[preRootStamps, scan], [preProjStamps, projTexts]] = await Promise.all([
     (async () => {
       const rootStamps = await readStampsMap(roots);
-      return [rootStamps, await scanSkills(opencodeText)] as const;
+      return [rootStamps, await scanSkills(opencodeText, undefined, lazy)] as const;
     })(),
     (async () => {
       const pStamps = await readStampsMap(projPaths);
@@ -553,7 +615,7 @@ async function loadFromDisk(onLoaded?: () => void) {
   S.projectTexts = projTexts;
   S.loaded = true;
   S.fresh = true;
-  indexedMeta = new Map();
+  lazy = scan.lazy;
   if (myGen === gen && writeSeq === loadWriteSeq && syncSeq === loadSyncSeq) {
     let activePost!: Promise<void>;
     activePost = (async () => {
@@ -681,6 +743,12 @@ async function readProjectTexts(next: State): Promise<{ texts: ProjectTexts; ski
 }
 
 async function save(next: State) {
+  // The plan checks every live skill's frontmatter, so their texts must be in memory.
+  const live = liveSkillIds(next);
+  await ensureMds(live);
+  // Fail closed: the planner silently skips a skill with no text unless it is marked unreadable.
+  const blind = live.find((id) => S.skillMds[id] == null && !S.unreadable.includes(id));
+  if (blind) throw new StaleError(`${skillPath(blind)} is not loaded`);
   // Refuse early, before taking the lock (project files read now; re-read under the lock).
   const { texts: projectTexts, skippedUnreadable } = await readProjectTexts(next);
   const first = planFor(next, projectTexts);
@@ -870,13 +938,16 @@ export async function undo(): Promise<boolean> {
 
 export function saveDescription(id: string, text: string) {
   void enqueue(async () => {
-    if (S.skillMds[id] == null) return;
+    if (!hasSkillMd(id)) return;
     const apply = (md: string) => {
       try { return core.setDescription(md, text); } catch (e) { throw new RefusedError(errText(e)); }
     };
     try {
       if (S.incomplete) throw new RefusedError(`some skill folders could not be read, so it is unclear which SKILL.md ${id} uses`);
-      apply(S.skillMds[id]); // refuse early, before taking the lock
+      await ensureMds([id]);
+      const md = S.skillMds[id];
+      if (md == null) throw new RefusedError(`${skillPath(id)} could not be read`);
+      apply(md); // refuse early, before taking the lock
       const p = skillPath(id);
       let lockedSkillStamp = '';
       let written = false;
@@ -923,6 +994,9 @@ function sameRec<V>(a: Record<string, V>, b: Record<string, V>): boolean {
   const bk = Object.keys(b);
   return ak.length === bk.length && ak.every((k) => Object.hasOwn(b, k) && a[k] === b[k]);
 }
+
+const sameLazy = (a: ReadonlyMap<string, LazySkill>, b: ReadonlyMap<string, LazySkill>) =>
+  a.size === b.size && [...a].every(([id, x]) => b.get(id)?.stamp === x.stamp && b.get(id)?.path === x.path);
 
 const sameUnreach = (a: readonly Unreachable[], b: readonly Unreachable[]) =>
   a.length === b.length && a.every((u, i) => u.path === b[i].path && u.code === b[i].code);
@@ -1075,6 +1149,7 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
   let nextUnreachable = S.unreachable;
   let nextUnreadable = S.unreadable;
   let nextMds = S.skillMds;
+  let nextLazy = lazy;
   let nextSkillStamps: Record<string, string> | null = null;
 
   if (needsFull) {
@@ -1088,6 +1163,7 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
             prevUnreadable: S.unreadable,
             prevStamps: skillFileStamps,
           },
+      pendingFullSync ? undefined : lazy,
     );
     if (interrupted(fullSyncOpts)) return false;
     nextAllIds = scan.allIds;
@@ -1097,6 +1173,7 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
     nextUnreachable = scan.unreachable;
     nextUnreadable = scan.unreadable;
     nextMds = scan.mds;
+    nextLazy = scan.lazy;
     nextSkillStamps = scan.skillStamps;
   }
 
@@ -1152,15 +1229,21 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
 
   const configChanged = opencodeText !== S.opencodeText || bundlesText !== S.bundlesText;
   const projectChanged = !sameRec(nextProjectTexts, S.projectTexts);
+  // Skill fields count only when this sync scanned them. A config-only sync holds references
+  // captured before its awaits; on-demand reads may have updated S since (an unreadable result,
+  // a loaded text), and copying the old values back would erase that.
   const changed =
     configChanged ||
     projectChanged ||
-    !sameIds(nextAllIds, S.allIds) ||
-    !sameRec(nextSkillPaths, S.skillPaths) ||
-    nextIncomplete !== S.incomplete ||
-    !sameIds(nextUnreadable, S.unreadable) ||
-    !sameUnreach(nextUnreachable, S.unreachable) ||
-    !sameRec(nextMds, S.skillMds);
+    (needsFull && (
+      !sameIds(nextAllIds, S.allIds) ||
+      !sameRec(nextSkillPaths, S.skillPaths) ||
+      nextIncomplete !== S.incomplete ||
+      !sameIds(nextUnreadable, S.unreadable) ||
+      !sameUnreach(nextUnreachable, S.unreachable) ||
+      !sameRec(nextMds, S.skillMds) ||
+      !sameLazy(nextLazy, lazy)
+    ));
 
   if (!changed) return false;
 
@@ -1171,14 +1254,17 @@ async function runSync(opts?: SyncOpts): Promise<boolean> {
   }
 
   const prevMds = S.skillMds;
-  S.allIds = nextAllIds;
-  S.skillRefs = nextSkillRefs;
-  S.skillPaths = nextSkillPaths;
-  S.unreachable = nextUnreachable;
-  S.incomplete = nextIncomplete;
-  S.unreadable = nextUnreadable;
-  S.skillMds = nextMds;
-  if (needsFull) fm.clear();
+  if (needsFull) {
+    S.allIds = nextAllIds;
+    S.skillRefs = nextSkillRefs;
+    S.skillPaths = nextSkillPaths;
+    S.unreachable = nextUnreachable;
+    S.incomplete = nextIncomplete;
+    S.unreadable = nextUnreadable;
+    S.skillMds = nextMds;
+    lazy = nextLazy;
+    fm.clear();
+  }
   S.opencodeText = opencodeText;
   S.bundlesText = bundlesText;
   S.state = nextState;

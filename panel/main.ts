@@ -23,7 +23,7 @@ import { countsFromState, liveLine, livePct, TOKENS_TITLE, tokensLabel } from '.
 import { $, el, HAND_EDIT, isMenuKey, MODE_LABEL, noBundlesBanner, onAltOrContext, openAtAnchor, plural, pluralNoun, rovingKey, SAVING_BADGE, UNBUNDLED, type Disposable } from './dom';
 import { createEditGuard } from './edit-guard';
 import {
-  S, activeProjectDir, applyChange, canUndo, checkDisk, commit, effectiveHome, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, startSync, toastError, toggleBundle, undo, undoDepth, undoLabel,
+  S, activeProjectDir, applyChange, hasSkillMd, canUndo, checkDisk, commit, effectiveHome, enqueue, errText, fmError, hooks, load, meta, mode, noteCreatedBundle, pending, seedDefaults, setHost, startSync, toastError, toggleBundle, undo, undoDepth, undoLabel,
 } from './io';
 import { connectHost } from '@openchamber/sdk';
 
@@ -154,7 +154,7 @@ function renderPill(id: string, from: string, parent: HTMLElement, m: Mode) {
 function sendBlocked(id: string): string | null {
   if (!S.fresh) return 'Still loading.';
   if (core.isBuiltin(id)) return 'Built-in skill: it has no folder to send.';
-  if (S.skillMds[id] == null) return 'This skill has no SKILL.md to send.';
+  if (!hasSkillMd(id)) return 'This skill has no SKILL.md to send.';
   if (S.incomplete) return "Some skill folders couldn't be read, so this may not be the copy OpenCode uses.";
   const err = fmError(id);
   if (err) return `Manual edit needed (${err}). ${HAND_EDIT}.`;
