@@ -56,11 +56,11 @@ Safety:
 Requirements: OpenChamber 2.7.1 or newer, and OpenCode V2. The `skills` command also needs Node 18
 or newer.
 
-**[Open in OpenChamber](openchamber://extensions/install?url=https%3A%2F%2Fgithub.com%2Fnightshine8%2Fopenchamber-skill-bundles)** (desktop app),
+**[Open in OpenChamber](openchamber://extensions/install?url=https%3A%2F%2Fgithub.com%2Fclowlabs%2Fopenchamber-skill-bundles)** (desktop app),
 or:
 
 1. In OpenChamber, open **Settings → Extensions**, paste
-   `https://github.com/nightshine8/openchamber-skill-bundles`, and click **Add**.
+   `https://github.com/clowlabs/openchamber-skill-bundles`, and click **Add**.
 2. Approve the permissions (see below), then open **Skill Bundles** from the rail or the Pages
    section.
 3. Click **Create from defaults**. You get 12 starter bundles, with only "Dev & coding" and
@@ -72,7 +72,7 @@ is pushed.
 For the `skills` command, clone the repo and link it onto your PATH:
 
 ```bash
-git clone https://github.com/nightshine8/openchamber-skill-bundles
+git clone https://github.com/clowlabs/openchamber-skill-bundles
 ln -s "$PWD/openchamber-skill-bundles/bin/skills" ~/.local/bin/skills
 ```
 

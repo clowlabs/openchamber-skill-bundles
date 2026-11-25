@@ -1,6 +1,6 @@
 {
   "name": "skill-bundles",
-  "version": "0.2.21",
+  "version": "0.2.22",
   "private": true,
   "type": "module",
   "description": "Turn OpenCode skills on and off in named bundles.",
@@ -59,7 +59,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nightshine8/openchamber-skill-bundles"
+    "url": "https://github.com/clowlabs/openchamber-skill-bundles"
   },
-  "homepage": "https://github.com/nightshine8/openchamber-skill-bundles#readme"
+  "homepage": "https://github.com/clowlabs/openchamber-skill-bundles#readme"
 }
