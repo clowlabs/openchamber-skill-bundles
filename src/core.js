@@ -525,13 +525,15 @@ export function syncPlan(state, allIds, skillMds, unreadable = []) {
     if (isBuiltin(id)) continue;
     const text = hasOwn(skillMds, id) ? skillMds[id] : undefined;
     const mode = lookup(id);
+    if (mode === "off") continue;
     if (typeof text !== "string") {
-      // Found but unreadable: "called" needs an edit we cannot make; "auto" may hide an opt-out.
-      if (blind.has(id) && mode === "called") throw Object.assign(new Error(`${id}: SKILL.md could not be read, so it cannot be set to "when called"`), { id });
-      if (blind.has(id) && mode === "auto") skipped.push({ id, reason: "SKILL.md could not be read" });
+      // No text: "called" needs an edit we cannot make; "auto" may hide an opt-out. Never silent,
+      // whether the file was unreadable or simply not read (vanished, or an adapter skipped it).
+      const why = blind.has(id) ? "could not be read" : "was not read";
+      if (mode === "called") throw Object.assign(new Error(`${id}: SKILL.md ${why}, so it cannot be set to "when called"`), { id });
+      skipped.push({ id, reason: `SKILL.md ${why}` });
       continue;
     }
-    if (mode === "off") continue;
     const want = mode !== "called";
     let next;
     try {

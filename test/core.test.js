@@ -905,6 +905,17 @@ test("planChange: unreadable SKILL.md refuses 'called', skips 'auto' with a note
   assert.deepEqual(p.skipped.map((s) => s.id), ["x"]);
 });
 
+test("planChange: a live skill whose SKILL.md text was never read is handled like an unreadable one, never silently", () => {
+  // e.g. the CLI saw the folder but the file vanished before the read; or an adapter forgot to load it
+  const st = S({ bundles: [{ id: "a", enabled: true, skills: ["x"] }] });
+  const prev = { bundlesText: core.serializeBundles(st), opencodeText: '{"permissions":[]}\n', skillMds: {} };
+  assert.throws(() => core.planChange(prev, core.setOverride(st, "x", "called"), ["x"]), (e) => e.file === "skill" && e.id === "x" && /not read/.test(e.message));
+  const p = core.planChange(prev, st, ["x"]);
+  assert.deepEqual(p.skipped, [{ id: "x", reason: "SKILL.md was not read" }]);
+  // off skills and built-ins need no text
+  assert.deepEqual(core.planChange(prev, core.setOverride(st, "x", "off"), ["x"]).skipped, []);
+});
+
 test("planChange: incomplete discovery keeps every rule and restates only flipped ids", () => {
   const st = S({ bundles: [{ id: "a", enabled: true, skills: ["x", "external"] }, { id: "b", enabled: false, skills: ["y"] }] });
   const rules = [

@@ -3358,7 +3358,7 @@ test("load(onLoaded) fires onLoaded before post-stat verification and warms skil
     return origStat(p);
   };
   io.setHost(h);
-  io.S.loaded = false;
+  io.S.phase = "empty";
   io.S.state = null;
 
   await io.load(() => {
@@ -3501,7 +3501,7 @@ function countingHost() {
 /** Fresh panel state, as a newly opened frame has. */
 function resetPanel(h) {
   io.setHost(h);
-  io.S.loaded = false;
+  io.S.phase = "empty";
   io.S.state = null;
   io.S.allIds = [];
   io.S.skillMds = {};
@@ -3509,6 +3509,45 @@ function resetPanel(h) {
   io.S.homeDerived = false;
   io.S.home = undefined;
 }
+
+test("boot phase: S.loaded and S.fresh are read from S.phase, so loaded-but-not-fresh is the only partial state", () => {
+  const seen = {};
+  for (const phase of ["empty", "preview", "verified"]) {
+    io.S.phase = phase;
+    seen[phase] = { loaded: io.S.loaded, fresh: io.S.fresh };
+  }
+  expect(seen).toEqual({
+    empty: { loaded: false, fresh: false },
+    preview: { loaded: true, fresh: false },
+    verified: { loaded: true, fresh: true },
+  });
+});
+
+test("boot phase: a cache-first load goes empty → preview (index paint) → verified (disk), a plain load empty → verified", async () => {
+  const { h } = countingHost();
+  resetPanel(h);
+  expect(io.S.phase).toBe("empty");
+  const phases = [];
+  await io.load(() => phases.push(io.S.phase), { cache: true });
+  expect(phases).toEqual(["preview", "verified"]);
+  expect(io.S.phase).toBe("verified");
+
+  resetPanel(countingHost().h);
+  const plain = [];
+  await io.load(() => plain.push(io.S.phase));
+  expect(plain).toEqual(["verified"]);
+});
+
+test("boot phase: a failed disk load after the index paint stays in preview, so writes keep refusing", async () => {
+  const { h } = countingHost();
+  resetPanel(h);
+  const listDir = h.listDir;
+  h.listDir = async () => { throw new Error("disk gone"); };
+  await expect(io.load(undefined, { cache: true })).rejects.toThrow("disk gone");
+  expect(io.S.phase).toBe("preview");
+  expect(await io.enqueue(async () => {})).toBe(false);
+  h.listDir = listDir;
+});
 
 test("cache-first load paints from panel-index-v1 with no folder walk, SKILL.md read or project list, then hydrates", async () => {
   // beforeEach's full load stored the index.

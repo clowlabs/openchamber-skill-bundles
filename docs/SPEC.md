@@ -244,8 +244,9 @@ after the global ones, so a project `allow` beats the global `deny *`.
   stamp). The indexed home only shapes the preview paint; saves use the home the disk load
   derives. On open, the panel reads the index
   and both config files, and if the index's roots match `opencode.json` it paints right away with
-  no folder walk, SKILL.md read or project list (`S.fresh = false`). The normal disk load follows
-  and paints again (`S.fresh = true`). Until that load is done, queued writes wait (and fail if it
+  no folder walk, SKILL.md read or project list (`S.phase = 'preview'`: `S.loaded`, not `S.fresh`).
+  The normal disk load follows and paints again (`S.phase = 'verified'`). Before any paint the
+  phase is `'empty'`; `S.loaded` and `S.fresh` are derived from it, never set. Until that load is done, queued writes wait (and fail if it
   fails), sync and checkDisk do nothing, and sending a skill shows "Still loading.". A missing,
   malformed or mismatched index means a plain disk load. Reloads after errors never use the index.
 - SKILL.md texts are read on demand. Each indexed skill carries the stat stamp of the SKILL.md its
@@ -256,6 +257,12 @@ after the global ones, so a project `allow` beats the global `deny *`.
   opened in the page's detail pane, and any file whose stamp changed. An on-demand read that fails
   as unreadable records the skill as unreadable, like a scan. A vanished file is a stale-save
   reload. A forced rescan (`pendingFullSync`) reads everything.
+- Core never plans a live skill blind (CLI and panel). In `syncPlan`, a skill that is not off and
+  has no SKILL.md text works like an unreadable one, whatever the reason (unreadable, vanished
+  between listing and read, or not loaded by the adapter). Set to "when called", it throws (tagged
+  `file: "skill"`, with the id), because the frontmatter edit cannot be made. Set to auto, it is
+  skipped with the reason "SKILL.md could not be read" or "SKILL.md was not read". The panel's own
+  check in `save()` stays as a stricter layer: it reloads instead of saving with a skip.
 - Panel: bundle header "Projects…" control + header/row Alt-click or right-click → flush checklist of
   Global + OpenChamber projects (listProjects, skip chats dir) with filter;
   header badge "Off · N projects" / "On · +N projects"; skill detail lists its projects.
