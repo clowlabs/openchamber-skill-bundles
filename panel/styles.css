@@ -150,3 +150,6 @@ body .oc-sdk-btn[data-variant="secondary"],
 body .oc-sdk-btn[data-variant="ghost"]:not(.oc-sdk-menu > .oc-sdk-btn) { border-color: var(--oc-sdk-edge, var(--oc-border)); }
 body .oc-sdk-btn[data-variant="secondary"]:hover:not(:disabled),
 body .oc-sdk-btn[data-variant="ghost"]:not(.oc-sdk-menu > .oc-sdk-btn):hover:not(:disabled) { border-color: var(--oc-muted); }
+
+.sb-proj-row.is-locked { opacity: 0.55; }
+.sb-proj-row.is-locked input { cursor: not-allowed; }

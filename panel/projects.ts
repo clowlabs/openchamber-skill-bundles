@@ -4,6 +4,9 @@ import { createPopup, note, onRefreshMenus, projectList, projectsNote, shortDir,
 import { S, activeProjectDir, commit, homeOpt, sameProjectDir } from './io';
 
 const GLOBAL_KEY = '__global';
+/** A project config can only be written for the project OpenChamber has open. */
+const NEED_OPEN = 'Open a session in this project to change its bundle.';
+const NO_PROJECT = 'Open a session in a project first: a project config can only be written for the open project.';
 
 type RowOptions = {
   key: string;
@@ -11,6 +14,7 @@ type RowOptions = {
   title?: string;
   sub?: string;
   checked: boolean;
+  disabled?: boolean;
   onChange?: (checked: boolean) => void;
 };
 
@@ -43,11 +47,15 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
   const row = (opts: RowOptions) => {
     const l = document.createElement('label');
     l.className = 'sb-proj-row';
-    l.title = opts.title ?? opts.key;
+    l.title = opts.title ?? (opts.disabled ? NEED_OPEN : opts.key);
     const c = document.createElement('input');
     c.type = 'checkbox';
     c.className = 'sb-proj-check';
     c.checked = opts.checked;
+    if (opts.disabled) {
+      c.disabled = true;
+      l.classList.add('is-locked');
+    }
     c.dataset.dir = opts.key;
     c.addEventListener('change', () => (opts.onChange ? opts.onChange(c.checked) : toggle(opts.key, c.checked)));
     const name = document.createElement('span');
@@ -125,14 +133,21 @@ export function openProjectsMenu(bundleId: string, x: number, y: number, returnF
         label: p.name,
         sub: isCur ? `current · ${shortDir(p.directory)}` : undefined,
         checked,
+        disabled: !isCur,
+        title: isCur ? undefined : curDir === null ? NO_PROJECT : NEED_OPEN,
       }));
     }
 
     // Folders in the bundle that OpenChamber doesn't list, kept flush in the checklist so they can be unchecked.
     if (unlistedMine.length || unlistedExcluded.length) {
       const folderLabel = (d: string) => d.split('/').filter(Boolean).pop() ?? d;
-      for (const d of unlistedMine) list.appendChild(row({ key: d, label: folderLabel(d), checked: true }));
-      for (const d of unlistedExcluded) list.appendChild(row({ key: d, label: folderLabel(d), checked: false }));
+      const locked = (d: string) => {
+        const n = core.normalizeScopeDir(d, hOpt);
+        return !(n !== null && n === curDir);
+      };
+      const lockedTitle = (d: string) => (curDir === null ? NO_PROJECT : locked(d) ? NEED_OPEN : undefined);
+      for (const d of unlistedMine) list.appendChild(row({ key: d, label: folderLabel(d), checked: true, disabled: locked(d), title: lockedTitle(d) }));
+      for (const d of unlistedExcluded) list.appendChild(row({ key: d, label: folderLabel(d), checked: false, disabled: locked(d), title: lockedTitle(d) }));
     }
     if (keep) list.querySelector<HTMLElement>(`[data-dir="${CSS.escape(keep)}"]`)?.focus();
   };

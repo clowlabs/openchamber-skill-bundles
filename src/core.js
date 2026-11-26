@@ -162,14 +162,20 @@ function parseDirList(v, where, home) {
 // Canonical spelling with a pre-normalized `home` (`null` = none): "." segments, repeated and
 // trailing slashes collapsed; ".." refused. Under `home`, spelled "~/…" (home itself "~").
 function normalizeDirWithHome(dir, h) {
-  if (typeof dir !== "string" || !(dir.startsWith("/") || dir === "~" || dir.startsWith("~/"))) {
+  if (typeof dir !== "string") throw new Error(`Project directory must be absolute: ${JSON.stringify(dir)}`);
+  // Windows drive paths ("E:/x", "e:\\x") are absolute as well: one spelling, "E:/x".
+  const drive = /^([a-zA-Z]):([\\/]|$)/.exec(dir);
+  if (drive) dir = `${drive[1].toUpperCase()}:/${dir.slice(2).replace(/^[\\/]+/, "").replace(/\\/g, "/")}`;
+  else if (!(dir.startsWith("/") || dir === "~" || dir.startsWith("~/"))) {
     throw new Error(`Project directory must be absolute: ${JSON.stringify(dir)}`);
   }
-  const tilde = dir === "~" || dir.startsWith("~/");
-  const segs = (tilde ? dir.slice(1) : dir).split("/").filter((x) => x !== "" && x !== ".");
+  const drivePrefix = drive ? dir.slice(0, 2) : null;
+  const tilde = !drivePrefix && (dir === "~" || dir.startsWith("~/"));
+  const body = drivePrefix ? dir.slice(2) : dir;
+  const segs = (tilde ? body.slice(1) : body).split("/").filter((x) => x !== "" && x !== ".");
   if (segs.includes("..")) throw new Error(`Project directory must not contain "..": ${dir}`);
-  let d = tilde ? (segs.length ? `~/${segs.join("/")}` : "~") : `/${segs.join("/")}`;
-  if (!tilde && h !== null && (d === h || d.startsWith(h + "/"))) {
+  let d = drivePrefix ? `${drivePrefix}/${segs.join("/")}` : tilde ? (segs.length ? `~/${segs.join("/")}` : "~") : `/${segs.join("/")}`;
+  if (!tilde && !drivePrefix && h !== null && (d === h || d.startsWith(h + "/"))) {
     d = d === h ? "~" : `~${d.slice(h.length)}`;
   }
   return d;
